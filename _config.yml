@@ -1,0 +1,16 @@
+theme: jekyll-theme-minimal
+include:
+  - _g_e_iterative_kernel_8h_source.html
+  - _floyd_recursive_parallel_kernel_8h_source.html
+  - _floyd_iterative_kernel_8h_source.html
+  - _matrix_8h_source.html
+  - _floyd_iterative_kernel_d_f_8h_source.html
+  - _g_e_recursive_parallel_kernel_8h_source.html
+  - _t_t_g-_build-_infrastructure.html
+  - _g_e_iterative_kernel_d_f_8h_source.html
+  - _documenting-_t_t_g.html
+  - _floyd_recursive_serial_kernel_8h_source.html
+  - _floyd_recursive_serial_kernel_d_f_8h_source.html
+  - _travis-_c_i-_administration-_notes.html
+  - _g_e_recursive_serial_kernel_8h_source.html
+  - _vector_8h_source.html
