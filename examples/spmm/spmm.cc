@@ -176,6 +176,7 @@ class Read_SpMatrix : public Op<void, std::tuple<Out<Key<2>, Blk>>, Read_SpMatri
   void op(std::tuple<Out<Key<2>, Blk>> &out) {
     for (int k = 0; k < matrix_.outerSize(); ++k) {
       for (typename SpMatrix<Blk>::InnerIterator it(matrix_, k); it; ++it) {
+        std::cout << "Read " << Key<2>({it.row(), it.col()}) << std::endl;
         ::send<0>(Key<2>({it.row(), it.col()}), it.value(), out);
       }
     }
@@ -263,6 +264,9 @@ class SpMM {
       const auto k = key[1];
       // broadcast a_ik to all existing {i,j,k}
       std::vector<Key<3>> ijk_keys;
+      std::cout << "BcastA " << key << std::endl;
+      if (k >= b_rowidx_to_colidx_.size()) std::cout << "**** BCASTA K is " << I << " size is " << b_rowidx_to_colidx_.size() << std::endl;
+      assert(k < b_rowidx_to_colidx_.size());
       for (auto &j : b_rowidx_to_colidx_[k]) {
         if (tracing()) ttg::print("Broadcasting A[", i, "][", k, "] to j=", j);
         ijk_keys.emplace_back(Key<3>({i, j, k}));
@@ -287,7 +291,10 @@ class SpMM {
       const auto k = key[0];
       const auto j = key[1];
       // broadcast b_kj to *jk
+      std::cout << "BcastB " << key << std::endl;
       std::vector<Key<3>> ijk_keys;
+      if (k >= a_colidx_to_rowidx_.size()) std::cout << "**** BCASTB K is " << k << " size is " << a_colidx_to_rowidx_.size() << std::endl;
+      assert(k < a_colidx_to_rowidx_.size());
       for (auto &i : a_colidx_to_rowidx_[k]) {
         if (tracing()) ttg::print("Broadcasting B[", k, "][", j, "] to i=", i);
         ijk_keys.emplace_back(Key<3>({i, j, k}));
@@ -462,6 +469,7 @@ class SpMM {
   // result[i][j] gives the j-th nonzero row for column i in matrix mat
   std::vector<std::vector<long>> make_colidx_to_rowidx(const SpMatrix<Blk> &mat) {
     std::vector<std::vector<long>> colidx_to_rowidx;
+    std::cout << "************************" << std::endl;
     for (int k = 0; k < mat.outerSize(); ++k) {  // cols, if col-major, rows otherwise
       for (typename SpMatrix<Blk>::InnerIterator it(mat, k); it; ++it) {
         const std::size_t row = it.row();
@@ -469,6 +477,7 @@ class SpMM {
         if (col >= colidx_to_rowidx.size()) colidx_to_rowidx.resize(col + 1);
         // in either case (col- or row-major) row index increasing for the given col
         colidx_to_rowidx[col].push_back(row);
+        std::cout << "col2row col " << col << " row " << row << std::endl; 
       }
     }
     return colidx_to_rowidx;
@@ -476,6 +485,7 @@ class SpMM {
   // result[i][j] gives the j-th nonzero column for row i in matrix mat
   std::vector<std::vector<long>> make_rowidx_to_colidx(const SpMatrix<Blk> &mat) {
     std::vector<std::vector<long>> rowidx_to_colidx;
+    std::cout << "************************" << std::endl;
     for (int k = 0; k < mat.outerSize(); ++k) {  // cols, if col-major, rows otherwise
       for (typename SpMatrix<Blk>::InnerIterator it(mat, k); it; ++it) {
         const std::size_t row = it.row();
@@ -483,6 +493,7 @@ class SpMM {
         if (row >= rowidx_to_colidx.size()) rowidx_to_colidx.resize(row + 1);
         // in either case (col- or row-major) col index increasing for the given row
         rowidx_to_colidx[row].push_back(col);
+        std::cout << "row2col row " << row << " col " << col << std::endl;
       }
     }
     return rowidx_to_colidx;
@@ -840,9 +851,9 @@ int main(int argc, char **argv) {
   double gflops = 0.0;
 
   if (int dashdash = cmdOptionIndex(argv, argv + argc, "--") > -1) {
-    ttg_initialize(argc - dashdash, argv + dashdash, -1);
+    ttg_initialize(argc - dashdash, argv + dashdash, 1);
   } else {
-    ttg_initialize(1, argv, -1);
+    ttg_initialize(1, argv, 1);
   }
 
   //  using mpqc::Debugger;
@@ -889,6 +900,8 @@ int main(int argc, char **argv) {
       double avg = parseOption(avgStr, 0.3);
       timing = true;
       initBlSpRandom(M, N, K, minTs, maxTs, avg, A, B, C, gflops);
+      std::cout << "M: " << M << ", N " << N << ", K" << K << std::endl;
+
     } else {
       initBlSpHardCoded(A, B, C);
     }
