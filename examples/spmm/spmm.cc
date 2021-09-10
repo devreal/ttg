@@ -26,6 +26,19 @@
 
 #include "ttg.h"
 
+#define USER_REGION_ENTER(name) if (tracing_enabled) parsec_profiling_ts_trace(event_##name##_startkey, 0, PROFILE_OBJECT_ID_NULL, NULL)
+#define USER_REGION_EXIT(name)  if (tracing_enabled) parsec_profiling_ts_trace(event_##name##_endkey, 0, PROFILE_OBJECT_ID_NULL, NULL)
+
+static bool tracing_enabled = false;
+static int event_bcasta_startkey, event_bcasta_endkey;
+static int event_bcastb_startkey, event_bcastb_endkey;
+static int event_read_startkey, event_read_endkey;
+static int event_write_startkey, event_write_endkey;
+static int event_mult_startkey, event_mult_endkey;
+static int event_csend_startkey, event_csend_endkey;
+static int event_send_startkey, event_send_endkey;
+static int event_sendback_startkey, event_sendback_endkey;
+
 using namespace ttg;
 
 #include "ttg/serialization.h"
@@ -183,11 +196,13 @@ class Read_SpMatrix : public Op<void, std::tuple<Out<Key<2>, Blk>>, Read_SpMatri
       , matrix_(matrix) {}
 
   void op(std::tuple<Out<Key<2>, Blk>> &out) {
+    USER_REGION_ENTER(read);
     for (int k = 0; k < matrix_.outerSize(); ++k) {
       for (typename SpMatrix<Blk>::InnerIterator it(matrix_, k); it; ++it) {
         ::send<0>(Key<2>({it.row(), it.col()}), it.value(), out);
       }
     }
+    USER_REGION_EXIT(read);
   }
 
  private:
@@ -204,6 +219,7 @@ class Write_SpMatrix : public Op<Key<2>, std::tuple<>, Write_SpMatrix<Blk>, Blk>
       : baseT(edges(in), edges(), "write_spmatrix", {"Cij"}, {}, [](auto key) { return 0; }), matrix_(matrix) {}
 
   void op(const Key<2> &key, typename baseT::input_values_tuple_type &&elem, std::tuple<> &) {
+    USER_REGION_ENTER(write);
     std::lock_guard<std::mutex> lock(mtx_);
     if (ttg::tracing()) {
       auto &w = get_default_world();
@@ -213,6 +229,7 @@ class Write_SpMatrix : public Op<Key<2>, std::tuple<>, Write_SpMatrix<Blk>, Blk>
                  static_cast<void *>(this));
     }
     matrix_.insert(key[0], key[1]) = baseT::template get<0>(elem);
+    USER_REGION_EXIT(write);
   }
 
   /// grab completion status as a future<void>
@@ -273,11 +290,13 @@ class SpMM {
       // broadcast a_ik to all existing {i,j,k}
       std::vector<Key<3>> ijk_keys;
       if (k >= b_rowidx_to_colidx_.size()) return;
+      USER_REGION_ENTER(bcasta);
       for (auto &j : b_rowidx_to_colidx_[k]) {
         if (tracing()) ttg::print("Broadcasting A[", i, "][", k, "] to j=", j);
         ijk_keys.emplace_back(Key<3>({i, j, k}));
       }
       ::broadcast<0>(ijk_keys, baseT::template get<0>(a_ik), a_ijk);
+      USER_REGION_EXIT(bcasta);
     }
 
    private:
@@ -299,11 +318,13 @@ class SpMM {
       // broadcast b_kj to *jk
       std::vector<Key<3>> ijk_keys;
       if (k >= a_colidx_to_rowidx_.size()) return;
+      USER_REGION_ENTER(bcastb);
       for (auto &i : a_colidx_to_rowidx_[k]) {
         if (tracing()) ttg::print("Broadcasting B[", k, "][", j, "] to i=", i);
         ijk_keys.emplace_back(Key<3>({i, j, k}));
       }
       ::broadcast<0>(ijk_keys, baseT::template get<0>(b_kj), b_ijk);
+      USER_REGION_EXIT(bcastb);
     }
 
    private:
@@ -329,6 +350,7 @@ class SpMM {
 
       // for each i and j that belongs to this node
       // determine first k that contributes, initialize input {i,j,first_k} flow to 0
+      USER_REGION_ENTER(csend);
       for (auto i = 0ul; i != a_rowidx_to_colidx_.size(); ++i) {
         if (a_rowidx_to_colidx_[i].empty()) continue;
         for (auto j = 0ul; j != b_colidx_to_rowidx_.size(); ++j) {
@@ -351,6 +373,7 @@ class SpMM {
           }
         }
       }
+      USER_REGION_EXIT(csend);
     }
 
     void op(const Key<3> &key, typename baseT::input_values_tuple_type &&_ijk,
@@ -360,6 +383,7 @@ class SpMM {
       const auto k = key[2];
       long next_k;
       bool have_next_k;
+      USER_REGION_ENTER(mult);
       std::tie(next_k, have_next_k) = compute_next_k(i, j, k);
       if (tracing()) {
         ttg::print("C[", i, "][", j, "]  += A[", i, "][", k, "] by B[", k, "][", j, "],  next_k? ",
@@ -367,16 +391,23 @@ class SpMM {
       }
       // compute the contrib, pass the running total to the next flow, if needed
       // otherwise write to the result flow
+      auto c = gemm(std::move(baseT::template get<2>(_ijk)), baseT::template get<0>(_ijk), baseT::template get<1>(_ijk));
+      USER_REGION_EXIT(mult);
       if (have_next_k) {
+        USER_REGION_ENTER(send);
         ::send<1>(
             Key<3>({i, j, next_k}),
-            gemm(std::move(baseT::template get<2>(_ijk)), baseT::template get<0>(_ijk), baseT::template get<1>(_ijk)),
+            std::move(c),
             result);
-      } else
+        USER_REGION_EXIT(send);
+      } else {
+        USER_REGION_ENTER(sendback);
         ::send<0>(
             Key<2>({i, j}),
-            gemm(std::move(baseT::template get<2>(_ijk)), baseT::template get<0>(_ijk), baseT::template get<1>(_ijk)),
+            std::move(c),
             result);
+        USER_REGION_EXIT(sendback);
+      }
     }
 
    private:
@@ -901,12 +932,43 @@ int main(int argc, char **argv) {
       double avg = parseOption(avgStr, 0.3);
       std::string seedStr(getCmdOption(argv, argv + argc, "-s"));
       unsigned int seed = parseOption(seedStr, 0);
+      if (0 == strcmp("", getCmdOption(argv, argv + argc, "-z"))) {
+        tracing_enabled = true;
+      }
       timing = true;
       initBlSpRandom(M, N, K, minTs, maxTs, avg, A, B, C, gflops, seed);
     } else {
       initBlSpHardCoded(A, B, C);
     }
 #endif  // !defined(BLOCK_SPARSE_GEMM)
+
+    if (tracing_enabled) {
+      std::cout << "Tracing enabled" << std::endl;
+      parsec_profiling_add_dictionary_keyword("BCASTA", "#0000FF",
+                                              0, "",
+                                              &event_bcasta_startkey, &event_bcasta_endkey);
+      parsec_profiling_add_dictionary_keyword("BCASTB", "#0000FF",
+                                              0, "",
+                                              &event_bcastb_startkey, &event_bcastb_endkey);
+      parsec_profiling_add_dictionary_keyword("GEMM", "#0000FF",
+                                              0, "",
+                                              &event_mult_startkey, &event_mult_endkey);
+      parsec_profiling_add_dictionary_keyword("READ", "#0000FF",
+                                              0, "",
+                                              &event_read_startkey, &event_read_endkey);
+      parsec_profiling_add_dictionary_keyword("WRITE", "#0000FF",
+                                              0, "",
+                                              &event_write_startkey, &event_write_endkey);
+      parsec_profiling_add_dictionary_keyword("C_SEND", "#0000FF",
+                                              0, "",
+                                              &event_csend_startkey, &event_csend_endkey);
+      parsec_profiling_add_dictionary_keyword("SEND", "#0000FF",
+                                              0, "",
+                                              &event_send_startkey, &event_send_endkey);
+      parsec_profiling_add_dictionary_keyword("SENDBACK", "#0000FF",
+                                              0, "",
+                                              &event_sendback_startkey, &event_sendback_endkey);
+    }
 
     // flow graph needs to exist on every node
     Edge<> ctl("control");
