@@ -1617,10 +1617,10 @@ namespace ttg_parsec {
           if (nullptr == (copy = reinterpret_cast<ttg_data_copy_t *>(task->parsec_task.data[i].data_in))) {
             if (copy_in == nullptr) {
               copy = detail::create_new_datacopy(std::forward<Value>(value));
-              task->parsec_task.data[i].data_in = copy;
             } else {
-              task->parsec_task.data[i].data_in = copy_in;
+              copy = detail::register_data_copy<valueT>(copy_in, task, input_is_const);
             }
+            task->parsec_task.data[i].data_in = copy;
           } else {
             // TODO: Ask Ed -- Why do we need a copy of value here?
             valueT value_copy = value;  // use constexpr if to avoid making a copy if given nonconst rvalue
