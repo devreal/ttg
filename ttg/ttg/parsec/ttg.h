@@ -43,6 +43,7 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#include <numeric>
 
 #include <parsec.h>
 #include <parsec/class/parsec_hash_table.h>
@@ -68,6 +69,8 @@ void parsec_taskpool_termination_detected(parsec_taskpool_t *tp);
 int parsec_add_fetch_runtime_task(parsec_taskpool_t *tp, int tasks);
 }
 
+#define TTG_PARSEC_MAX_INLINE_SIZE 1024
+
 namespace ttg_parsec {
   inline thread_local parsec_task_t *parsec_ttg_caller;
   inline thread_local parsec_execution_stream_t *parsec_ttg_es;
@@ -90,6 +93,7 @@ namespace ttg_parsec {
     fn_id_t fn_id;
     int32_t param_id;
     int num_keys;
+    bool iovec_inline;
   };
 
   namespace detail {
@@ -1342,6 +1346,21 @@ namespace ttg_parsec {
               } else {
                 set_arg_from_msg_keylist<i, decvalueT>(ttg::span<keyT>(&keylist[0], num_keys), copy);
               }
+
+            } else if (msg->op_id.iovec_inline) {
+              /* the whole object is inlined, unpack it directly */
+              auto &val = *static_cast<decvalueT*>(copy->device_private);
+              auto iovecs = descr.get_data(val);
+              /* start the RMA transfers */
+              for (auto &&iov : iovecs) {
+                std::memcpy(iov.data, msg->bytes, iov.num_bytes);
+                pos += iov.num_bytes;
+              }
+              if (!in_task && (std::get<i>(this->input_reducers) || keylist.size() > 1)) {
+                set_arg_from_msg_keylist_task<i, decvalueT>(std::move(keylist), copy);
+              } else {
+                set_arg_from_msg_keylist<i, decvalueT>(ttg::span<keyT>(&keylist[0], num_keys), copy);
+              }
             } else {
 
               /* extract the callback tag */
@@ -1767,7 +1786,6 @@ namespace ttg_parsec {
         msg->op_id.num_keys = 1;
       }
       if constexpr (!ttg::has_split_metadata<decvalueT>::value) {
-        // std::cout << "set_arg_from_msg unpacking from offset " << sizeof(keyT) << std::endl;
         pos = pack(value, msg->bytes, pos);
       } else {
         ttg_data_copy_t *copy;
@@ -1795,42 +1813,57 @@ namespace ttg_parsec {
         std::memcpy(msg->bytes + pos, &num_iovs, sizeof(num_iovs));
         pos += sizeof(num_iovs);
 
-        /* TODO: at the moment, the tag argument to parsec_ce.get() is treated as a
-         * raw function pointer instead of a preregistered AM tag, so play that game.
-         * Once this is fixed in PaRSEC we need to use parsec_ttg_rma_tag instead! */
-        parsec_ce_tag_t cbtag = reinterpret_cast<parsec_ce_tag_t>(&detail::get_remote_complete_cb);
-        std::memcpy(msg->bytes + pos, &cbtag, sizeof(cbtag));
-        pos += sizeof(cbtag);
+        size_t total_size = std::accumulate(std::next(std::begin(iovecs)), std::end(iovecs), iovecs.begin()->num_bytes,
+                                            [](size_t size, const ttg::iovec& iovec){ return size + iovec.num_bytes; });
+        if (total_size < TTG_PARSEC_MAX_INLINE_SIZE) {
+          /* we can inline the whole object to save extra transfers */
+          /* TODO: try to pack smaller iovecs and leave larger iovecs separate */
+          for (auto &&iov : iovecs) {
+            std::memcpy(msg->bytes + pos, iov.data, iov.num_bytes);
+            pos += iov.num_bytes;
+          }
+          msg->op_id.iovec_inline = true;
+        } else {
 
-        /**
-         * register the generic iovecs and pack the registration handles
-         * memory layout: [<lreg_size, lreg, release_cb_ptr>, ...]
-         */
-        for (auto &&iov : iovecs) {
-          parsec_ce_mem_reg_handle_t lreg;
-          size_t lreg_size;
-          /* TODO: only register once when we can broadcast the data! */
-          parsec_ce.mem_register(iov.data, PARSEC_MEM_TYPE_NONCONTIGUOUS, iov.num_bytes, parsec_datatype_int8_t,
-                                 iov.num_bytes, &lreg, &lreg_size);
-          auto lreg_ptr = std::shared_ptr<void>{lreg, [](void *ptr) {
-                                                  parsec_ce_mem_reg_handle_t memreg = (parsec_ce_mem_reg_handle_t)ptr;
-                                                  parsec_ce.mem_unregister(&memreg);
-                                                }};
-          int32_t lreg_size_i = lreg_size;
-          std::memcpy(msg->bytes + pos, &lreg_size_i, sizeof(lreg_size_i));
-          pos += sizeof(lreg_size_i);
-          std::memcpy(msg->bytes + pos, lreg, lreg_size_i);
-          pos += lreg_size_i;
-          /* TODO: can we avoid the extra indirection of going through std::function? */
-          std::function<void(void)> *fn = new std::function<void(void)>([=]() mutable {
-            /* shared_ptr of value and registration captured by value so resetting
-             * them here will eventually release the memory/registration */
-            detail::release_data_copy(copy);
-            lreg_ptr.reset();
-          });
-          std::intptr_t fn_ptr{reinterpret_cast<std::intptr_t>(fn)};
-          std::memcpy(msg->bytes + pos, &fn_ptr, sizeof(fn_ptr));
-          pos += sizeof(fn_ptr);
+          msg->op_id.iovec_inline = false;
+
+          /* TODO: at the moment, the tag argument to parsec_ce.get() is treated as a
+          * raw function pointer instead of a preregistered AM tag, so play that game.
+          * Once this is fixed in PaRSEC we need to use parsec_ttg_rma_tag instead! */
+          parsec_ce_tag_t cbtag = reinterpret_cast<parsec_ce_tag_t>(&detail::get_remote_complete_cb);
+          std::memcpy(msg->bytes + pos, &cbtag, sizeof(cbtag));
+          pos += sizeof(cbtag);
+
+          /**
+          * register the generic iovecs and pack the registration handles
+          * memory layout: [<lreg_size, lreg, release_cb_ptr>, ...]
+          */
+          for (auto &&iov : iovecs) {
+            parsec_ce_mem_reg_handle_t lreg;
+            size_t lreg_size;
+            /* TODO: only register once when we can broadcast the data! */
+            parsec_ce.mem_register(iov.data, PARSEC_MEM_TYPE_NONCONTIGUOUS, iov.num_bytes, parsec_datatype_int8_t,
+                                  iov.num_bytes, &lreg, &lreg_size);
+            auto lreg_ptr = std::shared_ptr<void>{lreg, [](void *ptr) {
+                                                    parsec_ce_mem_reg_handle_t memreg = (parsec_ce_mem_reg_handle_t)ptr;
+                                                    parsec_ce.mem_unregister(&memreg);
+                                                  }};
+            int32_t lreg_size_i = lreg_size;
+            std::memcpy(msg->bytes + pos, &lreg_size_i, sizeof(lreg_size_i));
+            pos += sizeof(lreg_size_i);
+            std::memcpy(msg->bytes + pos, lreg, lreg_size_i);
+            pos += lreg_size_i;
+            /* TODO: can we avoid the extra indirection of going through std::function? */
+            std::function<void(void)> *fn = new std::function<void(void)>([=]() mutable {
+              /* shared_ptr of value and registration captured by value so resetting
+              * them here will eventually release the memory/registration */
+              detail::release_data_copy(copy);
+              lreg_ptr.reset();
+            });
+            std::intptr_t fn_ptr{reinterpret_cast<std::intptr_t>(fn)};
+            std::memcpy(msg->bytes + pos, &fn_ptr, sizeof(fn_ptr));
+            pos += sizeof(fn_ptr);
+          }
         }
       }
       send_am(owner, static_cast<void *>(msg.get()), sizeof(msg_header_t) + pos);
@@ -2031,22 +2064,27 @@ namespace ttg_parsec {
         auto iovs = descr.get_data(*const_cast<decvalueT *>(&value));
         int32_t num_iovs = std::distance(std::begin(iovs), std::end(iovs));
         std::vector<std::pair<int32_t, std::shared_ptr<void>>> memregs;
-        memregs.reserve(num_iovs);
 
-        /* register all iovs so the registration can be reused */
-        for (auto &&iov : iovs) {
-          parsec_ce_mem_reg_handle_t lreg;
-          size_t lreg_size;
-          parsec_ce.mem_register(iov.data, PARSEC_MEM_TYPE_NONCONTIGUOUS, iov.num_bytes, parsec_datatype_int8_t,
-                                 iov.num_bytes, &lreg, &lreg_size);
-          /* TODO: use a static function for deregistration here? */
-          memregs.push_back(std::make_pair(static_cast<int32_t>(lreg_size),
-                                           /* TODO: this assumes that parsec_ce_mem_reg_handle_t is void* */
-                                           std::shared_ptr<void>{lreg, [](void *ptr) {
-                                                                   parsec_ce_mem_reg_handle_t memreg =
-                                                                       (parsec_ce_mem_reg_handle_t)ptr;
-                                                                   parsec_ce.mem_unregister(&memreg);
-                                                                 }}));
+        size_t total_size = std::accumulate(std::next(std::begin(iovs)), std::end(iovs), iovs.begin()->num_bytes,
+                                            [](size_t size, const ttg::iovec& iovec){ return size + iovec.num_bytes; });
+
+        if (total_size >= TTG_PARSEC_MAX_INLINE_SIZE) {
+          /* register all iovs so the registration can be reused */
+          memregs.reserve(num_iovs);
+          for (auto &&iov : iovs) {
+            parsec_ce_mem_reg_handle_t lreg;
+            size_t lreg_size;
+            parsec_ce.mem_register(iov.data, PARSEC_MEM_TYPE_NONCONTIGUOUS, iov.num_bytes, parsec_datatype_int8_t,
+                                  iov.num_bytes, &lreg, &lreg_size);
+            /* TODO: use a static function for deregistration here? */
+            memregs.push_back(std::make_pair(static_cast<int32_t>(lreg_size),
+                                            /* TODO: this assumes that parsec_ce_mem_reg_handle_t is void* */
+                                            std::shared_ptr<void>{lreg, [](void *ptr) {
+                                                                    parsec_ce_mem_reg_handle_t memreg =
+                                                                        (parsec_ce_mem_reg_handle_t)ptr;
+                                                                    parsec_ce.mem_unregister(&memreg);
+                                                                  }}));
+          }
         }
 
         using msg_t = detail::msg_t;
@@ -2094,41 +2132,54 @@ namespace ttg_parsec {
           std::memcpy(msg->bytes + pos, &num_iovs, sizeof(num_iovs));
           pos += sizeof(num_iovs);
 
-          /* TODO: at the moment, the tag argument to parsec_ce.get() is treated as a
-           * raw function pointer instead of a preregistered AM tag, so play that game.
-           * Once this is fixed in PaRSEC we need to use parsec_ttg_rma_tag instead! */
-          parsec_ce_tag_t cbtag = reinterpret_cast<parsec_ce_tag_t>(&detail::get_remote_complete_cb);
-          std::memcpy(msg->bytes + pos, &cbtag, sizeof(cbtag));
-          pos += sizeof(cbtag);
-
           /**
            * pack the registration handles
            * memory layout: [<lreg_size, lreg, lreg_fn>, ...]
            */
-          int idx = 0;
-          for (auto &&iov : iovs) {
-            // auto [lreg_size, lreg_ptr] = memregs[idx];
-            int32_t lreg_size;
-            std::shared_ptr<void> lreg_ptr;
-            std::tie(lreg_size, lreg_ptr) = memregs[idx];
-            std::memcpy(msg->bytes + pos, &lreg_size, sizeof(lreg_size));
-            pos += sizeof(lreg_size);
-            std::memcpy(msg->bytes + pos, lreg_ptr.get(), lreg_size);
-            pos += lreg_size;
-            /* create a function that will be invoked upon RMA completion at the target */
-            std::shared_ptr<void> lreg_ptr_v = lreg_ptr;
-            /* mark another reader on the copy */
-            copy = detail::register_data_copy<valueT>(copy, nullptr, true);
-            std::function<void(void)> *fn = new std::function<void(void)>([=]() mutable {
-              /* shared_ptr of value and registration captured by value so resetting
-               * them here will eventually release the memory/registration */
-              detail::release_data_copy(copy);
-              lreg_ptr_v.reset();
-            });
-            std::intptr_t fn_ptr{reinterpret_cast<std::intptr_t>(fn)};
-            std::memcpy(msg->bytes + pos, &fn_ptr, sizeof(fn_ptr));
-            pos += sizeof(fn_ptr);
-            ++idx;
+          if (total_size < TTG_PARSEC_MAX_INLINE_SIZE) {
+            /* we can inline the whole object to save extra transfers */
+            /* TODO: try to pack smaller iovecs and leave larger iovecs separate */
+            for (auto &&iov : iovs) {
+              std::memcpy(msg->bytes + pos, iov.data, iov.num_bytes);
+              pos += iov.num_bytes;
+            }
+            msg->op_id.iovec_inline = true;
+          } else {
+
+            int idx = 0;
+            msg->op_id.iovec_inline = false;
+
+            /* TODO: at the moment, the tag argument to parsec_ce.get() is treated as a
+            * raw function pointer instead of a preregistered AM tag, so play that game.
+            * Once this is fixed in PaRSEC we need to use parsec_ttg_rma_tag instead! */
+            parsec_ce_tag_t cbtag = reinterpret_cast<parsec_ce_tag_t>(&detail::get_remote_complete_cb);
+            std::memcpy(msg->bytes + pos, &cbtag, sizeof(cbtag));
+            pos += sizeof(cbtag);
+
+            for (auto &&iov : iovs) {
+              // auto [lreg_size, lreg_ptr] = memregs[idx];
+              int32_t lreg_size;
+              std::shared_ptr<void> lreg_ptr;
+              std::tie(lreg_size, lreg_ptr) = memregs[idx];
+              std::memcpy(msg->bytes + pos, &lreg_size, sizeof(lreg_size));
+              pos += sizeof(lreg_size);
+              std::memcpy(msg->bytes + pos, lreg_ptr.get(), lreg_size);
+              pos += lreg_size;
+              /* create a function that will be invoked upon RMA completion at the target */
+              std::shared_ptr<void> lreg_ptr_v = lreg_ptr;
+              /* mark another reader on the copy */
+              copy = detail::register_data_copy<valueT>(copy, nullptr, true);
+              std::function<void(void)> *fn = new std::function<void(void)>([=]() mutable {
+                /* shared_ptr of value and registration captured by value so resetting
+                * them here will eventually release the memory/registration */
+                detail::release_data_copy(copy);
+                lreg_ptr_v.reset();
+              });
+              std::intptr_t fn_ptr{reinterpret_cast<std::intptr_t>(fn)};
+              std::memcpy(msg->bytes + pos, &fn_ptr, sizeof(fn_ptr));
+              pos += sizeof(fn_ptr);
+              ++idx;
+            }
           }
           send_am(owner, static_cast<void *>(msg.get()), sizeof(msg_header_t) + pos);
         }
