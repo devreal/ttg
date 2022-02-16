@@ -11,6 +11,7 @@
 /* include ttg header to make symbols available in case this header is included directly */
 #include "../../ttg.h"
 
+#include "ttg/aggregator.h"
 #include "ttg/base/keymap.h"
 #include "ttg/base/tt.h"
 #include "ttg/base/world.h"
@@ -764,9 +765,9 @@ namespace ttg_parsec {
       }
     }
 
-    using input_terminals_type = std::tuple<ttg::In<keyT, input_valueTs>...>;
+    using input_terminals_type = std::tuple<ttg::In<keyT, ttg::detail::terminal_type_t<input_valueTs>>...>;
     using input_args_type = std::tuple<input_valueTs...>;
-    using input_edges_type = std::tuple<ttg::Edge<keyT, std::decay_t<input_valueTs>>...>;
+    using input_edges_type = std::tuple<ttg::Edge<keyT, ttg::meta::decayed_aggregator_t<input_valueTs>>...>;
     static_assert(ttg::meta::is_none_Void_v<input_valueTs...>, "ttg::Void is for internal use only, do not use it");
     // if have data inputs and (always last) control input, convert last input to Void to make logic easier
     using input_values_full_tuple_type = std::tuple<ttg::meta::void_to_Void_t<std::decay_t<input_valueTs>>...>;
@@ -1308,10 +1309,12 @@ namespace ttg_parsec {
       task_t *task;
       auto &world_impl = world.impl();
       auto &reducer = std::get<i>(input_reducers);
+      constexpr bool is_aggregator = ttg::detail::is_aggregator_v<valueT>;
       bool release = false;
       bool remove_from_hash = true;
+      bool use_hash_table = (numins > 1) || reducer || is_aggregator;
       /* If we have only one input and no reducer on that input we can skip the hash table */
-      if (numins > 1 || reducer) {
+      if (use_hash_table) {
         parsec_hash_table_lock_bucket(&tasks_table, hk);
         if (nullptr == (task = (task_t *)parsec_hash_table_nolock_find(&tasks_table, hk))) {
           task = create_new_task(key);
@@ -1330,16 +1333,44 @@ namespace ttg_parsec {
         remove_from_hash = false;
       }
 
-      if (reducer) {  // is this a streaming input? reduce the received value
+      if constexpr (is_aggregator) {
+
+        /* we use the lock to ensure mutual exclusion when inserting into the aggregator */
+
+        using aggregator_t = valueT;
+        aggregator_t* agg;
+        ttg_data_copy_t *agg_copy;
+        if (nullptr == (agg_copy = reinterpret_cast<ttg_data_copy_t *>(task->parsec_task.data[i].data_in))) {
+          /* create a new aggregator */
+          agg_copy = detail::create_new_datacopy(aggregator_t());
+          task->parsec_task.data[i].data_in = agg_copy;
+        }
+        agg = reinterpret_cast<aggregator_t *>(agg_copy->device_private);
+
+        ttg_data_copy_t *copy;
+        if (nullptr != copy_in) {
+          /* register this copy with the task */
+          copy = detail::register_data_copy<std::decay_t<Value>>(copy_in, task, std::is_const_v<typename aggregator_t::value_type>);
+        } else {
+          copy = detail::create_new_datacopy(std::forward<Value>(value));
+        }
+        /* put the value into the aggregator */
+        agg->add_value(*reinterpret_cast<std::decay_t<Value> *>(copy->device_private));
+        release = (agg->size() == task->stream[i].goal);
+
+        /* release the hash table bucket */
+        parsec_hash_table_unlock_bucket(&tasks_table, hk);
+
+      } else  if (reducer) {  // is this a streaming input? reduce the received value
         // N.B. Right now reductions are done eagerly, without spawning tasks
         //      this means we must lock
-        parsec_hash_table_lock_bucket(&tasks_table, hk);
+
+        /* we use the lock for mutual exclusion for the reducer */
 
         if constexpr (!ttg::meta::is_void_v<valueT>) {  // for data values
           // have a value already? if not, set, otherwise reduce
           ttg_data_copy_t *copy = nullptr;
           if (nullptr == (copy = reinterpret_cast<ttg_data_copy_t *>(task->parsec_task.data[i].data_in))) {
-            using decay_valueT = std::decay_t<valueT>;
             if (nullptr == copy_in) {
               copy = detail::create_new_datacopy(std::forward<Value>(value));
             } else {
@@ -1347,7 +1378,8 @@ namespace ttg_parsec {
             }
             task->parsec_task.data[i].data_in = copy;
           } else {
-            reducer(*reinterpret_cast<std::decay_t<valueT> *>(copy->device_private), value);
+            using decay_valueT = std::decay_t<valueT>;
+            reducer(*reinterpret_cast<decay_valueT *>(copy->device_private), value);
           }
         } else {
           reducer();  // even if this was a control input, must execute the reducer for possible side effects
@@ -1360,6 +1392,8 @@ namespace ttg_parsec {
         }
         parsec_hash_table_unlock_bucket(&tasks_table, hk);
       } else {
+        /* release the lock, not needed anymore */
+        parsec_hash_table_unlock_bucket(&tasks_table, hk);
         /* whether the task needs to be deferred or not */
         bool needs_deferring = false;
         if constexpr (!valueT_is_Void) {

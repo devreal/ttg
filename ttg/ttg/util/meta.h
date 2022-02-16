@@ -10,6 +10,11 @@ namespace ttg {
 
   class Void;
 
+  // fwd decl
+  template<typename ValueT>
+  struct Aggregator;
+
+
   namespace meta {
 
 #if __cplusplus >= 201703L
@@ -78,13 +83,26 @@ namespace ttg {
     template <typename Tuple>
     using nonref_tuple_t = typename nonref_tuple<Tuple>::type;
 
+    template<typename T>
+    struct decayed_aggregator {
+      using type = std::decay_t<T>;
+    };
+
+    template<typename ValueT>
+    struct decayed_aggregator<ttg::Aggregator<ValueT>> {
+      using type = ttg::Aggregator<std::decay_t<ValueT>>;
+    };
+
+    template<typename T>
+    using decayed_aggregator_t = typename decayed_aggregator<T>::type;
+
     // tuple<Ts...> -> tuple<std::decay_t<Ts>...>
-    template <typename T, typename Enabler = void>
+    template <typename T>
     struct decayed_tuple;
 
     template <typename... Ts>
     struct decayed_tuple<std::tuple<Ts...>> {
-      using type = std::tuple<typename std::decay<Ts>::type...>;
+      using type = std::tuple<decayed_aggregator_t<std::decay_t<Ts>>...>;
     };
 
     template <typename Tuple>

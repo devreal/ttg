@@ -120,6 +120,25 @@ namespace tt_i_iv {
   };
 }  // namespace tt_i_iv
 
+
+namespace tt_i_i_a {
+
+  class tt : public ttg::TT<int, std::tuple<>, tt, ttg::Aggregator<int>> {
+    using baseT = ttg::TT<int, std::tuple<>, tt, ttg::Aggregator<int>>;
+
+   public:
+    tt(const typename baseT::input_edges_type &inedges, const typename baseT::output_edges_type &outedges,
+       const std::string &name)
+        : baseT(inedges, outedges, name, {"int", "void"}, {}) {}
+
+    static constexpr const bool have_cuda_op = false;
+
+    void op(const int &key, const baseT::input_refs_tuple_type &data, baseT::output_terminals_type &outs) {}
+
+    ~tt() {}
+  };
+}  // namespace tt_i_i_a
+
 TEST_CASE("TemplateTask", "[core]") {
   SECTION("constructors") {
     {  // void task id, void data
@@ -156,6 +175,12 @@ TEST_CASE("TemplateTask", "[core]") {
       CHECK_NOTHROW(std::make_unique<tt_i_i::tt>(ttg::edges(in), ttg::edges(), ""));
       CHECK_NOTHROW(
           ttg::make_tt([](const int &key, const int &datum, std::tuple<> &outs) {}, ttg::edges(in), ttg::edges()));
+    }
+    {  // nonvoid task id, nonvoid data, aggregator input
+      ttg::Edge<int, int> in;
+      CHECK_NOTHROW(std::make_unique<tt_i_i_a::tt>(ttg::edges(ttg::make_aggregator(in)), ttg::edges(), ""));
+      CHECK_NOTHROW(
+          ttg::make_tt([](const int &key, ttg::Aggregator<const int> &datum, std::tuple<> &outs) {}, ttg::edges(ttg::make_aggregator(in)), ttg::edges()));
     }
   }
 }
