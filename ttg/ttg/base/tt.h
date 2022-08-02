@@ -27,6 +27,7 @@ namespace ttg {
     int64_t instance_id;  //!< Unique ID for object; in after-move state will be -1
 
     std::string name;
+    std::string full_name;
     std::vector<TerminalBase *> inputs;
     std::vector<TerminalBase *> outputs;
     bool trace_instance = false;         //!< If true traces just this instance
@@ -108,16 +109,18 @@ namespace ttg {
    protected:
     TTBase(TTBase &&other)
         : instance_id(other.instance_id)
-        , is_ttg_(std::move(other.is_ttg_))
         , name(std::move(other.name))
+        , full_name(std::move(other.name))
         , inputs(std::move(other.inputs))
-        , outputs(std::move(other.outputs)) {
+        , outputs(std::move(other.outputs))
+        , is_ttg_(std::move(other.is_ttg_)) {
       other.instance_id = -1;
     }
     TTBase &operator=(TTBase &&other) {
       instance_id = other.instance_id;
       is_ttg_ = std::move(other.is_ttg_);
       name = std::move(other.name);
+      full_name = std::move(other.full_name);
       inputs = std::move(other.inputs);
       outputs = std::move(other.outputs);
       other.instance_id = -1;
@@ -125,7 +128,7 @@ namespace ttg {
     }
 
     TTBase(const std::string &name, size_t numins, size_t numouts)
-        : instance_id(next_instance_id()), is_ttg_(false), name(name), inputs(numins), outputs(numouts) {}
+        : instance_id(next_instance_id()), name(name), inputs(numins), outputs(numouts), is_ttg_(false)  {}
 
     static const std::vector<TerminalBase *> *&outputs_tls_ptr_accessor() {
       static thread_local const std::vector<TerminalBase *> *outputs_tls_ptr = nullptr;
@@ -182,8 +185,46 @@ namespace ttg {
       return owning_ttg;
     }
 
+    const void set_ttg(TTBase& ttg) {
+      // the full name will be different after this call
+      this->full_name.clear();
+      this->owning_ttg = &ttg;
+    }
+
     bool is_ttg() const {
       return is_ttg_;
+    }
+
+  private:
+
+    void assemble_full_name(std::stringstream& ss, const TTBase* tt) const {
+      if (nullptr != tt->ttg_ptr()) {
+        // prepend the owning ttg's name
+        assemble_full_name(ss, tt->ttg_ptr());
+        ss << "::";
+      }
+      std::cout << "tt name: " << tt->get_name() << std::endl;
+      std::string name = tt->get_name();
+      // remove the ' TTG' substring from the owner
+      auto pos = name.rfind(" TTG");
+      if (pos != name.npos) {
+        name.erase(pos);
+      }
+      ss << name;
+    }
+
+  public:
+
+    /// returns the full name, including the TTG hierarchy
+    const std::string& get_full_name() {
+      if (full_name.empty()) {
+        // populate the name
+        std::stringstream ss;
+        assemble_full_name(ss, this);
+        full_name = ss.str();
+        std::cout << "get_full_name " << full_name << std::endl;
+      }
+      return full_name;
     }
 
     /// Sets the name of this operation

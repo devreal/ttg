@@ -89,7 +89,7 @@ namespace ttg {
 
    private:
     void own_my_tts() const {
-      for (auto &op : tts) op->owning_ttg = this;
+      for (auto &op : tts) op->set_ttg(this);
     }
 
   };
