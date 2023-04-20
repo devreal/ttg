@@ -7,11 +7,11 @@
 
 #include "ttg/base/terminal.h"
 #include "ttg/fwd.h"
+#include "ttg/run.h"
 #include "ttg/util/demangle.h"
 #include "ttg/util/meta.h"
 #include "ttg/util/trace.h"
 #include "ttg/world.h"
-#include "boost/callable_traits.hpp"
 
 namespace ttg {
   namespace detail {
@@ -20,61 +20,62 @@ namespace ttg {
      * Elements of the data structure can be accessed using get method, which calls the at method of the Container.
      * keyT - taskID
      * valueT - Value type of the Container
-    */
-    template<typename keyT, typename valueT>
+     */
+    template <typename keyT, typename valueT>
     struct ContainerWrapper {
-      std::function<valueT (keyT const& key)> get = nullptr;
-      std::function<size_t (keyT const& key)> owner = nullptr;
+      std::function<valueT(keyT const &key)> get = nullptr;
+      std::function<size_t(keyT const &key)> owner = nullptr;
 
       ContainerWrapper() = default;
       ContainerWrapper(const ContainerWrapper &) = default;
       ContainerWrapper(ContainerWrapper &&) = default;
-      ContainerWrapper& operator=(const ContainerWrapper&) = default;
+      ContainerWrapper &operator=(const ContainerWrapper &) = default;
 
-      template<typename T, typename mapperT, typename keymapT, std::enable_if_t<!std::is_same<std::decay_t<T>,
-                                                          ContainerWrapper>{}, bool> = true>
-        //Store a pointer to the user's container in std::any, no copies
-        ContainerWrapper(T &t, mapperT &&mapper,
-                         keymapT &&keymap) : get([&t, mapper = std::forward<mapperT>(mapper)](keyT const &key) {
-                                                   if constexpr (!std::is_class_v<T> && std::is_invocable_v<T, keyT>) {
-                                                      auto k = mapper(key);
-                                                      return t(k); //Call the user-defined lambda function.
-                                                    }
-                                                  else
-                                                    {
-                                                      auto k = mapper(key);
-                                                      //at method returns a const ref to the item.
-                                                      return t.at(k);
-                                                    }
-                                                }),
-                                             owner([&t, mapper = std::forward<mapperT>(mapper),
-                                                    keymap = std::forward<keymapT>(keymap)](keyT const &key) {
-                                                    auto idx = mapper(key); //Mapper to map task ID to index of the data structure.
-                                                    return keymap(idx);
-                                                  })
-        {}
+      template <typename T, typename mapperT, typename keymapT,
+                std::enable_if_t<!std::is_same<std::decay_t<T>, ContainerWrapper>{}, bool> = true>
+      // Store a pointer to the user's container in std::any, no copies
+      ContainerWrapper(T &t, mapperT &&mapper, keymapT &&keymap)
+          : get([&t, mapper = std::forward<mapperT>(mapper)](keyT const &key) {
+            if constexpr (!std::is_class_v<T> && std::is_invocable_v<T, keyT>) {
+              auto k = mapper(key);
+              return t(k);  // Call the user-defined lambda function.
+            } else {
+              auto k = mapper(key);
+              // at method returns a const ref to the item.
+              return t.at(k);
+            }
+          })
+          , owner(
+                [&t, mapper = std::forward<mapperT>(mapper), keymap = std::forward<keymapT>(keymap)](keyT const &key) {
+                  auto idx = mapper(key);  // Mapper to map task ID to index of the data structure.
+                  return keymap(idx);
+                }) {}
     };
 
-    template <typename valueT> struct ContainerWrapper<void, valueT> {
-      std::function<valueT ()> get = nullptr;
-      std::function<size_t ()> owner = nullptr;
+    template <typename valueT>
+    struct ContainerWrapper<void, valueT> {
+      std::function<valueT()> get = nullptr;
+      std::function<size_t()> owner = nullptr;
     };
 
-    template <typename keyT> struct ContainerWrapper<keyT, void> {
-      std::function<std::nullptr_t (keyT const& key)> get = nullptr;
-      std::function<size_t (keyT const& key)> owner = nullptr;
+    template <typename keyT>
+    struct ContainerWrapper<keyT, void> {
+      std::function<std::nullptr_t(keyT const &key)> get = nullptr;
+      std::function<size_t(keyT const &key)> owner = nullptr;
     };
 
-    template <typename valueT> struct ContainerWrapper<ttg::Void, valueT> {
-      std::function<valueT ()> get = nullptr;
-      std::function<size_t ()> owner = nullptr;
+    template <typename valueT>
+    struct ContainerWrapper<ttg::Void, valueT> {
+      std::function<valueT()> get = nullptr;
+      std::function<size_t()> owner = nullptr;
     };
 
-    template <> struct ContainerWrapper<void, void> {
-      std::function<std::nullptr_t ()> get = nullptr;
-      std::function<size_t ()> owner = nullptr;
+    template <>
+    struct ContainerWrapper<void, void> {
+      std::function<std::nullptr_t()> get = nullptr;
+      std::function<size_t()> owner = nullptr;
     };
-  } //namespace detail
+  }  // namespace detail
 
   /// \brief Base type for input terminals receiving messages annotated by task IDs of type `keyT`
   /// \tparam <keyT> a task ID type (can be `void`)
@@ -300,15 +301,13 @@ namespace ttg {
       }
     }
 
-
     template <typename rangeT, typename Value>
     void prepare_send(const rangeT &keylist, Value &&value) {
       const Value &v = value;
       if (prepare_send_callback) {
         if constexpr (ttg::meta::is_iterable_v<rangeT>) {
-          prepare_send_callback(ttg::span<const keyT>(&(*std::begin(keylist)),
-                                                      std::distance(std::begin(keylist), std::end(keylist))),
-                                v);
+          prepare_send_callback(
+              ttg::span<const keyT>(&(*std::begin(keylist)), std::distance(std::begin(keylist), std::end(keylist))), v);
         } else {
           /* got something we cannot iterate over (single element?) so put one element in the span */
           prepare_send_callback(ttg::span<const keyT>(&keylist, 1), v);
@@ -457,14 +456,13 @@ namespace ttg {
             ")");
 #endif
       this->connect_base(in);
-      //If I am a pull terminal, add me as (in)'s predecessor
-      if (this->is_pull_terminal)
-        in->connect_pull(this);
+      // If I am a pull terminal, add me as (in)'s predecessor
+      if (this->is_pull_terminal) in->connect_pull(this);
     }
 
-    template<typename Key = keyT, typename Value = valueT>
-    std::enable_if_t<meta::is_none_void_v<Key,Value>,void> send(const Key &key, const Value &value) {
-      for (auto && successor : this->successors()) {
+    template <typename Key = keyT, typename Value = valueT>
+    std::enable_if_t<meta::is_none_void_v<Key, Value>, void> send(const Key &key, const Value &value) {
+      for (auto &&successor : this->successors()) {
         assert(successor->get_type() != TerminalBase::Type::Write);
         if (successor->get_type() == TerminalBase::Type::Read) {
           static_cast<In<keyT, std::add_const_t<valueT>> *>(successor)->send(key, value);
@@ -566,8 +564,8 @@ namespace ttg {
     }
 
     template <typename rangeT, typename Key = keyT, typename Value = valueT>
-    std::enable_if_t<meta::is_none_void_v<Key> && !meta::is_void_v<valueT>, void>
-    prepare_send(const rangeT &keylist, const Value &value) {
+    std::enable_if_t<meta::is_none_void_v<Key> && !meta::is_void_v<valueT>, void> prepare_send(const rangeT &keylist,
+                                                                                               const Value &value) {
       for (auto &&successor : this->successors()) {
         assert(successor->get_type() != TerminalBase::Type::Write);
         if (successor->get_type() == TerminalBase::Type::Read) {
@@ -579,8 +577,7 @@ namespace ttg {
     }
 
     template <typename rangeT, typename Key = keyT, typename Value = valueT>
-    std::enable_if_t<meta::is_none_void_v<Key> && !meta::is_void_v<valueT>, void>
-    prepare_send(const Value &value) {
+    std::enable_if_t<meta::is_none_void_v<Key> && !meta::is_void_v<valueT>, void> prepare_send(const Value &value) {
       for (auto &&successor : this->successors()) {
         assert(successor->get_type() != TerminalBase::Type::Write);
         if (successor->get_type() == TerminalBase::Type::Read) {
