@@ -1277,6 +1277,28 @@ namespace ttg_madness {
 
 #include "ttg/make_tt.h"
 
+   namespace device {
+    class DeviceAllocator {
+      public:
+        DeviceAllocator(int did) { 
+          if(did != 0) {
+            throw std::out_of_range("TTG MADNESS Backend: current implementation only supports CPU devices")
+          }
+        }
+        void *allocate(std::size_t size) {
+          return ::malloc(size);
+        };
+        void  free(void *ptr) {
+          ::free(ptr);
+        }
+        ::ttg::ExecutionSpace executionSpace() {
+          return ::ttg::ExecutionSpace::Host;
+        }
+    };
+
+    std::size_t nb_devices() { return 1; }
+  }
+
 }  // namespace ttg_madness
 
 #include "ttg/madness/watch.h"

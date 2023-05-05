@@ -72,6 +72,11 @@ namespace ttg_parsec {
   template <typename T>
   static void ttg_broadcast(ttg::World world, T &data, int source_rank);
 
+  namespace device {
+    class DeviceAllocator;
+    std::size_t nb_devices();
+  }
+
 #if 0
   template<typename... Args>
   inline std::pair<bool, std::tuple<ptr<std::decay_t<Args>>...>> get_ptr(Args&&... args);
@@ -81,7 +86,6 @@ namespace ttg_parsec {
 
   template<typename T, typename... Args>
   inline ptr<T> make_ptr(Args&&... args);
-
 
 }  // namespace ttg_parsec
 

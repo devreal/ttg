@@ -45,6 +45,11 @@ namespace ttg_madness {
   template <typename T>
   inline void ttg_broadcast(ttg::World world, T &data, int source_rank);
 
+  namespace device {
+    class DeviceAllocator;
+    std::size_t nb_devices();
+  }
+
 }  // namespace ttg_madness
 
 #endif  // TTG_MADNESS_FWD_H

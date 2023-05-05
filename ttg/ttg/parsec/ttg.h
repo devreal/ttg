@@ -78,6 +78,7 @@
 #include <parsec/execution_stream.h>
 #include <parsec/interfaces/interface.h>
 #include <parsec/mca/device/device.h>
+#include <parsec/utils/zone_malloc.h>
 #include <parsec/parsec_comm_engine.h>
 #include <parsec/parsec_internal.h>
 #include <parsec/scheduling.h>
@@ -3565,6 +3566,71 @@ namespace ttg_parsec {
   };
 
 #include "ttg/make_tt.h"
+
+  namespace device {
+
+    class DeviceAllocator {
+      private:
+          int ttg_did, parsec_did;
+          struct ::zone_malloc_s *zone;
+          ::ttg::ExecutionSpace exec_space;
+      public:
+        DeviceAllocator(int did);
+        void *allocate(std::size_t size);
+        void  free(void *ptr);
+        ::ttg::ExecutionSpace executionSpace();
+    };
+
+    DeviceAllocator::DeviceAllocator(int did) : ttg_did(-1), parsec_did(-1), zone(nullptr), exec_space(::ttg::ExecutionSpace::Invalid) {
+      for(int i = 0; i < parsec_nb_devices; i++) {
+        parsec_device_module_t *m = parsec_mca_device_get(i);
+        if(m->type == PARSEC_DEV_CPU || m->type == PARSEC_DEV_CUDA) { 
+          if(did == 0) {
+            parsec_did = i;
+            ttg_did = did;
+            if(m->type == PARSEC_DEV_CUDA) {
+              parsec_device_gpu_module_t *gm = reinterpret_cast<parsec_device_gpu_module_t*>(m);
+              zone = gm->memory;
+              exec_space = ::ttg::ExecutionSpace::CUDA;
+            } else {
+              exec_space = ::ttg::ExecutionSpace::Host;
+            }
+            return;
+          }
+          did--;
+        }
+      }
+      throw std::out_of_range("Device identifier is out of range");
+    }
+
+    void *DeviceAllocator::allocate(std::size_t size) {
+      if(nullptr == zone) return malloc(size);
+      return zone_malloc(zone, size);
+    }
+
+    void DeviceAllocator::free(void *ptr) {
+      if(nullptr == zone) {
+        free(ptr);
+        return;
+      }
+      zone_free(zone, ptr);
+    }
+
+    ::ttg::ExecutionSpace DeviceAllocator::executionSpace() {
+      return exec_space;
+    }
+
+    std::size_t nb_devices() { 
+      std::size_t nb = 0;
+      for(int i = 0; i < parsec_nb_devices; i++) {
+        parsec_device_module_t *m = parsec_mca_device_get(i);
+        if(m->type == PARSEC_DEV_CPU || m->type == PARSEC_DEV_CUDA) {
+          nb++;
+        }
+      }
+      return nb;
+    }
+  } // namespace ttg_parsec::device
 
 }  // namespace ttg_parsec
 
