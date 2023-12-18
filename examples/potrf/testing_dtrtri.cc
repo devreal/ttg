@@ -13,6 +13,8 @@
 #include "result.h"
 #include "trtri_L.h"
 #include "trtri_U.h"
+#include "util.h"
+
 
 int check_dtrtri( lapack::Diag diag, lapack::Uplo uplo, double *A, double *Ainv, int N );
 
@@ -73,6 +75,8 @@ int main(int argc, char **argv)
     uplo = lapack::Uplo::Lower;
 
   ttg::initialize(argc, argv, nthreads);
+
+  kokkos_init(argc, argv);
 
   auto world = ttg::default_execution_context();
 
@@ -228,6 +232,7 @@ int main(int argc, char **argv)
   world.dag_off();
   world.profile_off();
 
+  kokkos_finalize();
   ttg::finalize();
   return ret;
 }
@@ -309,7 +314,7 @@ int check_dtrtri( lapack::Diag diag, lapack::Uplo uplo, double *A, double *Ainv,
 
     std::cout << "============" << std::endl;
     std::cout << "Checking TRTRI " << std::endl;
-    std::cout <<  "-- ||A||_one = " << Anorm << " ||A^(-1)||_one = " << Ainvnorm << " ||I - A * A^(-1)||_one = " 
+    std::cout <<  "-- ||A||_one = " << Anorm << " ||A^(-1)||_one = " << Ainvnorm << " ||I - A * A^(-1)||_one = "
               << Rnorm << ", cond = " << Rcond << ", result = " << result << std::endl;
 
     if ( std::isinf(Ainvnorm) || std::isnan(result) || std::isinf(result) || (result > 10.0) ) {

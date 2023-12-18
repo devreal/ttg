@@ -1,3 +1,5 @@
+#define DEBUG_TILES_VALUES 1
+
 #include <ttg.h>
 #include <ttg/serialization/std/tuple.h>
 
@@ -5,6 +7,7 @@
 #include "pmw.h"
 #include "potrf.h"
 #include "result.h"
+#include "util.h"
 
 #include <iomanip>
 
@@ -37,6 +40,16 @@ int main(int argc, char **argv)
   char *opt = nullptr;
   int ret = EXIT_SUCCESS;
   int niter = 3;
+  int P = -1, Q = -1;
+
+  if( (opt = getCmdOption(argv+1, argv+argc, "-P")) != nullptr ) {
+    P = Q = atoi(opt);
+  }
+
+  if( (opt = getCmdOption(argv+1, argv+argc, "-Q")) != nullptr ) {
+    Q = atoi(opt);
+    if (P == -1) P = Q;
+  }
 
   if( (opt = getCmdOption(argv+1, argv+argc, "-N")) != nullptr ) {
     N = M = atoi(opt);
@@ -58,11 +71,31 @@ int main(int argc, char **argv)
     niter = atoi(opt);
   }
 
-  bool check = !cmdOptionExists(argv+1, argv+argc, "-x");
+  bool check = cmdOptionExists(argv+1, argv+argc, "-x");
   bool cow_hint = !cmdOptionExists(argv+1, argv+argc, "-w");
 
   // TODO: need to filter out our arguments to make parsec happy
   ttg::initialize(1, argv, nthreads);
+
+  if (P == -1) {
+    if (Q == -1) {
+      P = std::sqrt(world.size());
+    } else {
+      P = (world.size() + Q - 1)/Q;
+    }
+  }
+  if (Q == -1) {
+    Q = (world.size() + P - 1)/P;
+  }
+
+  // try to find proper process grid
+  while (P*Q != world.size()) {
+    P = std::max(P, Q);
+    P--;
+    Q = (world.size() + P - 1)/P;
+  }
+
+  kokkos_init(argc, argv);
 
   // initialize MADNESS so that TA allocators can be created
   madness::ParsecRuntime::initialize_with_existing_context(ttg::default_execution_context().impl().context());
@@ -82,9 +115,14 @@ int main(int argc, char **argv)
     check = false;
   }
 
+  if (P*Q > world.size()) {
+    std::cerr << "World size is not "
+  }
+
   static_assert(ttg::has_split_metadata<MatrixTile<double>>::value);
 
-  std::cout << "Creating 2D block cyclic matrix with NB " << NB << " N " << N << " M " << M << " P " << P << std::endl;
+  std::cout << "Creating 2D block cyclic matrix with NB " << NB << " N "
+            << N << " M " << M << " P " << P << " Q " << Q << std::endl;
 
   parsec_matrix_sym_block_cyclic_t dcA;
   parsec_matrix_sym_block_cyclic_init(&dcA, parsec_matrix_type_t::PARSEC_MATRIX_DOUBLE,
@@ -227,6 +265,7 @@ int main(int argc, char **argv)
   world.profile_off();
 
   madness::finalize();
+  kokkos_finalize();
   ttg::finalize();
   return ret;
 }

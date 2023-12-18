@@ -17,6 +17,17 @@ if (TARGET tiledarray)
     add_ttg_executable(testing_dlauum potrf/testing_dlauum.cc LINK_LIBRARIES tiledarray lapackpp)
     add_ttg_executable(testing_dpoinv potrf/testing_dpoinv.cc LINK_LIBRARIES tiledarray lapackpp)
 
+    if (TARGET Kokkos::kokkos)
+      add_library(plgsy-device STATIC potrf/core_plgsy.cu)
+      target_link_libraries(plgsy-device PRIVATE Kokkos::kokkos)
+      target_compile_options(plgsy-device PRIVATE --extended-lambda --expt-relaxed-constexpr -I${CMAKE_CURRENT_SOURCE_DIR}/../ttg/ -I${CMAKE_CURRENT_SOURCE_DIR})
+      target_compile_definitions(plgsy-device PRIVATE -DTTG_HAVE_KOKKOS)
+      # TODO: target_include_directories does not seem to work with CUDA :/
+      include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../ttg/ ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/potrf)
+      #add_library(plgsy-host STATIC potrf/core_plgsy.cc)
+      #target_link_libraries(plgsy-host PRIVATE Kokkos::kokkos)
+    endif(TARGET Kokkos::kokkos)
+
     if (TARGET CUDA::cublas)
       add_ttg_executable(bspmm-cuda spmm/spmm_cuda.cc
                          LINK_LIBRARIES tiledarray TiledArray_Eigen BTAS Boost::boost CUDA::cublas
@@ -26,7 +37,9 @@ if (TARGET tiledarray)
       if (TARGET CUDA::cusolver)
         add_ttg_executable(testing_dpotrf_cuda potrf/testing_dpotrf.cc
                           LINK_LIBRARIES lapackpp tiledarray CUDA::cublas CUDA::cusolver
-                          COMPILE_DEFINITIONS TTG_ENABLE_CUDA=1 #;DEBUG_TILES_VALUES=1
+                                          $<$<TARGET_EXISTS:Kokkos::kokkos>:$<TARGET_OBJECTS:Kokkos::kokkoscore>>
+                                          $<$<TARGET_EXISTS:Kokkos::kokkos>:plgsy-device>
+                          COMPILE_DEFINITIONS TTG_ENABLE_CUDA=1;$<$<TARGET_EXISTS:Kokkos::kokkos>:TTG_HAVE_KOKKOS=1> #;DEBUG_TILES_VALUES=1
                           RUNTIMES "parsec")
       endif(TARGET CUDA::cusolver)
     elseif (TARGET roc::hipblas)
@@ -37,7 +50,9 @@ if (TARGET tiledarray)
       if (TARGET roc::hipsolver)
         add_ttg_executable(testing_dpotrf_hip potrf/testing_dpotrf.cc
                            LINK_LIBRARIES lapackpp tiledarray roc::hipblas roc::hipsolver
-                           COMPILE_DEFINITIONS TTG_ENABLE_HIP=1;DEBUG_TILES_VALUES=1
+                                          $<$<TARGET_EXISTS:Kokkos::kokkos>:$<TARGET_OBJECTS:Kokkos::kokkoscore>>
+                                          $<$<TARGET_EXISTS:Kokkos::kokkos>:plgsy-device>
+                           COMPILE_DEFINITIONS TTG_ENABLE_HIP=1;$<$<TARGET_EXISTS:Kokkos::kokkos>:TTG_HAVE_KOKKOS=1> #;DEBUG_TILES_VALUES=1
                            RUNTIMES "parsec")
       endif(TARGET roc::hipsolver)
     elseif (TARGET MKL::MKL_DPCPP)

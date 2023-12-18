@@ -12,6 +12,7 @@
 #include "plgsy.h"
 #include "pmw.h"
 #include "result.h"
+#include "util.h"
 
 char* getCmdOption(char ** begin, char ** end, const std::string & option)
 {
@@ -57,6 +58,8 @@ int main(int argc, char **argv)
   bool defer_cow_hint = !cmdOptionExists(argv+1, argv+argc, "-w");
 
   ttg::initialize(argc, argv, nthreads);
+
+  kokkos_init(argc, argv);
 
   auto world = ttg::default_execution_context();
 
@@ -140,6 +143,7 @@ int main(int argc, char **argv)
   world.dag_off();
   world.profile_off();
 
+  kokkos_finalize();
   ttg::finalize();
   return ret;
 }

@@ -5,6 +5,7 @@
 #include "lapack.hh"
 #include "pmw.h"
 #include "util.h"
+#include "norm.h"
 #include "../devblas_helper.h"
 
 
@@ -67,19 +68,6 @@ namespace potrf {
                       A.buffer().current_device_ptr(), A.lda(),
                       workspace, Lwork,
                       devInfo);
-  #endif
-  }
-
-  static void device_norm(const MatrixTile<double> &A, double *norm) {
-    auto size = A.size();
-    auto buffer = A.buffer().current_device_ptr();
-    //std::cout << "device_norm ptr " << buffer << " device " << ttg::device::current_device() << std::endl;
-#if defined(TTG_HAVE_CUDA)
-    auto handle = cublas_handle();
-    //double n = 1.0;
-    cublasDnrm2(handle, size, buffer, 1, norm);
-  #elif defined(TTG_HAVE_HIPBLAS)
-    hipblasDnrm2(hipblas_handle(), size, buffer, 1, norm);
   #endif
   }
 #endif // defined(TTG_HAVE_CUDART) || defined(TTG_HAVE_HIP)
@@ -160,6 +148,7 @@ namespace potrf {
       device_norm(tile_kk, &norms[1]);
       /* wait for the kernel to complete */
       co_await ttg::wait_kernel(devInfo);
+      std::cout << "POTRF " << key << " input norm " << std::setprecision(12) << norms[0] << " output norm " << norms[1] << std::endl;
       // check that we got the input tile we expected
       assert(check_norm(tile_kk.norm(), norms[0]));
       // set the new norm
@@ -307,6 +296,7 @@ namespace potrf {
       device_norm(tile_mk, &norms[2]);
       /* wait for the kernel to complete */
       co_await ttg::wait_kernel();
+      std::cout << "TRSM " << key << " input norms kk " << std::setprecision(12) << norms[0] << " mk " << norms[1] << " output norm " << norms[2] << std::endl;
       // check that we got the input tiles we expected
       assert(check_norm(tile_kk.norm(), norms[0]));
       assert(check_norm(tile_mk.norm(), norms[1]));
@@ -436,6 +426,7 @@ namespace potrf {
       device_norm(tile_kk, &norms[2]);
       /* wait for the kernel to complete */
       co_await ttg::wait_kernel();
+      std::cout << "SYRK " << key << " input norm mk " << std::setprecision(12) << norms[0] << " kk " << norms[1] << " output norm " << norms[2] << std::endl;
       // check that we got the input tiles we expected
       assert(check_norm(tile_mk.norm(), norms[0]));
       assert(check_norm(tile_kk.norm(), norms[1]));

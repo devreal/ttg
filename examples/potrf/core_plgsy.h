@@ -75,23 +75,27 @@ void CORE_plgsy( T bump, int m, int n, T *A, int lda,
 
     jump = (unsigned long long int)m0 + (unsigned long long int)n0 * (unsigned long long int)gM;
 
+
+    auto fill_line = [](T* line, int from, int to, int ran, int ptr_advance){
+            T* tmp = line;
+            for (int i = from; i < to; i++) {
+                *tmp = 0.5f - ran * RndF_Mul;
+                ran  = Rnd64_A * ran + Rnd64_C;
+                if constexpr (std::is_same<T, std::complex<double>>::value ||
+                    std::is_same<T, std::complex<float>>::value ) {
+                    *tmp += T(- ran * RndF_Mul, 0.5);
+                    ran   = Rnd64_A * ran + Rnd64_C;
+                }
+                tmp += ptr_advance;
+            }
+        };
     /*
      * Tile diagonal
      */
     if ( m0 == n0 ) {
         for (j = 0; j < n; j++) {
             ran = Rnd64_jump( nbelem * jump, seed );
-
-            for (i = j; i < m; i++) {
-                *tmp = 0.5f - ran * RndF_Mul;
-                ran  = Rnd64_A * ran + Rnd64_C;
-                if constexpr (std::is_same<T, std::complex<double>>::value ||
-                    std::is_same<T, std::complex<float>>::value ) {
-                  *tmp += T(- ran * RndF_Mul, 0.5);
-                  ran   = Rnd64_A * ran + Rnd64_C;
-                }
-                tmp++;
-            }
+            fill_line(tmp, j, m, ran, 1);
             tmp  += (lda - i + j + 1);
             jump += gM + 1;
         }
@@ -110,17 +114,7 @@ void CORE_plgsy( T bump, int m, int n, T *A, int lda,
     else if ( m0 > n0 ) {
         for (j = 0; j < n; j++) {
             ran = Rnd64_jump( nbelem * jump, seed );
-
-            for (i = 0; i < m; i++) {
-                *tmp = 0.5f - ran * RndF_Mul;
-                ran  = Rnd64_A * ran + Rnd64_C;
-                if constexpr (std::is_same<T, std::complex<double>>::value ||
-                    std::is_same<T, std::complex<float>>::value ) {
-                  *tmp += T(- ran * RndF_Mul, 0.5);
-                  ran   = Rnd64_A * ran + Rnd64_C;
-                }
-                tmp++;
-            }
+            fill_line(tmp, 0, j, ran, 1);
             tmp  += (lda - i);
             jump += gM;
         }
@@ -134,17 +128,18 @@ void CORE_plgsy( T bump, int m, int n, T *A, int lda,
 
         for (i = 0; i < m; i++) {
             ran = Rnd64_jump( nbelem * jump, seed );
-
-            for (j = 0; j < n; j++) {
-                A[j*lda+i] = 0.5f - ran * RndF_Mul;
-                ran = Rnd64_A * ran + Rnd64_C;
-                if constexpr (std::is_same<T, std::complex<double>>::value ||
-                    std::is_same<T, std::complex<float>>::value ) {
-                  A[j*lda+i] += T(0.0, 0.5f - ran * RndF_Mul);
-                  ran = Rnd64_A * ran + Rnd64_C;
-                }
-            }
+            fill_line(&A[i], 0, n, ran, lda);
             jump += gM;
         }
     }
 }
+
+
+template <typename T>
+void CORE_plgsy_device( T bump, int m, int n, T *A, int lda,
+                        int gM, int m0, int n0, unsigned long long int seed );
+
+
+template <typename T>
+void CORE_plgsy_kokkos_host( T bump, int m, int n, T *A, int lda,
+                             int gM, int m0, int n0, unsigned long long int seed );

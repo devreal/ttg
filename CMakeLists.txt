@@ -188,6 +188,8 @@ else(MPI_FOUND)
   set(TTG_HAVE_MPIEXT $<BOOL:false>)
 endif(MPI_FOUND)
 
+find_package(Kokkos COMPONENTS separable_compilation)
+
 ##########################
 #### Examples
 ##########################
