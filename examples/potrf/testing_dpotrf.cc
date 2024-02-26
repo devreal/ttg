@@ -38,6 +38,17 @@ int main(int argc, char **argv)
   int ret = EXIT_SUCCESS;
   int niter = 3;
 
+  int P = -1, Q = -1;
+
+  if( (opt = getCmdOption(argv+1, argv+argc, "-P")) != nullptr ) {
+    P = Q = atoi(opt);
+  }
+
+  if( (opt = getCmdOption(argv+1, argv+argc, "-Q")) != nullptr ) {
+    Q = atoi(opt);
+    if (P == -1) P = Q;
+  }
+
   if( (opt = getCmdOption(argv+1, argv+argc, "-N")) != nullptr ) {
     N = M = atoi(opt);
   }
@@ -64,17 +75,39 @@ int main(int argc, char **argv)
   // TODO: need to filter out our arguments to make parsec happy
   ttg::initialize(1, argv, nthreads);
 
-  /* set up TA to get the allocator */
-  allocator_init();
-
   auto world = ttg::default_execution_context();
+
+  if (P == -1) {
+    if (Q == -1) {
+      P = std::sqrt(world.size());
+    } else {
+      P = (world.size() + Q - 1)/Q;
+    }
+  }
+  if (Q == -1) {
+    Q = (world.size() + P - 1)/P;
+  }
+
+  // try to find proper process grid
+  if (P*Q != world.size()) {
+    P = std::max(P, Q);
+    while (P*Q != world.size() && P > 1) {
+      P--;
+      Q = (world.size() + P - 1)/P;
+    }
+  }
+
+  // TODO: DEBUG
+  //ttg::trace_on();
+
+  // initialize MADNESS so that TA allocators can be created
+  madness::ParsecRuntime::initialize_with_existing_context(ttg::default_execution_context().impl().context());
+  madness::initialize(argc, argv, /* nthread = */ 1, /* quiet = */ true);
+
   if(nullptr != prof_filename) {
     world.profile_on();
     world.dag_on(prof_filename);
   }
-
-  int P = std::sqrt(world.size());
-  int Q = (world.size() + P - 1)/P;
 
   if(check && (P>1 || Q>1)) {
     std::cerr << "Check is disabled for distributed runs at this time" << std::endl;
@@ -83,7 +116,10 @@ int main(int argc, char **argv)
 
   static_assert(ttg::has_split_metadata<MatrixTile<double>>::value);
 
-  std::cout << "Creating 2D block cyclic matrix with NB " << NB << " N " << N << " M " << M << " P " << P << std::endl;
+  if (0 == world.rank()) {
+    std::cout << "Creating 2D block cyclic matrix with NB " << NB << " N "
+              << N << " M " << M << " P " << P << " Q " << Q << std::endl;
+  }
 
   parsec_matrix_sym_block_cyclic_t dcA;
   parsec_matrix_sym_block_cyclic_init(&dcA, parsec_matrix_type_t::PARSEC_MATRIX_DOUBLE,
@@ -227,7 +263,7 @@ int main(int argc, char **argv)
 
   world.profile_off();
 
-  allocator_fini();
+  madness::finalize();
   ttg::finalize();
   return ret;
 }
