@@ -254,6 +254,8 @@ if (TARGET PaRSEC::parsec)
           ${CMAKE_CURRENT_SOURCE_DIR}/ttg/parsec/devicescratch.h
           ${CMAKE_CURRENT_SOURCE_DIR}/ttg/parsec/fwd.h
           ${CMAKE_CURRENT_SOURCE_DIR}/ttg/parsec/import.h
+          ${CMAKE_CURRENT_SOURCE_DIR}/ttg/parsec/keyfns.h
+          ${CMAKE_CURRENT_SOURCE_DIR}/ttg/parsec/mutexflow.h
           ${CMAKE_CURRENT_SOURCE_DIR}/ttg/parsec/ptr.h
           ${CMAKE_CURRENT_SOURCE_DIR}/ttg/parsec/parsec-ext.h
           ${CMAKE_CURRENT_SOURCE_DIR}/ttg/parsec/parsec_data.h

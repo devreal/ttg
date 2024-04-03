@@ -315,7 +315,7 @@ class SpMM25D {
           const std::vector<std::vector<long>> &b_cols_of_row,
           const std::vector<std::vector<long>> &b_rows_of_col, const std::vector<int> &mTiles,
           const std::vector<int> &nTiles, const std::vector<int> &kTiles, Keymap2 ij_keymap, Keymap3 ijk_keymap,
-          long P, long Q, long R, long parallel_bcasts = 1, bool enable_device_map = true)
+          long P, long Q, long R, long parallel_bcasts = 1, bool enable_device_map = true, bool enable_mutexflows = false)
       : a_cols_of_row_(a_cols_of_row)
       , b_rows_of_col_(b_rows_of_col)
       , a_rows_of_col_(a_rows_of_col)
@@ -338,7 +338,8 @@ class SpMM25D {
     local_bcast_b_ = std::make_unique<LocalBcastB>(local_b_ijk_, b_ijk_, a_rows_of_col_, ijk_keymap_);
     multiplyadd_ = std::make_unique<MultiplyAdd<Space>>(a_ijk_, b_ijk_, c_ijk_, c_ij_p_, a_cols_of_row_,
                                                         b_rows_of_col_, mTiles, nTiles, ijk_keymap_, constraint,
-                                                        k_cnt_, P, Q, parallel_bcasts_, enable_device_map_);
+                                                        k_cnt_, P, Q, parallel_bcasts_, enable_device_map_,
+                                                        enable_mutexflows);
 
     reduce_c_ = std::make_unique<ReduceC>(c_ij_p_, c, ij_keymap_);
     reduce_c_->template set_input_reducer<0>(
@@ -612,15 +613,47 @@ class SpMM25D {
                 std::shared_ptr<ttg::SequencedKeysConstraint<Key<2>>> constraint,
                 std::vector<std::atomic<std::size_t>>& k_cnt,
                 long P, long Q,
-                std::size_t parallel_bcasts, bool enable_device_map)
+                std::size_t parallel_bcasts, bool enable_device_map, bool enable_mutexflows)
         : baseT(edges(a_ijk, b_ijk, c_ijk), edges(c, c_ijk), "SpMM25D::MultiplyAdd", {"a_ijk", "b_ijk", "c_ijk"},
                 {"c_ij", "c_ijk"}, ijk_keymap)
         , a_cols_of_row_(a_cols_of_row)
         , b_rows_of_col_(b_rows_of_col)
         , k_cnt_(k_cnt)
         , constraint(std::move(constraint))
-        , parallel_bcasts_(parallel_bcasts) {
+        , parallel_bcasts_(parallel_bcasts)
+        , enable_mutexflows_(enable_mutexflows) {
       this->set_priomap([=,this](const Key<3> &ijk) { return this->prio(ijk); });  // map a key to an integral priority value
+
+      /* set the mutex map */
+      if (enable_mutexflows) {
+        this->template set_mutexmap<2>(
+          [&](const Key<3>& key){
+            /* map [i, j, k] to [i, j, 0] */
+            return Key<3>{key[0], key[1], 0};
+          },
+          [&](const Key<3> &key) {
+            /* count the number of tasks for this particular [i, j] */
+            std::size_t count = 0;
+            const auto p = ttg::default_execution_context().rank();
+            int k;
+            int i = key[0];
+            int j = key[1];
+            bool have_k;
+            std::tie(k, have_k) = compute_first_k(i, j, p);
+            while (have_k) {
+              count++;
+              std::tie(k, have_k) = compute_next_k(i, j, k);
+            }
+            return count;
+          },
+          /* TODO: the code calling the finalizer should detect whether or not
+          *       the callback takes the output tuple */
+          [&](const Key<3> &key, const blk_t& C) {
+            /* the final action: send the result */
+            ttg::send<0>(Key<2>({key[0], key[1]}), C);
+          });
+      }
+
       if constexpr (is_device_space) {
         if (enable_device_map) {
           int num_devices = ttg::device::num_devices();
@@ -696,31 +729,47 @@ class SpMM25D {
 
       // pass the running total to the next flow, if needed
       // otherwise write to the result flow
-      if (have_next_k) {
-        co_await ttg::device::forward(ttg::device::send<1>(
-                                                Key<3>({i, j, next_k}),
+      if (enable_mutexflows_) {
+        if (have_next_k) {
+          co_await ttg::device::forward(ttg::device::send<1>(
+                                                  Key<3>({i, j, next_k}),
+                                                  std::move(C),
+                                                  result));
+        } else {  // done with all local contributions to C[i][j], reduce with others on the process to which C[i][j]
+                  // belongs
+          co_await ttg::device::forward(ttg::device::send<0>(
+                                                  Key<2>({i, j}),
+                                                  std::move(C),
+                                                  result));
+        } else {
+          // no mutex flows, just send the result
+          co_await ttg::device::forward(ttg::device::send<1>(
+                                                ijk, // reuse the key, it will be mapped to the same bucket
                                                 std::move(C),
                                                 result));
-      } else {  // done with all local contributions to C[i][j], reduce with others on the process to which C[i][j]
-                // belongs
-        co_await ttg::device::forward(ttg::device::send<0>(
-                                                Key<2>({i, j}),
-                                                std::move(C),
-                                                result));
+        }
       }
 #else  // HAVE_SPMM_DEVICE
       gemm(C, A, B);
       // compute the contrib, pass the running total to the next flow, if needed
       // otherwise write to the result flow
-      if (have_next_k) {
+      if (!enable_mutexflows_) {
+        if (have_next_k) {
+          ::send<1>(
+              Key<3>({i, j, next_k}),
+              std::move(C),
+              result);
+        } else {  // done with all local contributions to C[i][j], reduce with others on the process to which C[i][j]
+                  // belongs
+          ::send<0>(
+              Key<2>({i, j}),
+              std::move(C),
+              result);
+        }
+      } else {
+        // no mutex flows, just send the result
         ::send<1>(
-            Key<3>({i, j, next_k}),
-            std::move(C),
-            result);
-      } else {  // done with all local contributions to C[i][j], reduce with others on the process to which C[i][j]
-                // belongs
-        ::send<0>(
-            Key<2>({i, j}),
+            ijk, // reuse the key, it will be mapped to the same bucket
             std::move(C),
             result);
       }
@@ -733,6 +782,7 @@ class SpMM25D {
     std::vector<std::atomic<std::size_t>>& k_cnt_;
     std::shared_ptr<ttg::SequencedKeysConstraint<Key<2>>> constraint;
     std::size_t parallel_bcasts_;
+    bool enable_mutexflows_;
 
     /* Compute the length of the remaining sequence on that tile */
     int32_t prio(const Key<3> &key) const {
@@ -1454,7 +1504,8 @@ static void timed_measurement(SpMatrix<> &A, SpMatrix<> &B, const std::function<
                               const std::vector<std::vector<long>> &b_cols_of_row,
                               const std::vector<std::vector<long>> &b_rows_of_col, std::vector<int> &mTiles,
                               std::vector<int> &nTiles, std::vector<int> &kTiles, int M, int N, int K, int minTs,
-                              int maxTs, int P, int Q, int R, int parallel_bcasts, bool enable_device_map) {
+                              int maxTs, int P, int Q, int R, int parallel_bcasts, bool enable_device_map,
+                              bool enable_mutexflow) {
   int MT = (int)A.rows();
   int NT = (int)B.cols();
   int KT = (int)A.cols();
@@ -1481,7 +1532,8 @@ static void timed_measurement(SpMatrix<> &A, SpMatrix<> &B, const std::function<
   assert(!has_value(c_status));
   //  SpMM25D a_times_b(world, eA, eB, eC, A, B);
   SpMM25D<> a_times_b(eA, eB, eC, A, B, a_cols_of_row, a_rows_of_col, b_cols_of_row, b_rows_of_col,
-                      mTiles, nTiles, kTiles, ij_keymap, ijk_keymap, P, Q, R, parallel_bcasts, enable_device_map);
+                      mTiles, nTiles, kTiles, ij_keymap, ijk_keymap, P, Q, R, parallel_bcasts, enable_device_map,
+                      enable_mutexflow);
   TTGUNUSED(a);
   TTGUNUSED(b);
   TTGUNUSED(a_times_b);
@@ -1717,6 +1769,14 @@ int main(int argc, char **argv) {
       }
       ttg_broadcast(ttg::default_execution_context(), seed, 0);
 
+      bool enable_mutexflow = cmdOptionExists(argv, argv + argc, "-mf");
+
+      bool enable_tracing  = cmdOptionExists(argv, argv + argc, "-trace");
+      if (enable_tracing) {
+        ttg::trace_on();
+        TTBase::set_trace_all(true);
+      }
+
       std::vector<int> mTiles;
       std::vector<int> nTiles;
       std::vector<int> kTiles;
@@ -1807,7 +1867,8 @@ int main(int argc, char **argv) {
 #endif // TTG_USE_PARSEC
           timed_measurement(A, B, ij_keymap, ijk_keymap, tiling_type, gflops, avg_nb, Adensity, Bdensity,
                             a_cols_of_row, a_rows_of_col, b_cols_of_row, b_rows_of_col, mTiles,
-                            nTiles, kTiles, M, N, K, minTs, maxTs, P, Q, R, parallel_bcasts, enable_device_map);
+                            nTiles, kTiles, M, N, K, minTs, maxTs, P, Q, R, parallel_bcasts, enable_device_map,
+                            enable_mutexflow);
 #if TTG_USE_PARSEC
           /* reset PaRSEC's load tracking */
           parsec_devices_reset_load(default_execution_context().impl().context());

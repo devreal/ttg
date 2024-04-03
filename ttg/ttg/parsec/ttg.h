@@ -27,6 +27,8 @@
 #include "ttg/edge.h"
 #include "ttg/execution.h"
 #include "ttg/func.h"
+#include "ttg/parsec/keyfns.h"
+#include "ttg/parsec/mutexflow.h"
 #include "ttg/runtimes.h"
 #include "ttg/terminal.h"
 #include "ttg/tt.h"
@@ -1357,6 +1359,11 @@ namespace ttg_parsec {
     ttg::meta::detail::keymap_t<keyT> keymap;
     ttg::meta::detail::keymap_t<keyT> priomap;
     ttg::meta::detail::keymap_t<keyT, ttg::device::Device> devicemap;
+
+    detail::mutexflow_tuple_type<keyT, input_tuple_type> mutexflows;  //!< mutex flow functions
+    std::size_t num_mutexflow = 0;  //!< number of mutex flows in the task
+
+
     // For now use same type for unary/streaming input terminals, and stream reducers assigned at runtime
     ttg::meta::detail::input_reducers_t<actual_input_tuple_type>
         input_reducers;  //!< Reducers for the input terminals (empty = expect single value)
@@ -2445,6 +2452,7 @@ namespace ttg_parsec {
     void set_arg_local_impl(const Key &key, Value &&value, detail::ttg_data_copy_t *copy_in = nullptr,
                             parsec_task_t **task_ring = nullptr) {
       using valueT = std::tuple_element_t<i, input_values_full_tuple_type>;
+      using decvalueT = std::decay_t<Value>;
       constexpr const bool input_is_const = std::is_const_v<std::tuple_element_t<i, input_args_type>>;
       constexpr const bool valueT_is_Void = ttg::meta::is_void_v<valueT>;
       constexpr const bool keyT_is_Void = ttg::meta::is_void_v<Key>;
@@ -2458,7 +2466,7 @@ namespace ttg_parsec {
         assert(keymap(key) == world.rank());
       }
 
-      task_t *task;
+      task_t *task = nullptr;
       auto &world_impl = world.impl();
       auto &reducer = std::get<i>(input_reducers);
       bool release = false;
@@ -2468,42 +2476,124 @@ namespace ttg_parsec {
 #endif
       bool get_pull_data = false;
       bool has_lock = false;
-      /* If we have only one input and no reducer on that input we can skip the hash table */
-      if (numins > 1 || reducer) {
-        has_lock = true;
-        parsec_hash_table_lock_bucket(&tasks_table, hk);
-        if (nullptr == (task = (task_t *)parsec_hash_table_nolock_find(&tasks_table, hk))) {
+      bool has_mutexflow = false;
+
+      auto get_copy_fn = [&](detail::parsec_ttg_task_base_t *task, auto&& value, bool is_const){
+        detail::ttg_data_copy_t *copy = copy_in;
+        if (nullptr == copy && nullptr != detail::parsec_ttg_caller) {
+          copy = detail::find_copy_in_task(detail::parsec_ttg_caller, &value);
+        }
+        if (nullptr != copy) {
+          /* retain the data copy */
+          copy = detail::register_data_copy<valueT>(copy, task, is_const);
+        } else {
+          /* create a new copy */
+          copy = detail::create_new_datacopy(std::forward<Value>(value));
+          if (!is_const) {
+            copy->mark_mutable();
+          }
+        }
+        return copy;
+      };
+
+      /* check if we have a mutex flow */
+      if constexpr (i < std::tuple_size_v<decltype(mutexflows)>) {
+        if (num_mutexflow > 0 && std::get<i>(mutexflows)) {
+          auto& mf = std::get<i>(mutexflows);
+          has_mutexflow = true;
+          bool need_finalize = false;
+          /* check if there is a task in the mutexflow and put in a dummy if not */
+          parsec_hash_table_lock_bucket(mf.get_hash_table(), hk);
+          detail::mutexflow_elem<keyT>* elem;
+          elem = (detail::mutexflow_elem<keyT>*)parsec_hash_table_nolock_find(mf.get_hash_table(), hk);
+          if (nullptr == elem) {
+            /* there is no task yet, which means that no task has all their other inputs fulfilled yet
+            * we create a new element int the bucket and store the value in it so that it can be used by
+            * another task later */
+            auto copy = get_copy_fn(nullptr, std::forward<Value>(value), input_is_const);
+            assert(nullptr != copy);
+
+            elem = new detail::mutexflow_elem<keyT>(mf.map_key(key), mf.get_count(key), copy);
+            parsec_hash_table_nolock_insert(mf.get_hash_table(), &elem->item());
+          } else if (elem->has_task()) {
+            /* there is a task, we can use it */
+            task = static_cast<task_t*>(elem->next_task());
+            /* don't set the input here, that will be done in release_task() */
+          } else {
+            /* no task but we already have an element */
+            /* make sure the element does not have a value set already */
+            if (elem->has_copy()) {
+              ttg::print_error(get_name(), " : ", key, ": error mutex argument is already set : ", i);
+              throw std::logic_error("bad set arg");
+            }
+            if (elem->get_count() <= 1) { // check for 1 because the current task is still active
+              /* there are no tasks left to execute so we finalize and are done */
+              need_finalize = true;
+            } else {
+              /* set the value in the element */
+              elem->set_copy(get_copy_fn(nullptr, std::forward<Value>(value), input_is_const));
+            }
+          }
+          parsec_hash_table_unlock_bucket(mf.get_hash_table(), hk);
+          if (need_finalize) {
+            /* TODO: we need a function that encapsulates this, called here and in make_tt */
+            auto old_output_tls_ptr = this->outputs_tls_ptr_accessor();
+            this->set_outputs_tls_ptr();
+            // make sure the output tls is reset
+            auto _ = ttg::detail::scope_exit(
+              [this, old_output_tls_ptr](){
+                this->set_outputs_tls_ptr(old_output_tls_ptr);
+              });
+            mf.finalize(key, value);
+          }
+        }
+      }
+
+      if (!has_mutexflow) {
+        if (numins > 1 || reducer) {
+          /* more than one input or we have a reducer */
+          has_lock = true;
+          parsec_hash_table_lock_bucket(&tasks_table, hk);
+          if (nullptr == (task = (task_t *)parsec_hash_table_nolock_find(&tasks_table, hk))) {
+            task = create_new_task(key);
+            world_impl.increment_created();
+            parsec_hash_table_nolock_insert(&tasks_table, &task->tt_ht_item);
+            get_pull_data = !is_lazy_pull();
+            if( world_impl.dag_profiling() ) {
+  #if defined(PARSEC_PROF_GRAPHER)
+              parsec_prof_grapher_task(&task->parsec_task, world_impl.execution_stream()->th_id, 0,
+                                      key_hash<keyT>(make_key<keyT>(task->parsec_task.taskpool, task->parsec_task.locals), nullptr));
+  #endif
+            }
+          } else if (!reducer && numins == (task->in_data_count + 1)) {
+            /* remove while we have the lock */
+            parsec_hash_table_nolock_remove(&tasks_table, hk);
+            remove_from_hash = false;
+          }
+          /* if we have a reducer, we need to hold on to the lock for just a little longer */
+          if (!reducer) {
+            parsec_hash_table_unlock_bucket(&tasks_table, hk);
+            has_lock = false;
+          }
+        } else {
+          /* If we have only one input and no reducer on that input we can skip the hash table */
           task = create_new_task(key);
           world_impl.increment_created();
-          parsec_hash_table_nolock_insert(&tasks_table, &task->tt_ht_item);
-          get_pull_data = !is_lazy_pull();
+          remove_from_hash = false;
           if( world_impl.dag_profiling() ) {
 #if defined(PARSEC_PROF_GRAPHER)
             parsec_prof_grapher_task(&task->parsec_task, world_impl.execution_stream()->th_id, 0,
-                                     key_hash(make_key(task->parsec_task.taskpool, task->parsec_task.locals), nullptr));
+                                    key_hash<keyT>(make_key<keyT>(task->parsec_task.taskpool, task->parsec_task.locals), nullptr));
 #endif
           }
-        } else if (!reducer && numins == (task->in_data_count + 1)) {
-          /* remove while we have the lock */
-          parsec_hash_table_nolock_remove(&tasks_table, hk);
-          remove_from_hash = false;
-        }
-        /* if we have a reducer, we need to hold on to the lock for just a little longer */
-        if (!reducer) {
-          parsec_hash_table_unlock_bucket(&tasks_table, hk);
-          has_lock = false;
-        }
-      } else {
-        task = create_new_task(key);
-        world_impl.increment_created();
-        remove_from_hash = false;
-        if( world_impl.dag_profiling() ) {
-#if defined(PARSEC_PROF_GRAPHER)
-          parsec_prof_grapher_task(&task->parsec_task, world_impl.execution_stream()->th_id, 0,
-                                   key_hash(make_key(task->parsec_task.taskpool, task->parsec_task.locals), nullptr));
-#endif
         }
       }
+
+      if (nullptr == task) {
+        /* we did not find a task so nothing else to do here */
+        return;  // no task created, nothing to do
+      }
+
 
       if( world_impl.dag_profiling() ) {
 #if defined(PARSEC_PROF_GRAPHER)
@@ -2525,24 +2615,6 @@ namespace ttg_parsec {
         }
 #endif
       }
-
-      auto get_copy_fn = [&](detail::parsec_ttg_task_base_t *task, auto&& value, bool is_const){
-        detail::ttg_data_copy_t *copy = copy_in;
-        if (nullptr == copy && nullptr != detail::parsec_ttg_caller) {
-          copy = detail::find_copy_in_task(detail::parsec_ttg_caller, &value);
-        }
-        if (nullptr != copy) {
-          /* retain the data copy */
-          copy = detail::register_data_copy<valueT>(copy, task, is_const);
-        } else {
-          /* create a new copy */
-          copy = detail::create_new_datacopy(std::forward<Value>(value));
-          if (!is_const) {
-            copy->mark_mutable();
-          }
-        }
-        return copy;
-      };
 
       if (reducer && 1 != task->streams[i].goal) {  // is this a streaming input? reduce the received value
         auto submit_reducer_task = [&](auto *parent_task){
@@ -2616,21 +2688,25 @@ namespace ttg_parsec {
         }
         /* whether the task needs to be deferred or not */
         if constexpr (!valueT_is_Void) {
-          if (nullptr != task->copies[i]) {
-            ttg::print_error(get_name(), " : ", key, ": error argument is already set : ", i);
-            throw std::logic_error("bad set arg");
+          if (!has_mutexflow) {
+            if (nullptr != task->copies[i]) {
+              ttg::print_error(get_name(), " : ", key, ": error argument is already set : ", i);
+              throw std::logic_error("bad set arg");
+            }
+
+            /* get the copy to use as input for this task */
+            detail::ttg_data_copy_t *copy = get_copy_fn(task, std::forward<Value>(value), input_is_const);
+
+            /* if we registered as a writer and were the first to register with this copy
+            * we need to defer the release of this task to give other tasks a chance to
+            * make a copy of the original data */
+            release = (copy->get_next_task() != &task->parsec_task);
+            task->copies[i] = copy;
+          } else {
+            release = true; // always call into release if we have a mutexflow
           }
-
-          /* get the copy to use as input for this task */
-          detail::ttg_data_copy_t *copy = get_copy_fn(task, std::forward<Value>(value), input_is_const);
-
-          /* if we registered as a writer and were the first to register with this copy
-           * we need to defer the release of this task to give other tasks a chance to
-           * make a copy of the original data */
-          release = (copy->get_next_task() != &task->parsec_task);
-          task->copies[i] = copy;
         } else {
-          release = true;
+          release = true; // always call into release if the value is void
         }
       }
       task->remove_from_hash = remove_from_hash;
@@ -2722,15 +2798,20 @@ namespace ttg_parsec {
       }
     }
 
+
+    /**
+     * Release one dependency of a task, i.e., increment the
+     */
     void release_task(task_t *task,
                       parsec_task_t **task_ring = nullptr) {
       constexpr const bool keyT_is_Void = ttg::meta::is_void_v<keyT>;
 
       /* if remove_from_hash == false, someone has already removed the task from the hash table
        * so we know that the task is ready, no need to do atomic increments here */
-      bool is_ready = !task->remove_from_hash;
+      bool is_ready = (!task->remove_from_hash) && (num_mutexflow == 0);
       int32_t count;
       if (is_ready) {
+        assert(num_mutexflow == 0);
         count = numins;
       } else {
         count = parsec_atomic_fetch_inc_int32(&task->in_data_count) + 1;
@@ -2739,6 +2820,46 @@ namespace ttg_parsec {
 
       auto &world_impl = world.impl();
       ttT *baseobj = task->tt;
+
+      /* handle mutex flows (we have either 1 or 0 inputs outstanding) */
+      if (num_mutexflow > 0 && (numins - count) <= num_mutexflow) {
+        /* check if this task can be released from the mutexflow */
+        auto handle_mutexflow = [&]<std::size_t i>(auto& mf) {
+          if (mf) {
+            parsec_key_t hk = task->pkey();
+            parsec_hash_table_lock_bucket(mf.get_hash_table(), hk);
+            detail::mutexflow_elem<keyT>* elem;
+            if (nullptr != (elem = (detail::mutexflow_elem<keyT>*)parsec_hash_table_nolock_find(mf.get_hash_table(), hk))) {
+              if (!elem->has_active_task() && elem->has_copy()) {
+                /* we can set the active task
+                * ownership of the copy transfers to the task, i.e., the task will release the copy
+                * at the end */
+                assert(task->copies[i] == nullptr);
+                assert(elem->get_copy() != nullptr);
+                task->copies[i] = elem->get_copy();
+                elem->clear_copy(); // so no other task can pick it up
+                elem->set_active_task(task);
+                count = numins; // all inputs available
+              } else {
+                // add the task to the mutexflow as ready to run later
+                task->in_data_count = numins-1; // we're waiting for the mutexflow
+                elem->add_task(task);
+              }
+            } else {
+              /* insert a new element that contains this task */
+              assert(count < numins);
+              elem = new detail::mutexflow_elem<keyT>(mf.map_key(task->key), mf.get_count(task->key), task);
+              parsec_hash_table_nolock_insert(mf.get_hash_table(), &elem->item());
+            }
+            parsec_hash_table_unlock_bucket(mf.get_hash_table(), hk);
+            /* only one mutexflow */
+            return true;
+          }
+          return false;
+        };
+
+        detail::apply_mutexflow_with_index(handle_mutexflow, mutexflows);
+      }
 
       if (count == numins) {
         parsec_execution_stream_t *es = world_impl.execution_stream();
@@ -3812,48 +3933,6 @@ namespace ttg_parsec {
 
     void fence() override { ttg::default_execution_context().impl().fence(); }
 
-    static int key_equal(parsec_key_t a, parsec_key_t b, void *user_data) {
-      if constexpr (std::is_same_v<keyT, void>) {
-        return 1;
-      } else {
-        keyT &ka = *(reinterpret_cast<keyT *>(a));
-        keyT &kb = *(reinterpret_cast<keyT *>(b));
-        return ka == kb;
-      }
-    }
-
-    static uint64_t key_hash(parsec_key_t k, void *user_data) {
-      constexpr const bool keyT_is_Void = ttg::meta::is_void_v<keyT>;
-      if constexpr (keyT_is_Void || std::is_same_v<keyT, void>) {
-        return 0;
-      } else {
-        keyT &kk = *(reinterpret_cast<keyT *>(k));
-        using ttg::hash;
-        uint64_t hv = hash<std::decay_t<decltype(kk)>>{}(kk);
-        return hv;
-      }
-    }
-
-    static char *key_print(char *buffer, size_t buffer_size, parsec_key_t k, void *user_data) {
-      if constexpr (std::is_same_v<keyT, void>) {
-        buffer[0] = '\0';
-        return buffer;
-      } else {
-        keyT kk = *(reinterpret_cast<keyT *>(k));
-        std::stringstream iss;
-        iss << kk;
-        memset(buffer, 0, buffer_size);
-        iss.get(buffer, buffer_size);
-        return buffer;
-      }
-    }
-
-    static parsec_key_t make_key(const parsec_taskpool_t *tp, const parsec_assignment_t *as) {
-        // we use the parsec_assignment_t array as a scratchpad to store the hash and address of the key
-        keyT *key = *(keyT**)&(as[2]);
-        return reinterpret_cast<parsec_key_t>(key);
-    }
-
     static char *parsec_ttg_task_snprintf(char *buffer, size_t buffer_size, const parsec_task_t *parsec_task) {
       if(buffer_size == 0)
         return buffer;
@@ -3889,8 +3968,6 @@ namespace ttg_parsec {
       return dst;
     }
 #endif
-
-    parsec_key_fn_t tasks_hash_fcts = {key_equal, key_print, key_hash};
 
     static parsec_hook_return_t complete_task_and_release(parsec_execution_stream_t *es, parsec_task_t *parsec_task) {
 
@@ -3930,6 +4007,37 @@ namespace ttg_parsec {
         task->suspended_task_address = nullptr;
       }
 #endif // TTG_HAVE_COROUTINE
+
+      /* handle mutex flows */
+      // TODO: outline this into separate function
+
+      auto handle_mutexflow = [&](auto& mf) {
+        if (mf) {
+          detail::mutexflow_elem<keyT> *elem;
+          detail::parsec_ttg_task_base_t *next_task = nullptr;
+          parsec_hash_table_lock_bucket(mf.get_hash_table(), task->pkey());
+          elem = (detail::mutexflow_elem<keyT> *)parsec_hash_table_nolock_find(mf.get_hash_table(), task->pkey());
+          assert(elem != nullptr);
+          assert(elem->get_active_task() == task);
+          auto count = elem->clear_active_task();
+          if (count == 0) {
+            /* we're done, release the copy and remove the element */
+            parsec_hash_table_nolock_remove(mf.get_hash_table(), task->pkey());
+            delete elem;
+          } else if (elem->has_task() && elem->has_copy()) {
+            /* get the next task */
+            next_task = elem->next_task();
+          }
+          parsec_hash_table_unlock_bucket(mf.get_hash_table(), task->pkey());
+          /* release the next mutex task */
+          if (nullptr != next_task) {
+            next_task->release_task();
+          }
+          return true;
+        }
+        return false;
+      };
+      detail::apply_mutexflow(handle_mutexflow, task->tt->mutexflows);
 
       /* release our data copies */
       for (int i = 0; i < task->data_count; i++) {
@@ -4004,8 +4112,8 @@ namespace ttg_parsec {
         self.locals[2] = &detail::parsec_taskclass_param2;
         self.locals[3] = &detail::parsec_taskclass_param3;
       }
-      self.make_key = make_key;
-      self.key_functions = &tasks_hash_fcts;
+      self.make_key = detail::make_key<keyT>;
+      self.key_functions = &detail::tasks_hash_fcts<keyT>;
       self.task_snprintf = parsec_ttg_task_snprintf;
 
 #if defined(PARSEC_PROF_TRACE)
@@ -4098,11 +4206,11 @@ namespace ttg_parsec {
       parsec_mempool_construct(&mempools, PARSEC_OBJ_CLASS(parsec_task_t), sizeof(task_t),
                                offsetof(parsec_task_t, mempool_owner), nbthreads);
 
-      parsec_hash_table_init(&tasks_table, offsetof(detail::parsec_ttg_task_base_t, tt_ht_item), 8, tasks_hash_fcts,
-                             NULL);
+      parsec_hash_table_init(&tasks_table, offsetof(detail::parsec_ttg_task_base_t, tt_ht_item), 8,
+                             detail::tasks_hash_fcts<keyT>, NULL);
 
-      parsec_hash_table_init(&task_constraint_table, offsetof(detail::parsec_ttg_task_base_t, tt_ht_item), 8, tasks_hash_fcts,
-                             NULL);
+      parsec_hash_table_init(&task_constraint_table, offsetof(detail::parsec_ttg_task_base_t, tt_ht_item), 8,
+                             detail::tasks_hash_fcts<keyT>, NULL);
     }
 
     template <typename keymapT = ttg::detail::default_keymap<keyT>,
@@ -4232,8 +4340,8 @@ namespace ttg_parsec {
           tc->locals[2] = &detail::parsec_taskclass_param2;
           tc->locals[3] = &detail::parsec_taskclass_param3;
         }
-        tc->make_key = make_key;
-        tc->key_functions = &tasks_hash_fcts;
+        tc->make_key = detail::make_key<keyT>;;
+        tc->key_functions = &detail::tasks_hash_fcts<keyT>;
         tc->task_snprintf = parsec_ttg_task_snprintf;
 
 #if defined(PARSEC_PROF_TRACE)
@@ -4477,6 +4585,9 @@ namespace ttg_parsec {
     /// the constraint must provide a valid override of `check_key(key)`
     template<typename Constraint>
     void add_constraint(std::shared_ptr<Constraint> c) {
+      if (num_mutexflow > 0) {
+        throw std::runtime_error("Constraints not allowed with mutexflow!");
+      }
       std::size_t cid = constraints_check.size();
       if constexpr(ttg::meta::is_void_v<keyT>) {
         c->add_listener([this, cid](){ this->release_constraint(cid); }, this);
@@ -4493,6 +4604,9 @@ namespace ttg_parsec {
     /// the constraint must provide a valid override of `check_key(key)`
     template<typename Constraint>
     void add_constraint(Constraint&& c) {
+      if (num_mutexflow > 0) {
+        throw std::runtime_error("Constraints not allowed with mutexflow!");
+      }
       // need to make this a shared_ptr since it's shared between different callbacks
       this->add_constraint(std::make_shared<Constraint>(std::forward<Constraint>(c)));
     }
@@ -4503,6 +4617,9 @@ namespace ttg_parsec {
     template<typename Constraint, typename Mapper>
     void add_constraint(std::shared_ptr<Constraint> c, Mapper&& map) {
       static_assert(std::is_same_v<typename Constraint::key_type, keyT>);
+      if (num_mutexflow > 0) {
+        throw std::runtime_error("Constraints not allowed with mutexflow!");
+      }
       std::size_t cid = constraints_check.size();
       if constexpr(ttg::meta::is_void_v<keyT>) {
         c->add_listener([this, cid](){ this->release_constraint(cid); }, this);
@@ -4520,9 +4637,33 @@ namespace ttg_parsec {
     /// ths overload can be used to provide different key mapping functions for each TT
     template<typename Constraint, typename Mapper>
     void add_constraint(Constraint c, Mapper&& map) {
+      if (num_mutexflow > 0) {
+        throw std::runtime_error("Constraints not allowed with mutexflow!");
+      }
       // need to make this a shared_ptr since it's shared between different callbacks
       this->add_constraint(std::make_shared<Constraint>(std::forward<Constraint>(c)), std::forward<Mapper>(map));
     }
+
+    /// mutexmap setter
+    /// The mutexmap provides a mapping from key to IDs that represent buckets of tasks
+    /// that should be executed in a mutually exclusive manner.
+    /// The countmap maps any of the keys to the number of tasks in the respective bucket.
+    /// The countmap will only be called once for each bucket.
+    /// Only one mutexflow is supported per TT and no constraints are allowed.
+    template <std::size_t I, typename MutexMap, typename CountMap, typename Finalizer>
+    void set_mutexmap(MutexMap &&map, CountMap&& countmap, Finalizer &&finalizer) {
+      static_assert(I < numflows, "Mutexflow index out of bounds!");
+      if (num_mutexflow > 0) {
+        throw std::runtime_error("Only one mutexflow supported per TT!");
+      }
+      /* TODO: check that there are no constraints on this TT */
+      std::get<I>(mutexflows) = std::tuple_element_t<I, decltype(mutexflows)>(
+                                                        std::forward<MutexMap>(map),
+                                                        std::forward<CountMap>(countmap),
+                                                        std::forward<Finalizer>(finalizer));
+      num_mutexflow++;
+    }
+
 
     // Register the static_op function to associate it to instance_id
     void register_static_op_function(void) {

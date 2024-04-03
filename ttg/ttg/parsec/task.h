@@ -276,6 +276,7 @@ namespace ttg_parsec {
       static constexpr size_t num_streams = TT::numins;
       TT* tt = nullptr;
       std::array<stream_info_t, num_streams> streams;
+      constexpr static ttg::Void key = ttg::Void{}; // Void key for tasks with no key
 #ifdef TTG_HAVE_COROUTINE
       void* suspended_task_address = nullptr;  // if not null the function is suspended
       ttg::TaskCoroutineID coroutine_id = ttg::TaskCoroutineID::Invalid;
