@@ -14,9 +14,12 @@
 
 #include <parsec.h>
 
+#include <parsec/data_internal.h>
+
 #include "ttg/parsec/thread_local.h"
 #include "ttg/parsec/parsec-ext.h"
 #include "ttg/util/span.h"
+#include "ttg/util/iovec.h"
 
 
 namespace ttg_parsec {
