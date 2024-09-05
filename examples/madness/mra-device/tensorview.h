@@ -336,11 +336,6 @@ namespace mra {
     }
 #endif // 0
 
-    SCOPE void reset(value_type *ptr, dims_array_t dims) {
-      m_ptr = ptr;
-      m_dims = dims;
-    }
-
   public:
     template<typename... Dims>
     SCOPE explicit TensorView(T *ptr, Dims... dims)

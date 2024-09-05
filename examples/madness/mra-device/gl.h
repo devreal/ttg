@@ -10,12 +10,14 @@
 
 #include "util.h"
 
-namespace mra::detail {
+namespace mra {
 
 #ifndef __CUDA_ARCH__
-  /// Arrays for points and weights for the Gauss-Legendre quadrature on [0,1].
-  /// only available directly on the host
-  extern const double gl_data[128][64];
+  namespace detail {
+    /// Arrays for points and weights for the Gauss-Legendre quadrature on [0,1].
+    /// only available directly on the host
+    extern const double gl_data[128][64];
+  } // namespace detail
 
   /**
    * Host-side functions only
@@ -23,14 +25,14 @@ namespace mra::detail {
 
   template<typename T>
   inline ttg::Buffer<const T> GLbuffer() {
-    return ttg::Buffer<const T>(&gl_data[0][0], sizeof(gl_data)/sizeof(T));
+    return ttg::Buffer<const T>(&detail::gl_data[0][0], sizeof(detail::gl_data)/sizeof(T));
   }
 
   template<typename T>
   inline void GLget(const T** x, const T **w, std::size_t N) {
     assert(N>0 && N<=64);
-    *x = &gl_data[2*(N-1)  ][0];
-    *w = &gl_data[2*(N-1)+1][0];
+    *x = &detail::gl_data[2*(N-1)  ][0];
+    *w = &detail::gl_data[2*(N-1)+1][0];
   }
 
   /// Evaluate the first k Legendre scaling functions. p should be an array of k elements.
@@ -50,6 +52,6 @@ namespace mra::detail {
     *w = &data[2*(N-1)+1][0];
   }
 
-}
+} // namespace mra
 
 #endif

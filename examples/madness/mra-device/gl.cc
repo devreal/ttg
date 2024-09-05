@@ -7,7 +7,9 @@
 #include "../../mrarange.h"
 #include <ttg/device/device.h>
 
-namespace mra::detail {
+namespace mra {
+
+namespace detail {
 
     static bool initialized = false; // Must be initialized (GLinitialize())  single threaded before use
     static double nn1[64]; // nn1[n] = n/(n+1) ... used to speed evaluation of Legendre polyn recursion
@@ -154,26 +156,28 @@ namespace mra::detail {
         };
 #endif // 0
 
+} // namespace detail
+
     // Evaluate the Legendre polynomials up to the given order at x in [-1,1].
 
     // p should be an array of order+1 elements.
     static void legendre_polynomials(double x, size_t order, double *p) {
-        assert(initialized);
+        assert(detail::initialized);
         p[0] = 1.0;
         if (order == 0) return;
         p[1] = x;
         for (size_t n=1; n<order; ++n)
-            p[n+1] = (x*p[n] - p[n-1])*nn1[n] + x*p[n];
+            p[n+1] = (x*p[n] - p[n-1])*detail::nn1[n] + x*p[n];
     }
 
     /// Evaluate the first k Legendre scaling functions.
 
     /// p should be an array of k elements.
     void legendre_scaling_functions(double x, size_t k, double *p) {
-        assert(initialized);
+        assert(detail::initialized);
         legendre_polynomials(2.*x-1,k-1,p);
         for (size_t n=0; n<k; ++n) {
-            p[n] = p[n]*phi_norms[n];
+            p[n] = p[n]*detail::phi_norms[n];
         }
     }
 
@@ -184,7 +188,7 @@ namespace mra::detail {
         // Evaluate in double and then truncate to float to ensure accuracy
         double dp[64];
         assert(k<=64);
-        assert(initialized);
+        assert(detail::initialized);
         legendre_scaling_functions(double(x), k, dp);
         for (size_t i=0; i<k; i++) p[i] = float(dp[i]);
     }
@@ -229,12 +233,12 @@ namespace mra::detail {
 
     bool GLinitialize() {
         long n;
-        for (n=0; n<64; ++n) nn1[n] = n/((double)(n+1));
-        for (n=0; n<64; ++n) phi_norms[n] = std::sqrt(2.0*n+1.0);
+        for (n=0; n<64; ++n) detail::nn1[n] = n/((double)(n+1));
+        for (n=0; n<64; ++n) detail::phi_norms[n] = std::sqrt(2.0*n+1.0);
 
-        initialized = true;
+        detail::initialized = true;
 
-        return detail::check_weight_sum() && detail::check_maxn_sum();
+        return check_weight_sum() && check_maxn_sum();
     }
 
 }

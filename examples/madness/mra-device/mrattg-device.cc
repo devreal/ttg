@@ -378,7 +378,7 @@ void test(std::size_t K) {
 
 int main(int argc, char **argv) {
   ttg::initialize(argc, argv);
-  GLinitialize();
+  mra::GLinitialize();
 
   test<double, 3>(10);
 
