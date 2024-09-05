@@ -1398,7 +1398,7 @@ namespace ttg_parsec {
 
       task_t *task = (task_t*)gpu_task->ec;
       // get the device task from the coroutine handle
-      ttg::device::Task dev_task = ttg::device::detail::device_task_handle_type::from_address(task->suspended_task_address);
+      auto dev_task = ttg::device::detail::device_task_handle_type::from_address(task->suspended_task_address);
 
       task->dev_ptr->stream = gpu_stream;
 
@@ -1693,9 +1693,8 @@ namespace ttg_parsec {
 #ifdef TTG_HAVE_COROUTINE
         assert(task->coroutine_id != ttg::TaskCoroutineID::Invalid);
 
-#ifdef TTG_HAVE_DEVICE
         if (task->coroutine_id == ttg::TaskCoroutineID::DeviceTask) {
-          ttg::device::Task coro = ttg::device::detail::device_task_handle_type::from_address(suspended_task_address);
+          auto coro = ttg::device::detail::device_task_handle_type::from_address(suspended_task_address);
           assert(detail::parsec_ttg_caller == nullptr);
           detail::parsec_ttg_caller = static_cast<detail::parsec_ttg_task_base_t*>(task);
           // TODO: unify the outputs tls handling
@@ -1708,35 +1707,33 @@ namespace ttg_parsec {
           }
           task->tt->set_outputs_tls_ptr(old_output_tls_ptr);
           detail::parsec_ttg_caller = nullptr;
-        } else
-#endif  // TTG_HAVE_DEVICE
-      if (task->coroutine_id == ttg::TaskCoroutineID::ResumableTask) {
-        auto ret = static_cast<ttg::resumable_task>(ttg::coroutine_handle<ttg::resumable_task_state>::from_address(suspended_task_address));
-        assert(ret.ready());
-        auto old_output_tls_ptr = task->tt->outputs_tls_ptr_accessor();
-        task->tt->set_outputs_tls_ptr();
-        ret.resume();
-        if (ret.completed()) {
-          ret.destroy();
-          suspended_task_address = nullptr;
-        }
-        else { // not yet completed
-          // leave suspended_task_address as is
-
-          // right now can events are not properly implemented, we are only testing the workflow with dummy events
-          // so mark the events finished manually, parsec will rerun this task again and it should complete the second time
-          auto events = static_cast<ttg::resumable_task>(ttg::coroutine_handle<ttg::resumable_task_state>::from_address(suspended_task_address)).events();
-          for (auto &event_ptr : events) {
-            event_ptr->finish();
+        } else if (task->coroutine_id == ttg::TaskCoroutineID::ResumableTask) {
+          auto ret = static_cast<ttg::resumable_task>(ttg::coroutine_handle<ttg::resumable_task_state>::from_address(suspended_task_address));
+          assert(ret.ready());
+          auto old_output_tls_ptr = task->tt->outputs_tls_ptr_accessor();
+          task->tt->set_outputs_tls_ptr();
+          ret.resume();
+          if (ret.completed()) {
+            ret.destroy();
+            suspended_task_address = nullptr;
           }
-          assert(ttg::coroutine_handle<ttg::resumable_task_state>::from_address(suspended_task_address).promise().ready());
+          else { // not yet completed
+            // leave suspended_task_address as is
+
+            // right now can events are not properly implemented, we are only testing the workflow with dummy events
+            // so mark the events finished manually, parsec will rerun this task again and it should complete the second time
+            auto events = static_cast<ttg::resumable_task>(ttg::coroutine_handle<ttg::resumable_task_state>::from_address(suspended_task_address)).events();
+            for (auto &event_ptr : events) {
+              event_ptr->finish();
+            }
+            assert(ttg::coroutine_handle<ttg::resumable_task_state>::from_address(suspended_task_address).promise().ready());
+          }
+          task->tt->set_outputs_tls_ptr(old_output_tls_ptr);
+          detail::parsec_ttg_caller = nullptr;
+          task->suspended_task_address = suspended_task_address;
         }
-        task->tt->set_outputs_tls_ptr(old_output_tls_ptr);
-        detail::parsec_ttg_caller = nullptr;
-        task->suspended_task_address = suspended_task_address;
-      }
-      else
-        ttg::abort();  // unrecognized task id
+        else
+          ttg::abort();  // unrecognized task id
 #else // TTG_HAVE_COROUTINE
       ttg::abort();  // should not happen
 #endif  // TTG_HAVE_COROUTINE

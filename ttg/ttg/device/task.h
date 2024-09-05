@@ -402,26 +402,31 @@ namespace ttg::device {
 
   namespace detail {
     // fwd-decl
+    template<ttg::ExecutionSpace ES>
     struct device_task_promise_type;
     // base type for ttg::device::Task
-    using device_task_handle_type = ttg::coroutine_handle<device_task_promise_type>;
+    template<ttg::ExecutionSpace ES>
+    using device_task_handle_type = ttg::coroutine_handle<device_task_promise_type<ES>>;
   } // namespace detail
 
   /// A device::Task is a coroutine (a callable that can be suspended and resumed).
 
-  /// Since task execution in TTG is not preempable, tasks should not block.
+  /// Since task execution in TTG is not preemptable, tasks should not block.
   /// The purpose of suspending a task is to yield control back to the runtime until some events occur;
   /// in the meantime its executor (e.g., a user-space thread) can perform other work.
   /// Once the task function reaches a point where further progress is pending completion of one or more asynchronous
   /// actions the function needs to be suspended via a coroutine await (`co_await`).
   /// Resumption will be handled by the runtime.
-  struct Task : public detail::device_task_handle_type {
-    using base_type = detail::device_task_handle_type;
+  template<ttg::ExecutionSpace ES = available_execution_space>
+  struct Task : public detail::device_task_handle_type<ES> {
+    using base_type = detail::device_task_handle_type<ES>;
+
+    static constexpr const ttg::ExecutionSpace space = ES;
 
     /// these are members mandated by the promise_type concept
     ///@{
 
-    using promise_type = detail::device_task_promise_type;
+    using promise_type = detail::device_task_promise_type<ES>;
 
     ///@}
 
@@ -444,7 +449,10 @@ namespace ttg::device {
     * application task coroutine on the first co_yield. It subsequently
     * tracks the state of the task when it moves from waiting for transfers
     * to waiting for the submitted kernel to complete. */
+    template<ttg::ExecutionSpace ES>
     struct device_task_promise_type {
+
+      static constexpr const ttg::ExecutionSpace space = ES;
 
       /* do not suspend the coroutine on first invocation, we want to run
       * the coroutine immediately and suspend when we get the device transfers.
@@ -463,28 +471,39 @@ namespace ttg::device {
         return {};
       }
 
+#if 0
+      // TODO: still needed?
       /* Allow co_await on a tuple */
       template<typename... Views>
       ttg::suspend_always await_transform(std::tuple<Views&...> &views) {
         return yield_value(views);
       }
+#endif // 0
 
       template<typename... Ts>
-      ttg::suspend_always await_transform(detail::to_device_t<Ts...>&& a) {
-        bool need_transfer = !(TTG_IMPL_NS::register_device_memory(a.ties));
-        /* TODO: are we allowed to not suspend here and launch the kernel directly? */
-        m_state = ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER;
-        return {};
+      auto await_transform(detail::to_device_t<Ts...>&& a) {
+        if constexpr (space != ttg::ExecutionSpace::Host) {
+          bool need_transfer = !(TTG_IMPL_NS::register_device_memory(a.ties));
+          /* TODO: are we allowed to not suspend here and launch the kernel directly? */
+          m_state = ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER;
+          return ttg::suspend_always{};
+        } else {
+          return ttg::suspend_never{}; // host never suspends
+        }
       }
 
       template<typename... Ts>
       auto await_transform(detail::wait_kernel_t<Ts...>&& a) {
         //std::cout << "yield_value: wait_kernel_t" << std::endl;
-        if constexpr (sizeof...(Ts) > 0) {
-          TTG_IMPL_NS::mark_device_out(a.ties);
+        if constexpr (space != ttg::ExecutionSpace::Host) {
+          if constexpr (sizeof...(Ts) > 0) {
+            TTG_IMPL_NS::mark_device_out(a.ties);
+          }
+          m_state = ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL;
+          return a;
+        } else {
+          return ttg::suspend_never{}; // host never suspends
         }
-        m_state = ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL;
-        return a;
       }
 
       ttg::suspend_always await_transform(std::vector<device::detail::send_t>&& v) {
@@ -508,7 +527,7 @@ namespace ttg::device {
         return m_state == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE;
       }
 
-      ttg::device::Task get_return_object() { return {detail::device_task_handle_type::from_promise(*this)}; }
+      ttg::device::Task get_return_object() { return {detail::device_task_handle_type<ES>::from_promise(*this)}; }
 
       void unhandled_exception() {
         std::cerr << "Task coroutine caught an unhandled exception!" << std::endl;
@@ -532,8 +551,14 @@ namespace ttg::device {
     private:
       std::vector<device::detail::send_t> m_sends;
       ttg_device_coro_state m_state = ttg::device::detail::TTG_DEVICE_CORO_STATE_NONE;
-
     };
+
+    template<typename T>
+    struct is_device_task : std::false_type { };
+    template<ttg::ExecutionSpace ES>
+    struct is_device_task<Task<ES>> : std::true_type { };
+    template<typename T>
+    constexpr bool is_device_task_v = is_device_task<T>::value;
 
   } // namespace detail
 

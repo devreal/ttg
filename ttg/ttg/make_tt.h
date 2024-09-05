@@ -152,13 +152,9 @@ class CallableWrapTTArgs
 #ifdef TTG_HAVE_COROUTINE
       std::conditional_t<std::is_same_v<returnT, ttg::resumable_task>,
                          ttg::coroutine_handle<ttg::resumable_task_state>,
-#ifdef TTG_HAVE_DEVICE
-                         std::conditional_t<std::is_same_v<returnT, ttg::device::Task>,
-                                            ttg::device::Task::base_type,
+                         std::conditional_t<ttg::device::detail::is_device_task_v<returnT>,
+                                            returnT::base_type,
                                             void>
-#else  // TTG_HAVE_DEVICE
-                           void
-#endif  // TTG_HAVE_DEVICE
                          >;
 #else   // TTG_HAVE_COROUTINE
       void;
@@ -186,20 +182,12 @@ protected:
           coro_handle = ret;
         }
         return coro_handle;
-      } else
-#ifdef TTG_HAVE_DEVICE
-          if constexpr (std::is_same_v<returnT, ttg::device::Task>) {
-        ttg::device::Task::base_type coro_handle = ret;
+      } else if constexpr (ttg::device::detail::is_device_task_v<returnT>) {
+        returnT::base_type coro_handle = ret;
         return coro_handle;
       }
-#else  // TTG_HAVE_DEVICE
-        ttg::abort();  // should not happen
-#endif  // TTG_HAVE_DEVICE
       if constexpr (!(std::is_same_v<returnT, ttg::resumable_task>
-#ifdef TTG_HAVE_DEVICE
-          || std::is_same_v<returnT, ttg::device::Task>
-#endif  // TTG_HAVE_DEVICE
-              ))
+                   || ttg::device::detail::is_device_task_v<returnT>))
 #endif
       {
         static_assert(std::tuple_size_v<std::remove_reference_t<decltype(out)>> == 1,
