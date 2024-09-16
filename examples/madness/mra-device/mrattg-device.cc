@@ -187,7 +187,7 @@ static auto make_compress(
       mra::FunctionReconstructedNode<T, NDIM> p(key, K);
 
       /* stores sumsq for each child and for result at the end of the kernel */
-      const std::size_t tmp_size = project_tmp_size<NDIM>(K);
+      const std::size_t tmp_size = compress_tmp_size<NDIM>(K);
       auto tmp = std::make_unique_for_overwrite<T[]>(tmp_size);
       const auto& hgT = functiondata.get_hgT();
       auto tmp_scratch = ttg::make_scratch(tmp.get(), ttg::scope::Allocate, tmp_size);
@@ -202,9 +202,10 @@ static auto make_compress(
 
       /* assemble input array and submit kernel */
       //auto input_ptrs = std::apply([](auto... ins){ return std::array{(ins.coeffs.buffer().current_device_ptr())...}; });
-      auto input_ptrs = std::array{in0.coeffs.buffer().current_device_ptr(), in1.coeffs.buffer().current_device_ptr(),in2.coeffs.buffer().current_device_ptr(), in3.coeffs.buffer().current_device_ptr(),
-                                   in4.coeffs.buffer().current_device_ptr(), in5.coeffs.buffer().current_device_ptr(), in6.coeffs.buffer().current_device_ptr(), in7.coeffs.buffer().current_device_ptr()};
-
+      auto input_ptrs = std::array{in0.coeffs.buffer().current_device_ptr(), in1.coeffs.buffer().current_device_ptr()
+                                   in2.coeffs.buffer().current_device_ptr(), in3.coeffs.buffer().current_device_ptr(),
+                                   in4.coeffs.buffer().current_device_ptr(), in5.coeffs.buffer().current_device_ptr(),
+                                   in6.coeffs.buffer().current_device_ptr(), in7.coeffs.buffer().current_device_ptr()};
       auto coeffs_view = p.coeffs.current_view();
       auto rcoeffs_view = d.current_view();
       auto hgT_view = hgT.current_view();

@@ -140,6 +140,12 @@ namespace mra {
       return std::sqrt(sum);
     }
 
+    template<typename T>
+    SCOPE void print(const T& t) {
+      foreach_idx(t, [&](auto... idx){ printf("[%lu %lu %lu] %f\n", idx..., t(idx...)); });
+      SYNCTHREADS();
+    }
+
 
 } // namespace mra
 

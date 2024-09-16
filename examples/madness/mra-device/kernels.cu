@@ -164,6 +164,7 @@ void fcube(const Domain<NDIM>& D,
     else {
       //throw "how did we get here?";
       // TODO: how to handle this?
+      assert(!"Failed to handle eval call!");
     }
     SYNCTHREADS();
   }
@@ -252,6 +253,9 @@ __global__ void fcoeffs_kernel1(
     phibar       = TensorView<T, 2   >(phibar_ptr, K, K);
   }
   SYNCTHREADS();
+  r = 0.0;
+  child_values = 0.0;
+
   /* compute one child per block */
   for (int bid = blockid; bid < key.num_children; bid += gridDim.x) {
     Key<NDIM> child = key.child_at(bid);
@@ -288,6 +292,7 @@ __global__ void fcoeffs_kernel2(
     coeffs     = TensorView<T, NDIM>(coeffs_ptr, K);
   }
   SYNCTHREADS();
+  r = 0.0;
 
   T fac = std::sqrt(D.template get_volume<T>()*std::pow(T(0.5),T(NDIM*(1+key.level()))));
   values *= fac;
@@ -301,7 +306,6 @@ __global__ void fcoeffs_kernel2(
   /* TensorView assignment synchronizes */
   if (is_t0) {
     /* TODO: compute the norm across threads */
-    SYNCTHREADS();
     *is_leaf = (mra::normf(r) < truncate_tol(key,thresh)); // test norm of difference coeffs
   }
 }
@@ -393,6 +397,8 @@ __global__ void compress_kernel(
       workspace = TensorView<T, NDIM>(&tmp[TWOK2NDIM], K);
     }
     SYNCTHREADS();
+    r = 0.0;
+    p = 0.0;
 
     for (int bid = blockIdx.x; bid < key.num_children; bid += gridDim.x) {
       if (is_t0) sumsqs[bid] = 0.0;
@@ -473,6 +479,7 @@ __global__ void reconstruct_kernel(
     from_parent = TensorView<T, NDIM>(from_parent_ptr, K);
   }
   SYNCTHREADS();
+  s = 0.0;
 
   auto child_slice = get_child_slice<NDIM>(key, K, 0);
   if (key.level() != 0) node(child_slice) = from_parent;

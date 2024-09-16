@@ -508,16 +508,16 @@ namespace mra {
 
 
     /// Start for forward iteration through elements in row-major order --- this is convenient but not efficient
-    iterator<ndim()> begin() {return iterator<ndim()>(0, this);}
+    iterator<ndim()> begin() {return iterator<ndim()>(0, *this);}
 
     /// End for forward iteration through elements in row-major order --- this is convenient but not efficient
-    const iterator<ndim()>& end() { return iterator<ndim()>(0, this); }
+    const iterator<ndim()> end() { return iterator<ndim()>(0, *this); }
 
     /// Start for forward iteration through elements in row-major order --- this is convenient but not efficient
-    const_iterator<ndim()> begin() const { return const_iterator<ndim()>(0, this); }
+    const_iterator<ndim()> begin() const { return const_iterator<ndim()>(0, *this); }
 
     /// End for forward iteration through elements in row-major order --- this is convenient but not efficient
-    const const_iterator<ndim()>& end() const { return const_iterator<ndim()>(size(), this); }
+    const const_iterator<ndim()> end() const { return const_iterator<ndim()>(size(), *this); }
 
   private:
     dims_array_t m_dims;

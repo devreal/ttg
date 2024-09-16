@@ -11,6 +11,9 @@ int main(int argc, char **argv) {
 
   using matrix_type = mra::Tensor<double, 2>;
   using matrixview_type = typename matrix_type::view_type;
+  using tensor_type = mra::Tensor<double, 3>;
+  using tensorview_type = typename tensor_type::view_type;
+
   matrix_type m1 = matrix_type(2, 2); // 2x2 matrix
   matrix_type m2 = matrix_type(4, 4); // 4x4 matrix
   assert(m1.size() == 4);
@@ -89,6 +92,28 @@ int main(int argc, char **argv) {
     assert(e == c++);
   }
 
+  auto t1 = tensor_type(10, 10, 10);
+  auto t1v = t1.current_view();
+  t1v = 1.0;
+  auto t2 = tensor_type(20, 20, 20);
+  auto t2v = t2.current_view();
+  t2v = 2.0;
+  /* slice for the lower corner*/
+  std::array<mra::Slice, 3> tslices = {mra::Slice{10, 20}, mra::Slice{0, 10}, mra::Slice{10, 20}};
+  t2v(tslices) = t1v;
+
+  for (int i = 0; i < t2v.dim(0); ++i) {
+    for (int j = 0; j < t2v.dim(1); ++j) {
+      for (int k = 0; k < t2v.dim(2); ++k) {
+        printf("t2v(%d, %d, %d) %f\n", i, j, k, t2v(i, j, k));
+        if (i >= 10 && j < 10 && k >= 10) {
+          assert(t2v(i, j, k) == 1.0);
+        } else {
+          assert(t2v(i, j, k) == 2.0);
+        }
+      }
+    }
+  }
   ttg::finalize();
 
 }
