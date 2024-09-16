@@ -311,10 +311,10 @@ auto make_reconstruct(
         r.key = child;
         r.is_leaf = node.is_child_leaf[it.index()];
         if (r.is_leaf) {
-          sends.push_back(ttg::device::send<1>(child, r));
+          sends.push_back(ttg::device::send<1>(child, std::move(r)));
         }
         else {
-          sends.push_back(ttg::device::send<0>(child, r.coeffs));
+          sends.push_back(ttg::device::send<0>(child, std::move(r.coeffs)));
         }
     }
 #ifndef TTG_ENABLE_HOST

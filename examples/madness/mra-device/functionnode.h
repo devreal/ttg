@@ -7,7 +7,7 @@
 
 namespace mra {
     template <typename T, Dimension NDIM>
-    class FunctionReconstructedNode {
+    class FunctionReconstructedNode : public ttg::TTValue<FunctionReconstructedNode<T, NDIM>> {
     public: // temporarily make everything public while we figure out what we are doing
         using key_type = Key<NDIM>;
         using tensor_type = Tensor<T,NDIM>;
@@ -43,7 +43,7 @@ namespace mra {
 
 
     template <typename T, Dimension NDIM>
-    class FunctionCompressedNode {
+    class FunctionCompressedNode : public ttg::TTValue<FunctionCompressedNode<T, NDIM>> {
     public: // temporarily make everything public while we figure out what we are doing
         static constexpr bool is_function_node = true;
 
