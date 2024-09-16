@@ -71,24 +71,12 @@ namespace mra {
 
     Tensor& operator=(Tensor<T, NDIM, Allocator>&& other) = default;
 
-    /* Deep copy ctor und op are not needed for PO since tiles will never be read
-    * and written concurrently. Hence shallow copies are enough, will all
-    * receiving tasks sharing tile data. Re-enable this once the PaRSEC backend
-    * can handle data sharing without excessive copying */
-    Tensor(const Tensor<T, NDIM, Allocator>& other)
-    : ttvalue_type()
-    , m_dims(other.m_dims)
-    , m_buffer(other.size())
-    {
-      std::copy_n(other.data(), size(), this->data());
-    }
+    /* Disable copy construction.
+     * There is no way we can copy data from anywhere else but the host memory space
+     * so let's not even try. */
+    Tensor(const Tensor<T, NDIM, Allocator>& other) = delete;
 
-    Tensor& operator=(const Tensor<T, NDIM, Allocator>& other) {
-      m_dims = other.m_dims;
-      this->realloc();
-      std::copy_n(other.data(), size(), this->data());
-      return *this;
-    }
+    Tensor& operator=(const Tensor<T, NDIM, Allocator>& other) = delete;
 
     size_type size() const {
       return std::reduce(&m_dims[0], &m_dims[ndim()], 1, std::multiplies<size_type>{});

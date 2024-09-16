@@ -453,6 +453,7 @@ namespace ttg_parsec {
       value_type m_value;
 
       template<typename T>
+      requires(std::constructible_from<ValueT, T>)
       ttg_data_value_copy_t(T&& value)
       : ttg_data_copy_container_setter(this)
       , ttg_data_copy_t()
