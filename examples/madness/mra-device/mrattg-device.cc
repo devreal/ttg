@@ -52,7 +52,12 @@ auto make_project(
       /* TODO: children() returns an iteratable object but broadcast() expects a contiguous memory range.
                 We need to fix broadcast to support any ranges */
       for (auto child : children(key)) bcast_keys.push_back(child);
+
+#ifndef TTG_ENABLE_HOST
       outputs.push_back(ttg::device::broadcastk<0>(std::move(bcast_keys)));
+#else
+      ttg::broadcastk<0>(std::move(bcast_keys));
+#endif
       coeffs.current_view() = T(1e7); // set to obviously bad value to detect incorrect use
       result.is_leaf = false;
     }
@@ -82,8 +87,10 @@ auto make_project(
       auto tmp_scratch = ttg::make_scratch(tmp, ttg::scope::Allocate, tmp_size);
 
       /* TODO: cannot do this from a function, need to move it into the main task */
+#ifndef TTG_ENABLE_HOST
       co_await ttg::device::select(db, gl, f, coeffs.buffer(), phibar.buffer(),
                                    hgT.buffer(), tmp_scratch, is_leaf_scratch);
+#endif
       auto coeffs_view = coeffs.current_view();
       auto phibar_view = phibar.current_view();
       auto hgT_view    = hgT.current_view();
@@ -99,7 +106,9 @@ auto make_project(
                             is_leaf_device, thresh, ttg::device::current_stream());
 
       /* wait and get is_leaf back */
+#ifndef TTG_ENABLE_HOST
       co_await ttg::device::wait(is_leaf_scratch);
+#endif
       result.is_leaf = is_leaf;
       /* todo: is this safe? */
       delete[] tmp;
@@ -110,11 +119,19 @@ auto make_project(
       if (!result.is_leaf) {
         std::vector<mra::Key<NDIM>> bcast_keys;
         for (auto child : children(key)) bcast_keys.push_back(child);
+#ifndef TTG_ENABLE_HOST
         outputs.push_back(ttg::device::broadcastk<0>(std::move(bcast_keys)));
+#else
+        ttg::broadcastk<0>(bcast_keys);
+#endif
       }
     }
+#ifndef TTG_ENABLE_HOST
     outputs.push_back(ttg::device::send<1>(key, std::move(result))); // always produce a result
     co_await std::move(outputs);
+#else
+    ttg::send<1>(key, std::move(result));
+#endif
   };
 
   ttg::Edge<mra::Key<NDIM>, void> refine("refine");
@@ -126,8 +143,11 @@ static auto select_compress_send(const mra::Key<NDIM>& key, Value&& value,
                                  std::size_t child_idx,
                                  std::index_sequence<I, Is...>) {
   if (child_idx == I) {
-    std::cout << "key " << key << " sends to parent " << key.parent() << " input " << I << std::endl;
+#ifndef TTG_ENABLE_HOST
     return ttg::device::send<I>(key.parent(), std::forward<Value>(value));
+#else
+    return ttg::send<I>(key.parent(), std::forward<Value>(value));
+#endif
   } else if constexpr (sizeof...(Is) > 0){
     return select_compress_send(key, std::forward<Value>(value), child_idx, std::index_sequence<Is...>{});
   }
@@ -139,10 +159,14 @@ static auto select_compress_send(const mra::Key<NDIM>& key, Value&& value,
  * this is a device task to prevent data from being pulled back to the host
  * even though it will not actually perform any computation */
 template<typename T, mra::Dimension NDIM>
-static ttg::device::Task do_send_leafs_up(const mra::Key<NDIM>& key, const mra::FunctionReconstructedNode<T, NDIM>& node) {
+static TASKTYPE do_send_leafs_up(const mra::Key<NDIM>& key, const mra::FunctionReconstructedNode<T, NDIM>& node) {
   /* drop all inputs from nodes that are not leafs, they will be upstreamed by compress */
   if (!node.has_children()) {
+#ifndef TTG_ENABLE_HOST
     co_await select_compress_send(key, node, key.childindex(), std::make_index_sequence<mra::Key<NDIM>::num_children>{});
+#else
+    select_compress_send(key, node, key.childindex(), std::make_index_sequence<mra::Key<NDIM>::num_children>{});
+#endif
   }
 }
 
@@ -193,12 +217,14 @@ static auto make_compress(
       auto tmp_scratch = ttg::make_scratch(tmp.get(), ttg::scope::Allocate, tmp_size);
       T sumsqs[num_children+1];
       auto sumsqs_scratch = ttg::make_scratch(sumsqs, ttg::scope::Allocate, num_children+1);
+#ifndef TTG_ENABLE_HOST
       co_await ttg::device::select(p.coeffs.buffer(), d.buffer(), hgT.buffer(),
                                    tmp_scratch, sumsqs_scratch,
                                    in0.coeffs.buffer(), in1.coeffs.buffer(),
                                    in2.coeffs.buffer(), in3.coeffs.buffer(),
                                    in4.coeffs.buffer(), in5.coeffs.buffer(),
                                    in6.coeffs.buffer(), in7.coeffs.buffer());
+#endif
 
       /* assemble input array and submit kernel */
       //auto input_ptrs = std::apply([](auto... ins){ return std::array{(ins.coeffs.buffer().current_device_ptr())...}; });
@@ -216,7 +242,9 @@ static auto make_compress(
                             ttg::device::current_stream());
 
       /* wait for kernel and transfer sums back */
+#ifndef TTG_ENABLE_HOST
       co_await ttg::device::wait(sumsqs_scratch);
+#endif
       T sumsq = 0.0;
       T d_sumsq = sumsqs[num_children];
       {  // Collect child leaf info
@@ -234,17 +262,26 @@ static auto make_compress(
         p.sum = tmp[num_children] + sumsq; // result sumsq is last element in sumsqs
 
         // will not return
+#ifndef TTG_ENABLE_HOST
         co_await ttg::device::forward(
           // select to which child of our parent we send
           //ttg::device::send<0>(key, std::move(p)),
           select_compress_send(key, std::move(p), key.childindex(), std::make_index_sequence<num_children>{}),
           // Send result to output tree
           ttg::device::send<out_terminal_id>(key, std::move(result)));
+#else
+          select_compress_send(key, std::move(p), key.childindex(), std::make_index_sequence<num_children>{});
+          ttg::send<out_terminal_id>(key, std::move(result));
+#endif
       } else {
         std::cout << "At root of compressed tree: total normsq is " << sumsq + d_sumsq << std::endl;
+#ifndef TTG_ENABLE_HOST
         co_await ttg::device::forward(
           // Send result to output tree
           ttg::device::send<out_terminal_id>(key, std::move(result)));
+#else
+        ttg::send<out_terminal_id>(key, std::move(result));
+#endif
       }
   };
   ttg::Edge<mra::Key<NDIM>, mra::FunctionReconstructedNode<T, NDIM>> recur("recur");
@@ -305,6 +342,7 @@ auto make_reconstruct(
                               r_ptrs, tmp_scratch.device_ptr(), ttg::device::current_stream());
 
     // forward() returns a vector that we can push into
+#ifndef TTG_ENABLE_HOST
     auto sends = ttg::device::forward(ttg::device::send<1>(key, std::move(r_empty)));
     mra::KeyChildren<NDIM> children(key);
     for (auto it=children.begin(); it!=children.end(); ++it) {
@@ -319,10 +357,22 @@ auto make_reconstruct(
           sends.push_back(ttg::device::send<0>(child, std::move(r.coeffs)));
         }
     }
-#ifndef TTG_ENABLE_HOST
     co_await std::move(sends);
 #else
-
+    ttg::send<1>(key, std::move(r_empty));
+    mra::KeyChildren<NDIM> children(key);
+    for (auto it=children.begin(); it!=children.end(); ++it) {
+        const mra::Key<NDIM> child= *it;
+        mra::FunctionReconstructedNode<T,NDIM>& r = r_arr[it.index()];
+        r.key = child;
+        r.is_leaf = node.is_child_leaf[it.index()];
+        if (r.is_leaf) {
+          ttg::send<1>(child, std::move(r));
+        }
+        else {
+          ttg::send<0>(child, std::move(r.coeffs));
+        }
+    }
 #endif // TTG_ENABLE_HOST
   };
 
