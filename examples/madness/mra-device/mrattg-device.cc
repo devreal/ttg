@@ -407,7 +407,7 @@ void test(std::size_t K) {
   D.set_cube(-6.0,6.0);
 
   srand48(5551212); // for reproducible results
-  //for (auto i : range(10000)) drand48(); // warmup generator
+  for (int i = 0; i < range(10000); ++i) drand48(); // warmup generator
 
   ttg::Edge<mra::Key<NDIM>, void> project_control;
   ttg::Edge<mra::Key<NDIM>, mra::FunctionReconstructedNode<T, NDIM>> project_result, reconstruct_result;

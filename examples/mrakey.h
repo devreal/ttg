@@ -102,7 +102,7 @@ namespace mra {
             assert(n<MAX_LEVEL);
             std::array<Translation,NDIM> l = this->l;
             for (auto& x : l) x = 2*x + 1;
-            return Key<NDIM>(2*n, l);
+            return Key<NDIM>(n+1, l);
         }
         
         /// Used by iterator to increment child translation
@@ -127,7 +127,7 @@ namespace mra {
             assert(idx<NDIM);
             std::array<Translation,NDIM> l = this->l;
             for (auto d : range(NDIM)) l[d] = 2*l[d] + (idx & (1<<d)) ? 1 : 0;
-            return Key<NDIM>(2*n, l);
+            return Key<NDIM>(n+1, l);
         }
     };
     template <> inline Key<1> Key<1>::parent(Level generation) const {
