@@ -250,21 +250,25 @@ __global__ void fcoeffs_kernel1(
   __shared__ TensorView<T, 2   > x_vec, x, phibar;
   if (is_t0) {
     values       = TensorView<T, NDIM>(&tmp[0       ], 2*K);
-    r            = TensorView<T, NDIM>(&tmp[TWOK2NDIM+1*K2NDIM], K);
-    child_values = TensorView<T, NDIM>(&tmp[TWOK2NDIM+2*K2NDIM], K);
-    workspace    = TensorView<T, NDIM>(&tmp[TWOK2NDIM+3*K2NDIM], K);
-    x_vec        = TensorView<T, 2   >(&tmp[TWOK2NDIM+4*K2NDIM], NDIM, K2NDIM);
-    x            = TensorView<T, 2   >(&tmp[TWOK2NDIM+4*K2NDIM + (NDIM*K2NDIM)], NDIM, K);
+    r            = TensorView<T, NDIM>(&tmp[TWOK2NDIM+0*K2NDIM], K);
+    child_values = TensorView<T, NDIM>(&tmp[TWOK2NDIM+1*K2NDIM], K);
+    workspace    = TensorView<T, NDIM>(&tmp[TWOK2NDIM+2*K2NDIM], K);
+    x_vec        = TensorView<T, 2   >(&tmp[TWOK2NDIM+3*K2NDIM], NDIM, K2NDIM);
+    x            = TensorView<T, 2   >(&tmp[TWOK2NDIM+3*K2NDIM + (NDIM*K2NDIM)], NDIM, K);
     phibar       = TensorView<T, 2   >(phibar_ptr, K, K);
   }
   SYNCTHREADS();
-  r = 0.0;
-  child_values = 0.0;
 
   /* compute one child per block */
   for (int bid = blockid; bid < key.num_children; bid += gridDim.x) {
     Key<NDIM> child = key.child_at(bid);
+    auto kl = key.translation();
+    auto cl = child.translation();
+    printf("fcoeffs Key (%d, [%d, %d, %d]) child %d (%d, [%d, %d, %d])\n",
+            key.level(), kl[0], kl[1], kl[2], child.level(), cl[0], cl[1], cl[2]);
+    child_values = 0.0; // TODO: needed?
     fcube(D, gldata, f, child, thresh, child_values, K, x, x_vec);
+    r = 0.0;
     transform(child_values, phibar, r, workspace);
     auto child_slice = get_child_slice<NDIM>(key, K, bid);
     values(child_slice) = r;
@@ -282,7 +286,7 @@ __global__ void fcoeffs_kernel2(
   std::size_t K,
   T thresh)
 {
-  const bool is_t0 = !!(threadIdx.x + threadIdx.y + threadIdx.z);
+  const bool is_t0 = 0 == (threadIdx.x + threadIdx.y + threadIdx.z);
   const std::size_t    K2NDIM = std::pow(K, NDIM);
   const std::size_t TWOK2NDIM = std::pow(2*K, NDIM);
   /* reconstruct tensor views from pointers
@@ -309,9 +313,10 @@ __global__ void fcoeffs_kernel2(
   coeffs = r_slice; // extract sum coeffs
   r_slice = 0.0; // zero sum coeffs so can easily compute norm of difference coeffs
   /* TensorView assignment synchronizes */
+  T norm = mra::normf(r);
   if (is_t0) {
     /* TODO: compute the norm across threads */
-    *is_leaf = (mra::normf(r) < truncate_tol(key,thresh)); // test norm of difference coeffs
+    *is_leaf = (norm < truncate_tol(key,thresh)); // test norm of difference coeffs
   }
 }
 
@@ -340,7 +345,7 @@ void submit_fcoeffs_kernel(
   const std::size_t K = coeffs_view.dim(0);
   dim3 thread_dims = dim3(K, 1, 1); // figure out how to consider register usage
   /* launch one block per child */
-  CALL_KERNEL(fcoeffs_kernel1, key.num_children, thread_dims, 0, stream)(
+  CALL_KERNEL(fcoeffs_kernel1, 1, thread_dims, 0, stream)(
     D, gldata, fn, key, tmp, phibar_view.data(), K, thresh);
   checkSubmit();
   /* launch one block only */
