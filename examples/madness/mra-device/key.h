@@ -125,7 +125,7 @@ namespace mra {
             assert(n<MAX_LEVEL);
             assert(idx<num_children);
             std::array<Translation,NDIM> l = this->l;
-            for (Dimension d = 0; d < NDIM; ++d) l[d] = 2*l[d] + (idx & (1<<d)) ? 1 : 0;
+            for (Dimension d = 0; d < NDIM; ++d) l[d] = 2*l[d] + ((idx & (1<<d)) ? 1 : 0);
             return Key<NDIM>(n+1, l);
         }
     };
