@@ -84,8 +84,8 @@ SCOPE void make_xvec(const TensorView<T,2>& x, TensorView<T,2>& xvec,
                           std::integral_constant<Dimension, 2>) {
   const std::size_t K = x.dim(1);
   if (threadIdx.z == 0) {
-    for (size_t i=blockIdx.y; i<K; i += blockDim.y) {
-      for (size_t j=blockIdx.x; j<K; j += blockDim.x) {
+    for (size_t i=threadIdx.y; i<K; i += blockDim.y) {
+      for (size_t j=threadIdx.x; j<K; j += blockDim.x) {
         size_t ij = i*K + j;
         xvec(0,ij) = x(0,i);
         xvec(1,ij) = x(1,j);
@@ -101,8 +101,8 @@ SCOPE void make_xvec(const TensorView<T,2>& x, TensorView<T,2>& xvec,
                           std::integral_constant<Dimension, 3>) {
   const std::size_t K = x.dim(1);
   for (size_t i=threadIdx.z; i<K; i += blockDim.z) {
-    for (size_t j=blockIdx.y; j<K; j += blockDim.y) {
-      for (size_t k=blockIdx.x; k<K; k += blockDim.x) {
+    for (size_t j=threadIdx.y; j<K; j += blockDim.y) {
+      for (size_t k=threadIdx.x; k<K; k += blockDim.x) {
         size_t ijk = i*K*K + j*K + k;
         xvec(0,ijk) = x(0,i);
         xvec(1,ijk) = x(1,j);
@@ -181,9 +181,13 @@ void mTxmq(std::size_t dimi, std::size_t dimj, std::size_t dimk,
   if (threadIdx.z == 0) {
     for (std::size_t i = threadIdx.y; i < dimi; i += blockDim.y) {
       cT* ci = c + i*dimj; // the row of C all threads in dim x work on
-      const aT *aik_ptr = a;
-      /* not parallelized */
-      for (long k=0; k<dimk; ++k,aik_ptr+=dimi) {
+      const aT *aik_ptr = a + i;
+      // beta = 0
+      for (std::size_t j = threadIdx.x; j < dimj; j += blockDim.x) {
+        ci[j] = 0.0;
+      }
+
+      for (long k=0; k<dimk; ++k,aik_ptr+=dimi) { /* not parallelized */
         aT aki = *aik_ptr;
         for (std::size_t j = threadIdx.x; j < dimj; j += blockDim.x) {
           ci[j] += aki*b[k*ldb+j];
@@ -195,10 +199,11 @@ void mTxmq(std::size_t dimi, std::size_t dimj, std::size_t dimk,
 }
 template <Dimension NDIM, typename T>
 SCOPE
-void transform(const TensorView<T,NDIM>& t,
-               const TensorView<T,2>& c,
-               TensorView<T,NDIM>& result,
+void transform(const TensorView<T, NDIM>& t,
+               const TensorView<T, 2>& c,
+               TensorView<T, NDIM>& result,
                TensorView<T, NDIM>& workspace) {
+  workspace = 0.0; // set to zero
   const T* pc = c.data();
   T *t0=workspace.data(), *t1=result.data();
   if (t.ndim() & 0x1) std::swap(t0,t1);
