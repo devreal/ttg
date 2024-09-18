@@ -84,8 +84,8 @@ auto make_project(
       bool is_leaf;
       auto is_leaf_scratch = ttg::make_scratch(&is_leaf, ttg::scope::Allocate);
       const std::size_t tmp_size = project_tmp_size<NDIM>(K);
-      T* tmp = new T[tmp_size]; // TODO: move this into make_scratch()
-      auto tmp_scratch = ttg::make_scratch(tmp, ttg::scope::Allocate, tmp_size);
+      auto tmp = std::make_unique_for_overwrite<T[]>(tmp_size); // TODO: move this into make_scratch()
+      auto tmp_scratch = ttg::make_scratch(tmp.get(), ttg::scope::Allocate, tmp_size);
 
       /* TODO: cannot do this from a function, need to move it into the main task */
 #ifndef TTG_ENABLE_HOST
@@ -111,8 +111,7 @@ auto make_project(
       co_await ttg::device::wait(is_leaf_scratch);
 #endif
       result.is_leaf = is_leaf;
-      /* todo: is this safe? */
-      delete[] tmp;
+
       /**
        * END FCOEFFS HERE
        */
@@ -212,7 +211,7 @@ static auto make_compress(
       mra::FunctionReconstructedNode<T, NDIM> p(key, K);
 
       /* stores sumsq for each child and for result at the end of the kernel */
-      const std::size_t tmp_size = project_tmp_size<NDIM>(K);
+      const std::size_t tmp_size = compress_tmp_size<NDIM>(K);
       auto tmp = std::make_unique_for_overwrite<T[]>(tmp_size);
       const auto& hgT = functiondata.get_hgT();
       auto tmp_scratch = ttg::make_scratch(tmp.get(), ttg::scope::Allocate, tmp_size);
@@ -247,20 +246,20 @@ static auto make_compress(
       co_await ttg::device::wait(sumsqs_scratch);
 #endif
       T sumsq = 0.0;
-      T d_sumsq = sumsqs[num_children];
+      T d_sumsq = tmp[num_children];
       {  // Collect child leaf info
         //result.is_child_leaf = std::apply([](auto... ins){ return std::array{(ins.is_leaf)...}; });
         result.is_child_leaf = std::array{in0.is_leaf, in1.is_leaf, in2.is_leaf, in3.is_leaf,
                                           in4.is_leaf, in5.is_leaf, in6.is_leaf, in7.is_leaf};
-        for (std::size_t i = 0; i < num_children; ++i) {
-          sumsq += sumsqs[i]; // Accumulate sumsq from child difference coeffs
-        }
+        auto sumsqs = std::array{in0.sum, in1.sum, in2.sum, in3.sum,
+                                 in4.sum, in5.sum, in6.sum, in7.sum};
+        sumsq = std::reduce(sumsqs.begin(), sumsqs.end());
       }
 
       // Recur up
       std::cout << "compress key " << key << " parent " << key.parent() << " level " << key.level() << std::endl;
       if (key.level() > 0) {
-        p.sum = tmp[num_children] + sumsq; // result sumsq is last element in sumsqs
+        p.sum = d_sumsq + sumsq; // result sumsq is last element in sumsqs
 
         // will not return
 #ifndef TTG_ENABLE_HOST
@@ -461,7 +460,7 @@ int main(int argc, char **argv) {
   ttg::initialize(argc, argv);
   mra::GLinitialize();
 
-  test<double, 3>(10);
+  test<double, 3>(3);
 
   ttg::finalize();
 }

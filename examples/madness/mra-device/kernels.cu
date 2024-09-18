@@ -296,7 +296,7 @@ GLOBALSCOPE void fcoeffs_kernel2(
   if (is_t0) {
     values     = TensorView<T, NDIM>(&tmp[0], 2*K);
     r          = TensorView<T, NDIM>(&tmp[TWOK2NDIM], 2*K);
-    workspace  = TensorView<T, NDIM>(&tmp[2*TWOK2NDIM], K);
+    workspace  = TensorView<T, NDIM>(&tmp[2*TWOK2NDIM], 2*K);
     hgT        = TensorView<T, 2>(hgT_ptr, 2*K, 2*K);
     coeffs     = TensorView<T, NDIM>(coeffs_ptr, K);
   }
@@ -392,7 +392,6 @@ GLOBALSCOPE void compress_kernel(
   std::size_t K)
 {
   const bool is_t0 = 0 == (threadIdx.x + threadIdx.y + threadIdx.z);
-  int blockid = blockIdx.x;
   {   // Collect child coeffs and leaf info
     /* construct tensors */
     const size_t K2NDIM    = std::pow(  K,NDIM);
@@ -410,7 +409,7 @@ GLOBALSCOPE void compress_kernel(
     r = 0.0;
     p = 0.0;
 
-    for (int bid = blockIdx.x; bid < key.num_children(); bid += gridDim.x) {
+    for (int bid = blockIdx.x; bid < Key<NDIM>::num_children(); bid += gridDim.x) {
       if (is_t0) sumsqs[bid] = 0.0;
       SYNCTHREADS(); // wait for thread 0 to set sums to 0
       auto child_slice = get_child_slice<NDIM>(key, K, bid);
@@ -420,12 +419,12 @@ GLOBALSCOPE void compress_kernel(
     }
     //filter<T,K,NDIM>(s,d);  // Apply twoscale transformation=
     transform<NDIM>(s, hgT, r, workspace);
-    if (key.level() > 0 && blockIdx.x == 0) {
+    if (key.level() > 0) {
       auto child_slice = get_child_slice<NDIM>(key, K, 0);
       p = r(child_slice);
       r(child_slice) = 0.0;
-      sumabssq(r, &sumsqs[key.num_children()]); // put result sumsq at the end
     }
+    sumabssq(r, &sumsqs[Key<NDIM>::num_children()]); // put result sumsq at the end
   }
 }
 

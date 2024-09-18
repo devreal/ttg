@@ -14,9 +14,11 @@
 template<mra::Dimension NDIM>
 std::size_t project_tmp_size(std::size_t K) {
   const size_t K2NDIM = std::pow(K,NDIM);
-  return (NDIM*K2NDIM) // xvec in fcube
+  const std::size_t TWOK2NDIM = std::pow(2*K, NDIM);
+  return (3*TWOK2NDIM) // workspace, values and r
+       + (NDIM*K2NDIM) // xvec in fcube
        + (NDIM*K)      // x in fcube
-       + (4*K2NDIM);   // workspace in transform, values, child_values, r
+       + (3*K2NDIM);   // workspace in transform, child_values, r
 }
 
 /* Explicitly instantiated for 1, 2, 3 dimensional Gaussians */
@@ -59,9 +61,8 @@ void submit_compress_kernel(
 
 template<mra::Dimension NDIM>
 std::size_t reconstruct_tmp_size(std::size_t K) {
-  const size_t TWOK2NDIM = std::pow(2*K,NDIM); // s
-  const size_t K2NDIM = std::pow(K,NDIM); // workspace
-  return TWOK2NDIM + K2NDIM;
+  const size_t TWOK2NDIM = std::pow(2*K,NDIM); // s & workspace
+  return 2*TWOK2NDIM;
 }
 
 
