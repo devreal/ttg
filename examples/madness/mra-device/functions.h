@@ -35,7 +35,7 @@ namespace mra {
     }
 
     template <typename T>
-    SCOPE void distancesq(const Coordinate<T,3>& p, const TensorView<T,1>& q, T* rsq, std::size_t N) {
+    SCOPE void distancesq(const Coordinate<T,1>& p, const TensorView<T,2>& q, T* rsq, std::size_t N) {
         const T x = p(0);
 #ifdef __CUDA_ARCH__
         int tid = blockDim.x * ((blockDim.y*threadIdx.z) + threadIdx.y) + threadIdx.x;
@@ -43,6 +43,7 @@ namespace mra {
             T xx = q(0,i) - x;
             rsq[i] = xx*xx;
         }
+        SYNCTHREADS();
 #else  // __CUDA_ARCH__
         for (size_t i=0; i<N; i++) {
             T xx = q(0,i) - x;
@@ -52,7 +53,7 @@ namespace mra {
     }
 
     template <typename T>
-    SCOPE void distancesq(const Coordinate<T,3>& p, const TensorView<T,2>& q, T* rsq, std::size_t N) {
+    SCOPE void distancesq(const Coordinate<T,2>& p, const TensorView<T,2>& q, T* rsq, std::size_t N) {
         const T x = p(0);
         const T y = p(1);
 #ifdef __CUDA_ARCH__
@@ -62,6 +63,7 @@ namespace mra {
             T yy = q(1,i) - y;
             rsq[i] = xx*xx + yy*yy;
         }
+        SYNCTHREADS();
 #else  // __CUDA_ARCH__
         for (size_t i=0; i<N; i++) {
             T xx = q(0,i) - x;
@@ -72,7 +74,7 @@ namespace mra {
     }
 
     template <typename T>
-    SCOPE void distancesq(const Coordinate<T,3>& p, const TensorView<T,3>& q, T* rsq, std::size_t N) {
+    SCOPE void distancesq(const Coordinate<T,3>& p, const TensorView<T,2>& q, T* rsq, std::size_t N) {
         const T x = p(0);
         const T y = p(1);
         const T z = p(2);
@@ -84,6 +86,7 @@ namespace mra {
             T zz = q(2,i) - z;
             rsq[i] = xx*xx + yy*yy + zz*zz;
         }
+        SYNCTHREADS();
 #else  // __CUDA_ARCH__
         for (size_t i=0; i<N; i++) {
             T xx = q(0,i) - x;
@@ -143,6 +146,16 @@ namespace mra {
     template<typename T>
     SCOPE void print(const T& t) {
       foreach_idx(t, [&](auto... idx){ printf("[%lu %lu %lu] %f\n", idx..., t(idx...)); });
+      SYNCTHREADS();
+    }
+
+    template<typename T>
+    SCOPE void print(const T& t, const char* loc, const char *name) {
+      if constexpr (T::ndim() == 3) {
+        foreach_idx(t, [&](auto... idx){ printf("%s: %s[%lu %lu %lu] %p %e\n", loc, name, idx..., &t(idx...), t(idx...)); });
+      } else if constexpr (T::ndim() == 2) {
+        foreach_idx(t, [&](auto... idx){ printf("%s: %s[%lu %lu] %p %e\n", loc, name, idx..., &t(idx...), t(idx...)); });
+      }
       SYNCTHREADS();
     }
 
