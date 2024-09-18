@@ -14,12 +14,12 @@
 
 #ifdef TTG_ENABLE_HOST
 #define TASKTYPE void
+constexpr const ttg::ExecutionSpace Space = ttg::ExecutionSpace::Host;
 #else
 #define TASKTYPE ttg::device::Task
+constexpr const ttg::ExecutionSpace Space = ttg::ExecutionSpace::CUDA;
 #endif
 
-
-constexpr const ttg::ExecutionSpace Space = ttg::ExecutionSpace::CUDA;
 
 template <mra::Dimension NDIM>
 auto make_start(const ttg::Edge<mra::Key<NDIM>, void>& ctl) {
