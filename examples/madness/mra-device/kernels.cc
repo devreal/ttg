@@ -14,5 +14,8 @@ static constexpr const dim3 blockIdx  = {0, 0, 0};
 static constexpr const dim3 blockDim  = {1, 1, 1};
 static constexpr const dim3 gridDim   = {1, 1, 1};
 
+/* point cudaStream_t to our own stream type */
+typedef ttg::device::Stream cudaStream_t;
+
 /* include the CUDA code and hope that all is well */
 #include "kernels.cu"
