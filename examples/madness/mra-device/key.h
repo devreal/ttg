@@ -23,7 +23,8 @@ namespace mra {
         /// Refreshes the hash value.  Note that the default std::hash does not mix enough
         SCOPE HashValue rehash() const {
             HashValue hashvalue = n;
-            for (Dimension d=0; d<NDIM; d++) mulhash(hashvalue,l[d]);
+            //for (Dimension d=0; d<NDIM; d++) mulhash(hashvalue,l[d]);
+            for (Dimension d=0; d<NDIM; d++) hashvalue = (hashvalue<<7) | l[d];
             return hashvalue;
         }
 
