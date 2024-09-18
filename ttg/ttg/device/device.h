@@ -76,20 +76,28 @@ namespace ttg::device {
     constexpr const Stream default_stream_v = default_stream<Stream>::value;
   } // namespace detail
 
+} // namespace ttg
+
 #if defined(TTG_HAVE_CUDA)
 #include <cuda_runtime.h>
+namespace ttg::device {
   constexpr ttg::ExecutionSpace available_execution_space = ttg::ExecutionSpace::CUDA;
   using Stream = cudaStream_t;
+} // namespace ttg::device
 #elif defined(TTG_HAVE_HIP)
 #include <hip/hip_runtime.h>
+namespace ttg::device {
   constexpr ttg::ExecutionSpace available_execution_space = ttg::ExecutionSpace::HIP;
   using Stream = hipStream_t;
+} // namespace ttg::device
 #elif defined(TTG_HAVE_LEVEL_ZERO)
 #include <CL/sycl.hpp>
+namespace ttg::device {
   constexpr ttg::ExecutionSpace available_execution_space = ttg::ExecutionSpace::L0;
   using Stream = std::add_reference_t<sycl::queue>;
+} // namespace ttg::device
 #else
-
+namespace ttg::device {
   struct Stream { };
   namespace detail {
     template<>
@@ -98,8 +106,10 @@ namespace ttg::device {
     };
   } // namespace detail
   constexpr ttg::ExecutionSpace available_execution_space = ttg::ExecutionSpace::Host;
+} // namespace ttg::device
 #endif
 
+namespace ttg::device {
 
 #if !defined(TTG_HAVE_LEVEL_ZERO)
   namespace detail {
