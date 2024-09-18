@@ -185,7 +185,7 @@ static auto make_compress(
   // creates the right number of edges for nodes to flow from send_leafs_up to compress
   // send_leafs_up will select the right input for compress
   auto create_edges = [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-    return ttg::edges((Is, ttg::Edge<mra::Key<NDIM>, mra::FunctionReconstructedNode<T, NDIM>>{})...);
+    return ttg::edges(((void)Is, ttg::Edge<mra::Key<NDIM>, mra::FunctionReconstructedNode<T, NDIM>>{})...);
   };
   auto send_to_compress_edges = create_edges(std::make_index_sequence<num_children>{});
   /* append out edge to set of edges */

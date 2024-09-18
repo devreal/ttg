@@ -43,7 +43,7 @@ namespace mra {
 
     template<std::size_t... Is>
     static auto create_dims_array(std::size_t dim, std::index_sequence<Is...>) {
-      return std::array{(Is, dim)...};
+      return std::array{((void)Is, dim)...};
     }
 
   public:
