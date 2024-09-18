@@ -241,7 +241,7 @@ GLOBALSCOPE void fcoeffs_kernel1(
   T thresh)
 {
   int blockid = blockIdx.x;
-  bool is_t0 = !!(threadIdx.x + threadIdx.y + threadIdx.z);
+  bool is_t0 = 0 == (threadIdx.x + threadIdx.y + threadIdx.z);
   const std::size_t K2NDIM = std::pow(K, NDIM);
   const std::size_t TWOK2NDIM = std::pow(2*K, NDIM);
   /* reconstruct tensor views from pointers
@@ -391,7 +391,7 @@ GLOBALSCOPE void compress_kernel(
   const std::array<const T*, Key<NDIM>::num_children()> in_ptrs,
   std::size_t K)
 {
-  const bool is_t0 = !!(threadIdx.x + threadIdx.y + threadIdx.z);
+  const bool is_t0 = 0 == (threadIdx.x + threadIdx.y + threadIdx.z);
   int blockid = blockIdx.x;
   {   // Collect child coeffs and leaf info
     /* construct tensors */
@@ -476,7 +476,7 @@ GLOBALSCOPE void reconstruct_kernel(
   std::array<T*, (1<<NDIM) > r_arr,
   std::size_t K)
 {
-  const bool is_t0 = !!(threadIdx.x + threadIdx.y + threadIdx.z);
+  const bool is_t0 = 0 == (threadIdx.x + threadIdx.y + threadIdx.z);
   const size_t K2NDIM    = std::pow(  K,NDIM);
   const size_t TWOK2NDIM = std::pow(2*K,NDIM);
   SHARED TensorView<T, NDIM> node, s, workspace, from_parent;
