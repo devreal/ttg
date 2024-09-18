@@ -260,7 +260,7 @@ __global__ void fcoeffs_kernel1(
   SYNCTHREADS();
 
   /* compute one child per block */
-  for (int bid = blockid; bid < key.num_children; bid += gridDim.x) {
+  for (int bid = blockid; bid < key.num_children(); bid += gridDim.x) {
     Key<NDIM> child = key.child_at(bid);
     auto kl = key.translation();
     auto cl = child.translation();
@@ -388,7 +388,7 @@ __global__ void compress_kernel(
   const T* hgT_ptr,
   T* tmp,
   T* sumsqs, // sumsqs[0]: sum over sumsqs of p; sumsqs[1]: sumsq of result
-  const std::array<const T*, Key<NDIM>::num_children> in_ptrs,
+  const std::array<const T*, Key<NDIM>::num_children()> in_ptrs,
   std::size_t K)
 {
   const bool is_t0 = !!(threadIdx.x + threadIdx.y + threadIdx.z);
@@ -410,7 +410,7 @@ __global__ void compress_kernel(
     r = 0.0;
     p = 0.0;
 
-    for (int bid = blockIdx.x; bid < key.num_children; bid += gridDim.x) {
+    for (int bid = blockIdx.x; bid < key.num_children(); bid += gridDim.x) {
       if (is_t0) sumsqs[bid] = 0.0;
       SYNCTHREADS(); // wait for thread 0 to set sums to 0
       auto child_slice = get_child_slice<NDIM>(key, K, bid);
@@ -424,7 +424,7 @@ __global__ void compress_kernel(
       auto child_slice = get_child_slice<NDIM>(key, K, 0);
       p = r(child_slice);
       r(child_slice) = 0.0;
-      sumabssq(r, &sumsqs[key.num_children]); // put result sumsq at the end
+      sumabssq(r, &sumsqs[key.num_children()]); // put result sumsq at the end
     }
   }
 }
@@ -437,7 +437,7 @@ void submit_compress_kernel(
   const TensorView<T, 2>& hgT_view,
   T* tmp,
   T* sumsqs,
-  const std::array<const T*, Key<NDIM>::num_children>& in_ptrs,
+  const std::array<const T*, Key<NDIM>::num_children()>& in_ptrs,
   cudaStream_t stream)
 {
   const std::size_t K = p_view.dim(0);
@@ -458,7 +458,7 @@ void submit_compress_kernel<double, 3>(
   const TensorView<double, 2>& hgT_view,
   double* tmp,
   double* sumsqs,
-  const std::array<const double*, Key<3>::num_children>& in_ptrs,
+  const std::array<const double*, Key<3>::num_children()>& in_ptrs,
   cudaStream_t stream);
 
 
@@ -499,7 +499,7 @@ __global__ void reconstruct_kernel(
 
   /* extract all r from s
    * NOTE: we could do this on 1<<NDIM blocks but the benefits would likely be small */
-  for (int i = 0; i < key.num_children; ++i) {
+  for (int i = 0; i < key.num_children(); ++i) {
     auto child_slice = get_child_slice<NDIM>(key, K, i);
     /* tmp layout: 2K^NDIM for s, K^NDIM for workspace, [K^NDIM]* for r fields */
     auto r = TensorView<T, NDIM>(r_arr[i], K);
@@ -513,7 +513,7 @@ void submit_reconstruct_kernel(
   TensorView<T, NDIM>& node,
   const TensorView<T, 2>& hg,
   const TensorView<T, NDIM>& from_parent,
-  const std::array<T*, mra::Key<NDIM>::num_children>& r_arr,
+  const std::array<T*, mra::Key<NDIM>::num_children()>& r_arr,
   T* tmp,
   cudaStream_t stream)
 {
@@ -533,6 +533,6 @@ void submit_reconstruct_kernel<double, 3>(
   TensorView<double, 3>& node,
   const TensorView<double, 2>& hg,
   const TensorView<double, 3>& from_parent,
-  const std::array<double*, Key<3>::num_children>& r_arr,
+  const std::array<double*, Key<3>::num_children()>& r_arr,
   double* tmp,
   cudaStream_t stream);

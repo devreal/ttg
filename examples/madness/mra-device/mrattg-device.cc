@@ -164,9 +164,9 @@ static TASKTYPE do_send_leafs_up(const mra::Key<NDIM>& key, const mra::FunctionR
   /* drop all inputs from nodes that are not leafs, they will be upstreamed by compress */
   if (!node.has_children()) {
 #ifndef TTG_ENABLE_HOST
-    co_await select_compress_send(key, node, key.childindex(), std::make_index_sequence<mra::Key<NDIM>::num_children>{});
+    co_await select_compress_send(key, node, key.childindex(), std::make_index_sequence<mra::Key<NDIM>::num_children()>{});
 #else
-    select_compress_send(key, node, key.childindex(), std::make_index_sequence<mra::Key<NDIM>::num_children>{});
+    select_compress_send(key, node, key.childindex(), std::make_index_sequence<mra::Key<NDIM>::num_children()>{});
 #endif
   }
 }
@@ -181,7 +181,7 @@ static auto make_compress(
 {
   static_assert(NDIM == 3); // TODO: worth fixing?
 
-  constexpr const std::size_t num_children = mra::Key<NDIM>::num_children;
+  constexpr const std::size_t num_children = mra::Key<NDIM>::num_children();
   // creates the right number of edges for nodes to flow from send_leafs_up to compress
   // send_leafs_up will select the right input for compress
   auto create_edges = [&]<std::size_t... Is>(std::index_sequence<Is...>) {
@@ -203,7 +203,7 @@ static auto make_compress(
                          const mra::FunctionReconstructedNode<T,NDIM> &in7) -> TASKTYPE {
     //const typename ::detail::tree_types<T,K,NDIM>::compress_in_type& in,
     //typename ::detail::tree_types<T,K,NDIM>::compress_out_type& out) {
-      constexpr const auto num_children = mra::Key<NDIM>::num_children;
+      constexpr const auto num_children = mra::Key<NDIM>::num_children();
       constexpr const auto out_terminal_id = num_children;
       auto K = in0.coeffs.dim(0);
       mra::FunctionCompressedNode<T,NDIM> result(key, K); // The eventual result
@@ -315,8 +315,8 @@ auto make_reconstruct(
     r_empty.is_leaf = false;
 
     /* populate the vector of r's */
-    std::array<mra::FunctionReconstructedNode<T,NDIM>, key.num_children> r_arr;
-    for (int i = 0; i < key.num_children; ++i) {
+    std::array<mra::FunctionReconstructedNode<T,NDIM>, mra::Key<NDIM>::num_children()> r_arr;
+    for (int i = 0; i < key.num_children(); ++i) {
       r_arr[i] = mra::FunctionReconstructedNode<T,NDIM>(key, K);
     }
 
@@ -328,14 +328,14 @@ auto make_reconstruct(
     };
     /* select a device */
 #ifndef TTG_ENABLE_HOST
-    co_await do_select(std::make_index_sequence<key.num_children>{});
+    co_await do_select(std::make_index_sequence<mra::Key<NDIM>::num_children()>{});
 #endif
 
     // helper lambda to pick apart the std::array
     auto assemble_tensor_ptrs = [&]<std::size_t... Is>(std::index_sequence<Is...>){
       return std::array{(r_arr[Is].coeffs.current_view().data())...};
     };
-    auto r_ptrs = assemble_tensor_ptrs(std::make_index_sequence<key.num_children>{});
+    auto r_ptrs = assemble_tensor_ptrs(std::make_index_sequence<mra::Key<NDIM>::num_children()>{});
     auto node_view = node.coeffs.current_view();
     auto hg_view = hg.current_view();
     auto from_parent_view = from_parent.current_view();

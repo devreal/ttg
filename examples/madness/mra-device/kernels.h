@@ -63,7 +63,7 @@ void submit_compress_kernel(
   const mra::TensorView<T, 2>& hgT_view,
   T* tmp,
   T* sumsqs,
-  const std::array<const T*, mra::Key<NDIM>::num_children>& in_ptrs,
+  const std::array<const T*, mra::Key<NDIM>::num_children()>& in_ptrs,
   stream_t stream);
 
 template<mra::Dimension NDIM>
@@ -80,7 +80,7 @@ void submit_reconstruct_kernel(
   mra::TensorView<T, NDIM>& node,
   const mra::TensorView<T, 2>& hg,
   const mra::TensorView<T, NDIM>& from_parent,
-  const std::array<T*, mra::Key<NDIM>::num_children>& r_arr,
+  const std::array<T*, mra::Key<NDIM>::num_children()>& r_arr,
   T* tmp,
   stream_t stream);
 

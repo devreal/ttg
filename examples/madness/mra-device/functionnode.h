@@ -16,7 +16,7 @@ namespace mra {
         key_type key; //< Key associated with this node to facilitate computation from otherwise unknown parent/child
         mutable T sum = 0.0; //< If recurring up tree (e.g., in compress) can use this to also compute a scalar reduction
         bool is_leaf = false; //< True if node is leaf on tree (i.e., no children).
-        std::array<bool, Key<NDIM>::num_children> is_child_leaf = { false };
+        std::array<bool, Key<NDIM>::num_children()> is_child_leaf = { false };
         tensor_type coeffs; //< if !is_leaf these are junk (and need not be communicated)
         FunctionReconstructedNode() = default; // Default initializer does nothing so that class is POD
         FunctionReconstructedNode(const Key<NDIM>& key, std::size_t K)
@@ -48,7 +48,7 @@ namespace mra {
         static constexpr bool is_function_node = true;
 
         Key<NDIM> key; //< Key associated with this node to facilitate computation from otherwise unknown parent/child
-        std::array<bool, Key<NDIM>::num_children> is_child_leaf; //< True if that child is leaf on tree
+        std::array<bool, Key<NDIM>::num_children()> is_child_leaf; //< True if that child is leaf on tree
         Tensor<T,NDIM> coeffs; //< Always significant
 
         FunctionCompressedNode() = default; // needed for serialization
@@ -62,7 +62,7 @@ namespace mra {
 
         //T normf() const {return coeffs.normf();}
         bool has_children(size_t childindex) const {
-            assert(childindex<Key<NDIM>::num_children);
+            assert(childindex<Key<NDIM>::num_children());
             return !is_child_leaf[childindex];
         }
 

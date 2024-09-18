@@ -28,7 +28,7 @@ namespace mra {
         }
 
     public:
-        constexpr static size_t num_children = (1ul<<NDIM);
+        static constexpr size_t num_children() { return (1ul<<NDIM); }
 
         /// Default constructor is deliberately default so that is POD
         SCOPE Key() = default;
@@ -123,7 +123,7 @@ namespace mra {
         /// Return the Key of the child at position idx \in [0, 1<<NDIM)
         SCOPE Key<NDIM> child_at(size_t idx) {
             assert(n<MAX_LEVEL);
-            assert(idx<num_children);
+            assert(idx<num_children());
             std::array<Translation,NDIM> l = this->l;
             for (Dimension d = 0; d < NDIM; ++d) l[d] = 2*l[d] + ((idx & (1<<d)) ? 1 : 0);
             return Key<NDIM>(n+1, l);
