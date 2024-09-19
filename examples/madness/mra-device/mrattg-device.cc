@@ -257,7 +257,8 @@ static auto make_compress(
       }
 
       // Recur up
-      std::cout << "compress key " << key << " parent " << key.parent() << " level " << key.level() << std::endl;
+      std::cout << "compress key " << key << " parent " << key.parent() << " level " << key.level()
+                << " sumsq " << sumsq << " d_sumsq " << d_sumsq << std::endl;
       if (key.level() > 0) {
         p.sum = d_sumsq + sumsq; // result sumsq is last element in sumsqs
 

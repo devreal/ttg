@@ -176,7 +176,7 @@ SCOPE
 void mTxmq(std::size_t dimi, std::size_t dimj, std::size_t dimk,
            cT* __restrict__ c, const aT* a, const bT* b, std::ptrdiff_t ldb=-1) {
   if (ldb == -1) ldb=dimj;
-
+  printf("mTxmq dimi %lu dimj %lu dimk %lu\n", dimi, dimj, dimk);
   /* trivial 2D implementation for devices */
   if (threadIdx.z == 0) {
     for (std::size_t i = threadIdx.y; i < dimi; i += blockDim.y) {
@@ -237,6 +237,9 @@ GLOBALSCOPE void fcoeffs_kernel1(
   Key<NDIM> key,
   T* tmp,
   const T* phibar_ptr,
+  T* coeffs_ptr,
+  const T* hgT_ptr,
+  bool *is_leaf,
   std::size_t K,
   T thresh)
 {
@@ -246,8 +249,8 @@ GLOBALSCOPE void fcoeffs_kernel1(
   const std::size_t TWOK2NDIM = std::pow(2*K, NDIM);
   /* reconstruct tensor views from pointers
    * make sure we have the values at the same offset (0) as in kernel 1 */
-  SHARED TensorView<T, NDIM> values, r, child_values, workspace;
-  SHARED TensorView<T, 2   > x_vec, x, phibar;
+  SHARED TensorView<T, NDIM> values, r, child_values, workspace, coeffs;
+  SHARED TensorView<T, 2   > hgT, x_vec, x, phibar;
   if (is_t0) {
     values       = TensorView<T, NDIM>(&tmp[0       ], 2*K);
     r            = TensorView<T, NDIM>(&tmp[TWOK2NDIM+0*K2NDIM], K);
@@ -273,8 +276,35 @@ GLOBALSCOPE void fcoeffs_kernel1(
     auto child_slice = get_child_slice<NDIM>(key, K, bid);
     values(child_slice) = r;
   }
+
+  /* reallocate some of the tensorviews */
+  if (is_t0) {
+    r          = TensorView<T, NDIM>(&tmp[TWOK2NDIM], 2*K);
+    workspace  = TensorView<T, NDIM>(&tmp[2*TWOK2NDIM], 2*K);
+    hgT        = TensorView<T, 2>(hgT_ptr, 2*K, 2*K);
+    coeffs     = TensorView<T, NDIM>(coeffs_ptr, K);
+  }
+  SYNCTHREADS();
+  r = 0.0;
+
+  T fac = std::sqrt(D.template get_volume<T>()*std::pow(T(0.5),T(NDIM*(1+key.level()))));
+  values *= fac;
+  // Inlined: filter<T,K,NDIM>(values,r);
+  transform<NDIM>(values, hgT, r, workspace);
+
+  auto child_slice = get_child_slice<NDIM>(key, K, 0);
+  auto r_slice = r(child_slice);
+  coeffs = r_slice; // extract sum coeffs
+  r_slice = 0.0; // zero sum coeffs so can easily compute norm of difference coeffs
+  /* TensorView assignment synchronizes */
+  T norm = mra::normf(r);
+  if (is_t0) {
+    /* TODO: compute the norm across threads */
+    *is_leaf = (norm < truncate_tol(key,thresh)); // test norm of difference coeffs
+  }
 }
 
+#if 0
 template<typename T, Dimension NDIM>
 GLOBALSCOPE void fcoeffs_kernel2(
   const Domain<NDIM>& D,
@@ -319,6 +349,7 @@ GLOBALSCOPE void fcoeffs_kernel2(
     *is_leaf = (norm < truncate_tol(key,thresh)); // test norm of difference coeffs
   }
 }
+#endif // 0
 
 template<typename Fn, typename T, Dimension NDIM>
 void submit_fcoeffs_kernel(
@@ -346,12 +377,9 @@ void submit_fcoeffs_kernel(
   Dim3 thread_dims = Dim3(K, 1, 1); // figure out how to consider register usage
   /* launch one block per child */
   CALL_KERNEL(fcoeffs_kernel1, 1, thread_dims, 0, stream)(
-    D, gldata, fn, key, tmp, phibar_view.data(), K, thresh);
-  checkSubmit();
-  /* launch one block only */
-  CALL_KERNEL(fcoeffs_kernel2, 1, thread_dims, 0, stream)(
-    D, key, coeffs_view.data(), hgT_view.data(),
-    tmp, is_leaf_scratch, K, thresh);
+    D, gldata, fn, key, tmp, phibar_view.data(),
+    coeffs_view.data(), hgT_view.data(),
+    is_leaf_scratch, K, thresh);
   checkSubmit();
 }
 
@@ -415,6 +443,7 @@ GLOBALSCOPE void compress_kernel(
       auto child_slice = get_child_slice<NDIM>(key, K, bid);
       const TensorView<T, NDIM> in(in_ptrs[bid], K);
       sumabssq(in, &sumsqs[bid]);
+      printf("compress %d sumsq %f\n", bid, sumsqs[bid]);
       s(child_slice) = in;
     }
     //filter<T,K,NDIM>(s,d);  // Apply twoscale transformation=
@@ -476,7 +505,6 @@ GLOBALSCOPE void reconstruct_kernel(
   std::size_t K)
 {
   const bool is_t0 = 0 == (threadIdx.x + threadIdx.y + threadIdx.z);
-  const size_t K2NDIM    = std::pow(  K,NDIM);
   const size_t TWOK2NDIM = std::pow(2*K,NDIM);
   SHARED TensorView<T, NDIM> node, s, workspace, from_parent;
   SHARED TensorView<T, 2> hg;
