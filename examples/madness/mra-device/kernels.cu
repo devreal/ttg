@@ -424,17 +424,17 @@ GLOBALSCOPE void compress_kernel(
     /* construct tensors */
     const size_t K2NDIM    = std::pow(  K,NDIM);
     const size_t TWOK2NDIM = std::pow(2*K,NDIM);
-    SHARED TensorView<T,NDIM> s, r, p, workspace;
+    SHARED TensorView<T,NDIM> s, d, p, workspace;
     SHARED TensorView<T,2> hgT;
     if (is_t0) {
       s = TensorView<T,NDIM>(&tmp[0], 2*K);
-      r = TensorView<T,NDIM>(result_ptr, K);
+      d = TensorView<T,NDIM>(result_ptr, 2*K);
       p = TensorView<T,NDIM>(p_ptr, K);
       hgT = TensorView<T,2>(hgT_ptr, K);
       workspace = TensorView<T, NDIM>(&tmp[TWOK2NDIM], K);
     }
     SYNCTHREADS();
-    r = 0.0;
+    d = 0.0;
     p = 0.0;
 
     for (int bid = blockIdx.x; bid < Key<NDIM>::num_children(); bid += gridDim.x) {
@@ -447,13 +447,13 @@ GLOBALSCOPE void compress_kernel(
       s(child_slice) = in;
     }
     //filter<T,K,NDIM>(s,d);  // Apply twoscale transformation=
-    transform<NDIM>(s, hgT, r, workspace);
+    transform<NDIM>(s, hgT, d, workspace);
     if (key.level() > 0) {
       auto child_slice = get_child_slice<NDIM>(key, K, 0);
-      p = r(child_slice);
-      r(child_slice) = 0.0;
+      p = d(child_slice);
+      d(child_slice) = 0.0;
     }
-    sumabssq(r, &sumsqs[Key<NDIM>::num_children()]); // put result sumsq at the end
+    sumabssq(d, &sumsqs[Key<NDIM>::num_children()]); // put result sumsq at the end
   }
 }
 
