@@ -40,8 +40,7 @@ template<mra::Dimension NDIM>
 std::size_t compress_tmp_size(std::size_t K) {
   const size_t TWOK2NDIM = std::pow(2*K,NDIM);
   const size_t K2NDIM = std::pow(K,NDIM);
-  return (TWOK2NDIM) // s
-          + K2NDIM // workspace
+  return (2*TWOK2NDIM) // s & workspace
           + mra::Key<NDIM>::num_children() // sumsq for each child and result
           ;
 }

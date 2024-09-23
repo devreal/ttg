@@ -428,10 +428,10 @@ GLOBALSCOPE void compress_kernel(
     SHARED TensorView<T,2> hgT;
     if (is_t0) {
       s = TensorView<T,NDIM>(&tmp[0], 2*K);
+      workspace = TensorView<T, NDIM>(&tmp[TWOK2NDIM], 2*K);
       d = TensorView<T,NDIM>(result_ptr, 2*K);
       p = TensorView<T,NDIM>(p_ptr, K);
-      hgT = TensorView<T,2>(hgT_ptr, K);
-      workspace = TensorView<T, NDIM>(&tmp[TWOK2NDIM], K);
+      hgT = TensorView<T,2>(hgT_ptr, 2*K);
     }
     SYNCTHREADS();
     d = 0.0;
@@ -512,7 +512,7 @@ GLOBALSCOPE void reconstruct_kernel(
     node        = TensorView<T, NDIM>(node_ptr, 2*K);
     s           = TensorView<T, NDIM>(&tmp_ptr[0], 2*K);
     workspace   = TensorView<T, NDIM>(&tmp_ptr[TWOK2NDIM], 2*K);
-    hg          = TensorView<T, 2>(hg_ptr, K);
+    hg          = TensorView<T, 2>(hg_ptr, 2*K);
     from_parent = TensorView<T, NDIM>(from_parent_ptr, K);
   }
   SYNCTHREADS();
