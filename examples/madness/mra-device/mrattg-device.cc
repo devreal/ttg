@@ -174,6 +174,7 @@ static TASKTYPE do_send_leafs_up(const mra::Key<NDIM>& key, const mra::FunctionR
 /// Make a composite operator that implements compression for a single function
 template <typename T, mra::Dimension NDIM>
 static auto make_compress(
+  const std::size_t K,
   const mra::FunctionData<T, NDIM>& functiondata,
   ttg::Edge<mra::Key<NDIM>, mra::FunctionReconstructedNode<T, NDIM>>& in,
   ttg::Edge<mra::Key<NDIM>, mra::FunctionCompressedNode<T, NDIM>>& out)
@@ -190,7 +191,7 @@ static auto make_compress(
   /* append out edge to set of edges */
   auto compress_out_edges = std::tuple_cat(send_to_compress_edges, std::make_tuple(out));
   /* use the tuple variant to handle variable number of inputs while suppressing the output tuple */
-  auto do_compress = [&](const mra::Key<NDIM>& key,
+  auto do_compress = [&, K](const mra::Key<NDIM>& key,
                          //const std::tuple<const FunctionReconstructedNodeTypes&...>& input_frns
                          const mra::FunctionReconstructedNode<T,NDIM> &in0,
                          const mra::FunctionReconstructedNode<T,NDIM> &in1,
@@ -204,7 +205,6 @@ static auto make_compress(
     //typename ::detail::tree_types<T,K,NDIM>::compress_out_type& out) {
       constexpr const auto num_children = mra::Key<NDIM>::num_children();
       constexpr const auto out_terminal_id = num_children;
-      auto K = in0.coeffs.dim(0);
       mra::FunctionCompressedNode<T,NDIM> result(key, K); // The eventual result
       auto& d = result.coeffs;
       // allocate even though we might not need it
@@ -300,7 +300,7 @@ auto make_reconstruct(
 {
   ttg::Edge<mra::Key<NDIM>, mra::Tensor<T,NDIM>> S("S");  // passes scaling functions down
 
-  auto do_reconstruct = [&](const mra::Key<NDIM>& key,
+  auto do_reconstruct = [&, K](const mra::Key<NDIM>& key,
                             mra::FunctionCompressedNode<T, NDIM>&& node,
                             const mra::Tensor<T, NDIM>& from_parent) -> TASKTYPE {
     const std::size_t K = from_parent.dim(0);
@@ -340,7 +340,7 @@ auto make_reconstruct(
     auto hg_view = hg.current_view();
     auto from_parent_view = from_parent.current_view();
     submit_reconstruct_kernel(key, node_view, hg_view, from_parent_view,
-                              r_ptrs, tmp_scratch.device_ptr(), ttg::device::current_stream());
+                              r_ptrs, tmp_scratch.device_ptr(), K, ttg::device::current_stream());
 
     // forward() returns a vector that we can push into
 #ifndef TTG_ENABLE_HOST
@@ -426,7 +426,7 @@ void test(std::size_t K) {
   auto gauss_buffer = ttg::Buffer<mra::Gaussian<T, NDIM>>(&gaussian);
   auto start = make_start(project_control);
   auto project = make_project(D, gauss_buffer, K, functiondata, T(1e-6), project_control, project_result);
-  auto compress = make_compress(functiondata, project_result, compress_result);
+  auto compress = make_compress(K, functiondata, project_result, compress_result);
   auto reconstruct = make_reconstruct(K, functiondata, compress_result, reconstruct_result);
   auto printer =   make_printer(project_result,    "projected    ", false);
   auto printer2 =  make_printer(compress_result,   "compressed   ", false);

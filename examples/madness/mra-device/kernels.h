@@ -73,6 +73,7 @@ void submit_reconstruct_kernel(
   const mra::TensorView<T, NDIM>& from_parent,
   const std::array<T*, mra::Key<NDIM>::num_children()>& r_arr,
   T* tmp,
+  std::size_t K,
   ttg::device::Stream stream);
 
 #endif // HAVE_KERNELS_H

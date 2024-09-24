@@ -542,9 +542,9 @@ void submit_reconstruct_kernel(
   const TensorView<T, NDIM>& from_parent,
   const std::array<T*, mra::Key<NDIM>::num_children()>& r_arr,
   T* tmp,
+  std::size_t K,
   cudaStream_t stream)
 {
-  const std::size_t K = node.dim(0);
   /* runs on a single block */
   Dim3 thread_dims = Dim3(K, 1, 1); // figure out how to consider register usage
   CALL_KERNEL(reconstruct_kernel, 1, thread_dims, 0, stream)(
@@ -562,4 +562,5 @@ void submit_reconstruct_kernel<double, 3>(
   const TensorView<double, 3>& from_parent,
   const std::array<double*, Key<3>::num_children()>& r_arr,
   double* tmp,
+  std::size_t K,
   cudaStream_t stream);
