@@ -35,9 +35,6 @@
 #include "ttg/util/print.h"
 #include "ttg/util/trace.h"
 #include "ttg/util/typelist.h"
-#ifdef TTG_HAVE_DEVICE
-#include "ttg/device/task.h"
-#endif  // TTG_HAVE_DEVICE
 
 #include "ttg/serialization/data_descriptor.h"
 
@@ -48,6 +45,7 @@
 #include "ttg/parsec/thread_local.h"
 #include "ttg/parsec/devicefunc.h"
 #include "ttg/parsec/ttvalue.h"
+#include "ttg/device/task.h"
 
 #include <algorithm>
 #include <array>
