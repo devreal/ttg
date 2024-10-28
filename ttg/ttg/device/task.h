@@ -471,15 +471,6 @@ namespace ttg::device {
         return {};
       }
 
-#if 0
-      // TODO: still needed?
-      /* Allow co_await on a tuple */
-      template<typename... Views>
-      ttg::suspend_always await_transform(std::tuple<Views&...> &views) {
-        return yield_value(views);
-      }
-#endif // 0
-
       template<typename... Ts>
       auto await_transform(detail::to_device_t<Ts...>&& a) {
         if constexpr (space != ttg::ExecutionSpace::Host) {
@@ -494,29 +485,44 @@ namespace ttg::device {
 
       template<typename... Ts>
       auto await_transform(detail::wait_kernel_t<Ts...>&& a) {
-        //std::cout << "yield_value: wait_kernel_t" << std::endl;
         if constexpr (space != ttg::ExecutionSpace::Host) {
           if constexpr (sizeof...(Ts) > 0) {
             TTG_IMPL_NS::mark_device_out(a.ties);
           }
           m_state = ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL;
-          return a;
+          return ttg::suspend_always{};
         } else {
           return ttg::suspend_never{}; // host never suspends
         }
       }
 
       ttg::suspend_always await_transform(std::vector<device::detail::send_t>&& v) {
-        m_sends = std::forward<std::vector<device::detail::send_t>>(v);
-        m_state = ttg::device::detail::TTG_DEVICE_CORO_SENDOUT;
+        if constexpr (space != ttg::ExecutionSpace::Host) {
+          m_sends = std::move(v);
+          m_state = ttg::device::detail::TTG_DEVICE_CORO_SENDOUT;
+        } else {
+          /* execute second part of sends immediately and never suspend */
+          for (auto& send : v) {
+            send.coro();
+          }
+          v.clear();
+        }
         return {};
+        // unreachable
+        throw std::runtime_error("Returned after sending!");
       }
 
       ttg::suspend_always await_transform(device::detail::send_t&& v) {
-        m_sends.clear();
-        m_sends.push_back(std::forward<device::detail::send_t>(v));
-        m_state = ttg::device::detail::TTG_DEVICE_CORO_SENDOUT;
+        if constexpr (space != ttg::ExecutionSpace::Host) {
+          m_sends.clear();
+          m_sends.push_back(std::move(v));
+          m_state = ttg::device::detail::TTG_DEVICE_CORO_SENDOUT;
+        } else {
+          v.coro();
+        }
         return {};
+        // unreachable
+        throw std::runtime_error("Returned after sending!");
       }
 
       void return_void() {
@@ -527,7 +533,9 @@ namespace ttg::device {
         return m_state == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE;
       }
 
-      ttg::device::Task get_return_object() { return {detail::device_task_handle_type<ES>::from_promise(*this)}; }
+      ttg::device::Task<ES> get_return_object() {
+        return {detail::device_task_handle_type<ES>::from_promise(*this)};
+      }
 
       void unhandled_exception() {
         std::cerr << "Task coroutine caught an unhandled exception!" << std::endl;
@@ -562,102 +570,13 @@ namespace ttg::device {
 
   } // namespace detail
 
-  bool Task::completed() { return base_type::promise().state() == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE; }
+  template<ttg::ExecutionSpace ES>
+  bool Task<ES>::completed() {
+    return base_type::promise().state() == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE;
+  }
 
   struct device_wait_kernel
   { };
-
-
-  /* NOTE: below is preliminary for reductions on the device, which is not available yet */
-#if 0
-  /**************************
-   * Device reduction coros *
-   **************************/
-
-  struct device_reducer_promise_type;
-
-  using device_reducer_handle_type = ttg::coroutine_handle<device_reducer_promise_type>;
-
-  /// task that can be resumed after some events occur
-  struct device_reducer : public device_reducer_handle_type {
-    using base_type = device_reducer_handle_type;
-
-    /// these are members mandated by the promise_type concept
-    ///@{
-
-    using promise_type = device_reducer_promise_type;
-
-    ///@}
-
-    device_reducer(base_type base) : base_type(std::move(base)) {}
-
-    base_type& handle() { return *this; }
-
-    /// @return true if ready to resume
-    inline bool ready() {
-      return true;
-    }
-
-    /// @return true if task completed and can be destroyed
-    inline bool completed();
-  };
-
-
-  /* The promise type that stores the views provided by the
-  * application task coroutine on the first co_yield. It subsequently
-  * tracks the state of the task when it moves from waiting for transfers
-  * to waiting for the submitted kernel to complete. */
-  struct device_reducer_promise_type {
-
-    /* do not suspend the coroutine on first invocation, we want to run
-    * the coroutine immediately and suspend when we get the device transfers.
-    */
-    ttg::suspend_never initial_suspend() {
-      m_state = ttg::device::detail::TTG_DEVICE_CORO_INIT;
-      return {};
-    }
-
-    /* suspend the coroutine at the end of the execution
-    * so we can access the promise.
-    * TODO: necessary? maybe we can save one suspend here
-    */
-    ttg::suspend_always final_suspend() noexcept {
-      m_state = ttg::device::detail::TTG_DEVICE_CORO_COMPLETE;
-      return {};
-    }
-
-    template<typename... Ts>
-    ttg::suspend_always await_transform(detail::to_device_t<Ts...>&& a) {
-      bool need_transfer = !(TTG_IMPL_NS::register_device_memory(a.ties));
-      /* TODO: are we allowed to not suspend here and launch the kernel directly? */
-      m_state = ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER;
-      return {};
-    }
-
-    void return_void() {
-      m_state = ttg::device::detail::TTG_DEVICE_CORO_COMPLETE;
-    }
-
-    bool complete() const {
-      return m_state == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE;
-    }
-
-    device_reducer get_return_object() { return device_reducer{device_reducer_handle_type::from_promise(*this)}; }
-
-    void unhandled_exception() { }
-
-    auto state() {
-      return m_state;
-    }
-
-
-  private:
-    ttg::device::detail::ttg_device_coro_state m_state = ttg::device::detail::TTG_DEVICE_CORO_STATE_NONE;
-
-  };
-
-  bool device_reducer::completed() { return base_type::promise().state() == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE; }
-#endif // 0
 
 }  // namespace ttg::device
 
