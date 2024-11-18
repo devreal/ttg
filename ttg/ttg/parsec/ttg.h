@@ -3464,17 +3464,7 @@ namespace ttg_parsec {
             /* need to mark the flow RW to make PaRSEC happy */
             ((parsec_flow_t *)gpu_task->flow[flowidx])->flow_flags |= PARSEC_FLOW_ACCESS_RW;
             gpu_task->pushout |= 1<<flowidx;
-          }
-<<<<<<< HEAD
-        };
-        ttg::detail::buffer_apply(value,
-          [&]<typename T, typename Allocator>(const ttg::Buffer<T, Allocator>& buffer){
-            check_parsec_data(detail::get_parsec_data(buffer));
-          });
-      } else {
-        throw std::runtime_error("Value type must be serializable with ttg::BufferVisitorArchive");
-      }
-=======
+          
           if (flowidx == MAX_PARAM_COUNT) {
             throw std::runtime_error("Cannot add more than MAX_PARAM_COUNT flows to a task!");
           }
@@ -3488,8 +3478,14 @@ namespace ttg_parsec {
           gpu_task->pushout |= 1<<flowidx;
         }
       };
-      copy->foreach_parsec_data(check_parsec_data);
->>>>>>> flexible-device-inputs-and-gpu-task-free
+          ttg::detail::buffer_apply(value,
+          [&]<typename T, typename Allocator>(const ttg::Buffer<T, Allocator>& buffer){
+            check_parsec_data(detail::get_parsec_data(buffer));
+          });
+      } else {
+        throw std::runtime_error("Value type must be serializable with ttg::BufferVisitorArchive");
+      }
+
     }
 
 
