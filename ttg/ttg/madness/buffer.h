@@ -2,6 +2,7 @@
 #define TTG_MADNESS_BUFFER_H
 
 #include "ttg/serialization/traits.h"
+#include "ttg/device/device.h"
 
 #include <memory>
 
@@ -125,6 +126,12 @@ public:
     /* no-op */
   }
 
+
+  bool is_current_on(ttg::device::Device dev) const {
+    assert(is_valid());
+    return true;
+  }
+
   /* Get the owner device ID, i.e., the last updated
    * device buffer. */
   ttg::device::Device get_owner_device() const {
@@ -191,6 +198,10 @@ public:
   void allocate_on(const ttg::device::Device& device_id) {
     /* TODO: need exposed PaRSEC memory allocator */
     throw std::runtime_error("not implemented yet");
+  }
+
+  bool empty() const {
+    return (m_host_data == nullptr);
   }
 
   /* TODO: can we do this automatically?

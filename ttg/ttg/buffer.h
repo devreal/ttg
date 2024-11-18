@@ -5,6 +5,7 @@
 
 #include "ttg/fwd.h"
 #include "ttg/serialization.h"
+#include "ttg/util/meta.h"
 #include <memory>
 
 namespace ttg {
@@ -13,6 +14,8 @@ template<typename T, typename Allocator = std::allocator<std::decay_t<T>>>
 using Buffer = TTG_IMPL_NS::Buffer<T, Allocator>;
 
 namespace meta {
+
+  /* Specialize some traits */
 
   template<typename T, typename A>
   struct is_buffer<ttg::Buffer<T, A>> : std::true_type
@@ -42,7 +45,6 @@ namespace detail {
   constexpr const bool has_buffer_apply_v = has_buffer_apply<T>::value;
 
 } // namespace detail
-
 } // namespace ttg
 
 
