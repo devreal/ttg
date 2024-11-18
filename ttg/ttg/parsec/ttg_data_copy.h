@@ -422,7 +422,10 @@ namespace ttg_parsec {
         return m_iovecs.size();
       }
 
-#if defined(PARSEC_PROF_TRACE) && defined(PARSEC_TTG_PROFILE_BACKEND)
+#if defined(PARSEC_PROF_TRACE)
+      //< These two fields are used by the profiling system to carry information
+      //  between the data copy creation and its destruction. They are set after
+      //  creation by the profiling system, iff profiling is enabled.
       int64_t size;
       int64_t uid;
 #endif
