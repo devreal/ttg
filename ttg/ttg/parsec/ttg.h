@@ -1507,68 +1507,84 @@ namespace ttg_parsec {
     static parsec_hook_return_t device_static_evaluate(parsec_task_t* parsec_task) {
 
       task_t *task = (task_t*)parsec_task;
+      if (task->dev_ptr->gpu_task == nullptr) {
 
-      /* set up the device task */
-      parsec_gpu_task_t *gpu_task = task->dev_ptr->gpu_task;
-      /* TODO: needed? */
-      std::memset(gpu_task, 0, sizeof(gpu_task));
-      /* construct the GPU task */
-      PARSEC_OBJ_CONSTRUCT(gpu_task, parsec_list_item_t);
-      gpu_task->ec = parsec_task;
-      gpu_task->task_type = 0; // user task
-      gpu_task->last_data_check_epoch = 0; // used internally
-      gpu_task->pushout = 0;
-      gpu_task->submit = &TT::device_static_submit;
-      gpu_task->release_device_task = &release_device_task;
+        /* set up a device task */
+        parsec_gpu_task_t *gpu_task;
+        /* PaRSEC wants to free the gpu_task, because F***K ownerships */
+        gpu_task = static_cast<parsec_gpu_task_t*>(std::calloc(1, sizeof(*gpu_task)));
+        PARSEC_OBJ_CONSTRUCT(gpu_task, parsec_list_item_t);
+        gpu_task->ec = parsec_task;
+        gpu_task->task_type = 0; // user task
+        gpu_task->last_data_check_epoch = 0; // used internally
+        gpu_task->pushout = 0;
+        gpu_task->submit = &TT::device_static_submit<Space>;
+        gpu_task->release_device_task = &release_device_task;
 
-      /* TODO: is this the right place to set the mask? */
-      task->parsec_task.chore_mask = PARSEC_DEV_ALL;
+        // one way to force the task device
+        // currently this will probably break all of PaRSEC if this hint
+        // does not match where the data is located, not really useful for us
+        // instead we set a hint on the data if there is no hint set yet
+        //parsec_task->selected_device = ...;
 
-      /* copy over the task class, because that's what we need */
-      task->dev_ptr->task_class = *task->parsec_task.task_class;
+        /* set the gpu_task so it's available in register_device_memory */
+        task->dev_ptr->gpu_task = gpu_task;
 
-      // first invocation of the coroutine to get the coroutine handle
-      static_op(parsec_task);
+        /* TODO: is this the right place to set the mask? */
+        task->parsec_task.chore_mask = PARSEC_DEV_ALL;
 
-      /* when we come back here, the flows in gpu_task are set (see register_device_memory) */
+        /* copy over the task class, because that's what we need */
+        task->dev_ptr->task_class = *task->parsec_task.task_class;
 
-      parsec_task_class_t& tc = task->dev_ptr->task_class;
+        // first invocation of the coroutine to get the coroutine handle
+        static_op(parsec_task);
 
-      // input flows are set up during register_device_memory as part of the first invocation above
-      for (int i = 0; i < MAX_PARAM_COUNT; ++i) {
-        tc.in[i]  = gpu_task->flow[i];
-        tc.out[i] = gpu_task->flow[i];
-      }
-      tc.nb_flows = MAX_PARAM_COUNT;
+        /* when we come back here, the flows in gpu_task are set (see register_device_memory) */
 
-      /* set the device hint on the data */
-      TT *tt = task->tt;
-      if (tt->devicemap) {
-        int parsec_dev;
-        if constexpr (std::is_void_v<keyT>) {
-          parsec_dev = detail::ttg_device_to_parsec_device(tt->devicemap());
-        } else {
-          parsec_dev = detail::ttg_device_to_parsec_device(tt->devicemap(task->key));
-        }
+        parsec_task_class_t& tc = task->dev_ptr->task_class;
+
+        // input flows are set up during register_device_memory as part of the first invocation above
         for (int i = 0; i < MAX_PARAM_COUNT; ++i) {
-          /* only set on mutable data since we have exclusive access */
-          if (tc.in[i]->flow_flags & PARSEC_FLOW_ACCESS_WRITE) {
-            parsec_data_t *data = parsec_task->data[i].data_in->original;
-            /* only set the preferred device if the host has the latest copy
-              * as otherwise we may end up with the wrong data if there is a newer
-              * version on a different device. Also, keep fingers crossed. */
-            if (data->owner_device == 0) {
-              parsec_advise_data_on_device(data, parsec_dev, PARSEC_DEV_DATA_ADVICE_PREFERRED_DEVICE);
+          tc.in[i]  = gpu_task->flow[i];
+          tc.out[i] = gpu_task->flow[i];
+        }
+        tc.nb_flows = MAX_PARAM_COUNT;
+
+        /* set the device hint on the data */
+        TT *tt = task->tt;
+        if (tt->devicemap) {
+          int parsec_dev;
+          if constexpr (std::is_void_v<keyT>) {
+            parsec_dev = detail::ttg_device_to_parsec_device(tt->devicemap());
+          } else {
+            parsec_dev = detail::ttg_device_to_parsec_device(tt->devicemap(task->key));
+          }
+          for (int i = 0; i < MAX_PARAM_COUNT; ++i) {
+            /* only set on mutable data since we have exclusive access */
+            if (tc.in[i]->flow_flags & PARSEC_FLOW_ACCESS_WRITE) {
+              parsec_data_t *data = parsec_task->data[i].data_in->original;
+              /* only set the preferred device if the host has the latest copy
+               * as otherwise we may end up with the wrong data if there is a newer
+               * version on a different device. Also, keep fingers crossed. */
+              if (data->owner_device == 0) {
+                parsec_advise_data_on_device(data, parsec_dev, PARSEC_DEV_DATA_ADVICE_PREFERRED_DEVICE);
+              }
             }
           }
         }
+
+        /* set the new task class that contains the flows */
+        task->parsec_task.task_class = &task->dev_ptr->task_class;
+
+        /* select this one */
+        return PARSEC_HOOK_RETURN_DONE;
       }
 
-      /* set the new task class that contains the flows */
-      task->parsec_task.task_class = &task->dev_ptr->task_class;
+      std::cerr << "EVALUATE called on task with assigned GPU task!" << std::endl;
 
-      /* select this one */
-      return PARSEC_HOOK_RETURN_DONE;
+      /* not sure if this might happen*/
+      return PARSEC_HOOK_RETURN_ERROR;
+
     }
 
     static parsec_hook_return_t device_static_op(parsec_task_t* parsec_task) {
