@@ -18,7 +18,7 @@ if (NOT TARGET PaRSEC::parsec)
   FetchContent_Declare(
           PARSEC
           GIT_REPOSITORY      https://github.com/devreal/parsec-1.git
-          GIT_TAG             ${TTG_TRACKED_PARSEC_TAG}
+          GIT_TAG             data_copy_alloc_callbacks
   )
   FetchContent_MakeAvailable(PARSEC)
   FetchContent_GetProperties(PARSEC
