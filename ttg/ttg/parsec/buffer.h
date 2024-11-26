@@ -72,7 +72,7 @@ namespace detail {
       PtrT m_ptr; // keep a reference if PtrT is a shared_ptr
       std::size_t m_size;
 
-      void allocate(std::size_t size) {
+      void do_allocate(std::size_t size) {
         if constexpr (std::is_pointer_v<PtrT>) {
           m_ptr = allocator_traits::allocate(m_allocator, size);
         }
@@ -80,10 +80,20 @@ namespace detail {
         m_size = size;
       }
 
-      void deallocate() {
+      void do_deallocate() {
         allocator_traits::deallocate(m_allocator, static_cast<value_type*>(this->device_private), this->m_size);
         this->device_private = nullptr;
         this->m_size = 0;
+      }
+
+      static void allocate(parsec_data_copy_t *parsec_copy, int device) {
+        data_copy_type* copy = static_cast<data_copy_type*>(parsec_copy);
+        copy->do_allocate(parsec_copy->original->nb_elts);
+      }
+
+      static void deallocate(parsec_data_copy_t *parsec_copy, int device) {
+        data_copy_type* copy = static_cast<data_copy_type*>(parsec_copy);
+        copy->do_deallocate();
       }
 
     public:
@@ -104,16 +114,27 @@ namespace detail {
       }
 
       void construct(std::size_t size,
+                     ttg::scope scope,
                      const allocator_type& alloc = allocator_type()) {
         constexpr const bool is_empty_allocator = std::is_same_v<Allocator, empty_allocator<value_type>>;
         assert(!is_empty_allocator);
         m_allocator = alloc;
-        allocate(size);
-        this->device_private = m_ptr;
+        if (scope == ttg::scope::Allocate) {
+          /* if the user only requests an allocation on the device
+           * we don't allocate host memory but provide PaRSEC with
+           * a way to request host memory from us. */
+          this->allocate_cb = &allocate;
+          this->release_cb  = &deallocate;
+        } else {
+          /* the user requested that the data be sync'ed into the device
+           * so we need to provide host memory for the user to fill prior */
+          do_allocate(size);
+          this->device_private = m_ptr;
+        }
       }
 
       ~data_copy_type() {
-        this->deallocate();
+        this->do_deallocate();
       }
     };
 
@@ -143,7 +164,7 @@ namespace detail {
 
       /* create the host copy and allocate host memory */
       data_copy_type *copy = PARSEC_OBJ_NEW(data_copy_type);
-      copy->construct(size, allocator);
+      copy->construct(size, scope, allocator);
       parsec_data_copy_attach(data, copy, 0);
 
       /* adjust data flags */
