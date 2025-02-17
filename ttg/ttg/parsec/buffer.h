@@ -123,7 +123,7 @@ namespace detail {
           /* if the user only requests an allocation on the device
            * we don't allocate host memory but provide PaRSEC with
            * a way to request host memory from us. */
-          this->allocate_cb = &allocate;
+          this->alloc_cb = &allocate;
           this->release_cb  = &deallocate;
         } else {
           /* the user requested that the data be sync'ed into the device
