@@ -475,7 +475,7 @@ public:
   void reset_scope(ttg::scope scope) {
     if (scope == ttg::scope::Allocate) {
       m_data->device_copies[0]->version = 0;
-    } else {
+    } else if (scope == ttg::scope::SyncIn) {
       m_data->device_copies[0]->version = 1;
       /* reset all other copies to force a sync-in */
       for (int i = 0; i < parsec_nb_devices; ++i) {
@@ -488,6 +488,7 @@ public:
   }
 
   ttg::scope scope() const {
+    if (nullptr == m_data) return ttg::scope::Invalid;
     /* if the host owns the data and has a version of zero we only have to allocate data */
     return (m_data->device_copies[0]->version == 0 && m_data->owner_device == 0)
             ? ttg::scope::Allocate : ttg::scope::SyncIn;
