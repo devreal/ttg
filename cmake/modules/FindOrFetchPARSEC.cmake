@@ -17,8 +17,9 @@ if (NOT TARGET PaRSEC::parsec)
 
   FetchContent_Declare(
           PARSEC
-          GIT_REPOSITORY      https://github.com/devreal/parsec-1.git
-          GIT_TAG             ${TTG_TRACKED_PARSEC_TAG}
+          GIT_REPOSITORY      https://github.com/therault/parsec.git
+		  #GIT_TAG             ${TTG_TRACKED_PARSEC_TAG}
+          GIT_TAG             pins-extended-apex
   )
   FetchContent_MakeAvailable(PARSEC)
   FetchContent_GetProperties(PARSEC

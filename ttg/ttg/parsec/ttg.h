@@ -103,9 +103,6 @@
 #if defined(PARSEC_PROF_TRACE)
 #include <parsec/profiling.h>
 #undef PARSEC_TTG_PROFILE_BACKEND
-#if defined(PARSEC_PROF_GRAPHER)
-#include <parsec/parsec_prof_grapher.h>
-#endif
 #endif
 #include <cstdlib>
 #include <cstring>
@@ -319,18 +316,6 @@ namespace ttg_parsec {
       }
 #endif
 
-#ifdef PARSEC_PROF_GRAPHER
-      /* check if PaRSEC's dot tracing is enabled */
-      int dot_param_idx;
-      dot_param_idx = parsec_mca_param_find("profile", NULL, "dot");
-
-      if (dot_param_idx != PARSEC_ERROR) {
-        char *filename;
-        parsec_mca_param_lookup_string(dot_param_idx, &filename);
-        dag_on(filename);
-      }
-#endif // PARSEC_PROF_GRAPHER
-
       if( NULL != parsec_ce.tag_register) {
         parsec_ce.tag_register(WorldImpl::parsec_ttg_tag(), &detail::static_unpack_msg, this, detail::PARSEC_TTG_MAX_AM_SIZE);
         parsec_ce.tag_register(WorldImpl::parsec_ttg_rma_tag(), &detail::get_remote_complete_cb, this, 128);
@@ -473,28 +458,20 @@ namespace ttg_parsec {
     bool dag_profiling() override { return _dag_profiling; }
 
     virtual void dag_on(const std::string &filename) override {
-#if defined(PARSEC_PROF_GRAPHER)
-      if(!_dag_profiling) {
-        profile_on();
-        size_t len = strlen(filename.c_str())+32;
-        char ext_filename[len];
-        snprintf(ext_filename, len, "%s-%d.dot", filename.c_str(), rank());
-        parsec_prof_grapher_init(ctx, ext_filename);
-        _dag_profiling = true;
+
+      /* check if PaRSEC's dot tracing is enabled */
+      int dot_param_idx;
+      dot_param_idx = parsec_mca_param_find("pins", NULL, "dot_grapher_filename");
+
+      if (dot_param_idx == PARSEC_ERROR) {
+        std::cerr << "DAG profiling requested but not enabled in PaRSEC. "
+                  << "Enable PaRSEC PINS dot grapher via PARSEC_MCA_pins_dot_grapher_filename=<filename> "
+                  << "PARSEC_MCA_mca_pins=dot_grapher" << std::endl;
       }
-#else
-      ttg::print("Error: requested to create '", filename, "' to create a DAG of tasks,\n"
-                 "but PaRSEC does not support graphing options. Reconfigure with PARSEC_PROF_GRAPHER=ON\n");
-#endif
     }
 
     virtual void dag_off() override {
-#if defined(PARSEC_PROF_GRAPHER)
-      if(_dag_profiling) {
-        parsec_prof_grapher_fini();
-        _dag_profiling = false;
-      }
-#endif
+      /* nothing to do */
     }
 
     virtual void profile_off() override {
@@ -2416,9 +2393,6 @@ namespace ttg_parsec {
       auto &reducer = std::get<i>(input_reducers);
       bool release = false;
       bool remove_from_hash = true;
-#if defined(PARSEC_PROF_GRAPHER)
-      bool discover_task = true;
-#endif
       bool get_pull_data = false;
       bool has_lock = false;
       /* If we have only one input and no reducer on that input we can skip the hash table */
@@ -2430,12 +2404,6 @@ namespace ttg_parsec {
           world_impl.increment_created();
           parsec_hash_table_nolock_insert(&tasks_table, &task->tt_ht_item);
           get_pull_data = !is_lazy_pull();
-          if( world_impl.dag_profiling() ) {
-#if defined(PARSEC_PROF_GRAPHER)
-            parsec_prof_grapher_task(&task->parsec_task, world_impl.execution_stream()->th_id, 0,
-                                     key_hash(make_key(task->parsec_task.taskpool, task->parsec_task.locals), nullptr));
-#endif
-          }
         } else if (!reducer && numins == (task->in_data_count + 1)) {
           /* remove while we have the lock */
           parsec_hash_table_nolock_remove(&tasks_table, hk);
@@ -2450,33 +2418,6 @@ namespace ttg_parsec {
         task = create_new_task(key);
         world_impl.increment_created();
         remove_from_hash = false;
-        if( world_impl.dag_profiling() ) {
-#if defined(PARSEC_PROF_GRAPHER)
-          parsec_prof_grapher_task(&task->parsec_task, world_impl.execution_stream()->th_id, 0,
-                                   key_hash(make_key(task->parsec_task.taskpool, task->parsec_task.locals), nullptr));
-#endif
-        }
-      }
-
-      if( world_impl.dag_profiling() ) {
-#if defined(PARSEC_PROF_GRAPHER)
-        if(NULL != detail::parsec_ttg_caller && !detail::parsec_ttg_caller->is_dummy()) {
-          int orig_index = detail::find_index_of_copy_in_task(detail::parsec_ttg_caller, &value);
-          char orig_str[32];
-          char dest_str[32];
-          if(orig_index >= 0) {
-            snprintf(orig_str, 32, "%d", orig_index);
-          } else {
-            strncpy(orig_str, "_", 32);
-          }
-          snprintf(dest_str, 32, "%lu", i);
-          parsec_flow_t orig{ .name = orig_str, .sym_type = PARSEC_SYM_INOUT, .flow_flags = PARSEC_FLOW_ACCESS_RW,
-                              .flow_index = 0, .flow_datatype_mask = ~0 };
-          parsec_flow_t dest{ .name = dest_str, .sym_type = PARSEC_SYM_INOUT, .flow_flags = PARSEC_FLOW_ACCESS_RW,
-                              .flow_index = 0, .flow_datatype_mask = ~0 };
-          parsec_prof_grapher_dep(&detail::parsec_ttg_caller->parsec_task, &task->parsec_task, discover_task ? 1 : 0, &orig, &dest);
-        }
-#endif
       }
 
       auto get_copy_fn = [&](detail::parsec_ttg_task_base_t *task, auto&& value, bool is_const){
@@ -2587,6 +2528,19 @@ namespace ttg_parsec {
         }
       }
       task->remove_from_hash = remove_from_hash;
+
+
+      /**
+       * TODO: fix flows, add index of terminal
+       */
+      auto caller = detail::parsec_ttg_caller;
+      if (nullptr != caller) {
+        PARSEC_PINS(TASK_DEPENDENCY, world_impl.execution_stream(),
+                    &caller->parsec_task,
+                    &task->parsec_task, release, nullptr, nullptr);
+      }
+
+
       if (release) {
         release_task(task, task_ring);
       }
@@ -2938,26 +2892,6 @@ namespace ttg_parsec {
         parsec_profiling_ts_trace(world.impl().parsec_ttg_profile_backend_set_arg_end, 0, 0, NULL);
       }
 #endif
-#if defined(PARSEC_PROF_GRAPHER)
-      if(NULL != detail::parsec_ttg_caller && !detail::parsec_ttg_caller->is_dummy()) {
-        int orig_index = detail::find_index_of_copy_in_task(detail::parsec_ttg_caller, value_ptr);
-        char orig_str[32];
-        char dest_str[32];
-        if(orig_index >= 0) {
-          snprintf(orig_str, 32, "%d", orig_index);
-        } else {
-          strncpy(orig_str, "_", 32);
-        }
-        snprintf(dest_str, 32, "%lu", i);
-        parsec_flow_t orig{ .name = orig_str, .sym_type = PARSEC_SYM_INOUT, .flow_flags = PARSEC_FLOW_ACCESS_RW,
-                            .flow_index = 0, .flow_datatype_mask = ~0 };
-        parsec_flow_t dest{ .name = dest_str, .sym_type = PARSEC_SYM_INOUT, .flow_flags = PARSEC_FLOW_ACCESS_RW,
-                            .flow_index = 0, .flow_datatype_mask = ~0 };
-        task_t *task = create_new_task(key);
-        parsec_prof_grapher_dep(&detail::parsec_ttg_caller->parsec_task, &task->parsec_task, 0, &orig, &dest);
-        delete task;
-      }
-#endif
     }
 
     template <int i, typename Iterator, typename Value>
@@ -3266,11 +3200,6 @@ namespace ttg_parsec {
           task = create_new_task(key);
           world.impl().increment_created();
           parsec_hash_table_nolock_insert(&tasks_table, &task->tt_ht_item);
-          if( world.impl().dag_profiling() ) {
-#if defined(PARSEC_PROF_GRAPHER)
-            parsec_prof_grapher_task(&task->parsec_task, world.impl().execution_stream()->th_id, 0, *(uintptr_t*)&(task->parsec_task.locals[0]));
-#endif
-          }
         }
         parsec_hash_table_unlock_bucket(&tasks_table, hk);
 
@@ -3325,11 +3254,6 @@ namespace ttg_parsec {
           task = create_new_task(ttg::Void{});
           world.impl().increment_created();
           parsec_hash_table_nolock_insert(&tasks_table, &task->tt_ht_item);
-          if( world.impl().dag_profiling() ) {
-#if defined(PARSEC_PROF_GRAPHER)
-            parsec_prof_grapher_task(&task->parsec_task, world.impl().execution_stream()->th_id, 0, *(uintptr_t*)&(task->parsec_task.locals[0]));
-#endif
-          }
         }
         parsec_hash_table_unlock_bucket(&tasks_table, hk);
 
@@ -3799,13 +3723,17 @@ namespace ttg_parsec {
         ss << task->key;
 
         std::string keystr = ss.str();
-        std::replace(keystr.begin(), keystr.end(), '(', ':');
-        std::replace(keystr.begin(), keystr.end(), ')', ':');
 
-        snprintf(buffer, buffer_size, "%s(%s)[]<%d>", parsec_task->task_class->name, keystr.c_str(), parsec_task->priority);
+        snprintf(buffer, buffer_size, "%s(%s)", parsec_task->task_class->name, keystr.c_str());
       }
       return buffer;
     }
+
+    static parsec_hook_return_t parsec_ttg_prepare_input(parsec_execution_stream_t *es, parsec_task_t *task) {
+      /* nothing to be done here */
+      return PARSEC_HOOK_RETURN_DONE;
+    }
+
 
 #if defined(PARSEC_PROF_TRACE)
     static void *parsec_ttg_task_info(void *dst, const void *data, size_t size)
@@ -3940,6 +3868,7 @@ namespace ttg_parsec {
       self.make_key = make_key;
       self.key_functions = &tasks_hash_fcts;
       self.task_snprintf = parsec_ttg_task_snprintf;
+      self.prepare_input = parsec_ttg_prepare_input;
 
 #if defined(PARSEC_PROF_TRACE)
       self.profile_info = &parsec_ttg_task_info;

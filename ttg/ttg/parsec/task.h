@@ -181,7 +181,7 @@ namespace ttg_parsec {
         PARSEC_LIST_ITEM_SINGLETON(&parsec_task.super);
         parsec_task.mempool_owner = mempool;
         parsec_task.task_class = task_class;
-        parsec_task.status = PARSEC_TASK_STATUS_HOOK;
+        parsec_task.status = PARSEC_TASK_STATUS_PREPARE_INPUT;
         parsec_task.taskpool = taskpool;
         parsec_task.priority = priority;
         parsec_task.chore_mask = 1<<0;
