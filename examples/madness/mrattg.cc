@@ -545,7 +545,7 @@ void test1() {
 }
 
 int main(int argc, char** argv) {
-  ttg::initialize(argc, argv, 2);
+  ttg::initialize(argc, argv, -1);
   std::cout << "Hello from madttg\n";
 
   // vmlSetMode(VML_HA | VML_FTZDAZ_OFF | VML_ERRMODE_DEFAULT); // default
