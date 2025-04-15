@@ -56,7 +56,7 @@ namespace mra {
     }
 
     template <typename T, size_t N>
-    void distancesq(const Coordinate<T,3>& p, const SimpleTensor<T,1,N>& q, std::array<T,N>& rsq) {
+    void distancesq(const Coordinate<T,1>& p, const SimpleTensor<T,1,N>& q, std::array<T,N>& rsq) {
         const T x = p(0);
         for (size_t i=0; i<N; i++) {
             T xx = q(0,i) - x;
@@ -65,7 +65,7 @@ namespace mra {
     }
     
     template <typename T, size_t N>
-    void distancesq(const Coordinate<T,3>& p, const SimpleTensor<T,2,N>& q, std::array<T,N>& rsq) {
+    void distancesq(const Coordinate<T,2>& p, const SimpleTensor<T,2,N>& q, std::array<T,N>& rsq) {
         const T x = p(0);
         const T y = p(1);
         for (size_t i=0; i<N; i++) {

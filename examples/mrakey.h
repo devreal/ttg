@@ -24,7 +24,7 @@ namespace mra {
         /// Refreshes the hash value.  Note that the default std::hash does not mix enough
         void rehash() {
             hashvalue = n;
-            for (Dimension d=0; d<NDIM; d++) mulhash(hashvalue,l[d]);
+            for (Dimension d=0; d<NDIM; d++) hashvalue = (hashvalue << 8) + l[d];
         }
         
     public:
@@ -120,99 +120,6 @@ namespace mra {
             return b;
         }
     };
-    
-    // Specializations for dubuoius efficiency gains except perhaps for NDIM=1
-    
-    template <> inline void Key<1>::rehash() {
-        hashvalue = mulhash(HashValue(n),l[0]);
-    }
-    
-    template <> inline void Key<2>::rehash() {
-        hashvalue = mulhash(mulhash(HashValue(n),l[0]),l[1]);
-    }
-    
-    template <> inline void Key<3>::rehash() {
-        hashvalue = mulhash(mulhash(mulhash(HashValue(n),l[0]),l[1]),l[2]);
-    }
-    
-    template <> inline Key<1> Key<1>::parent(Level generation) const {
-        generation = std::min(generation,n);
-        return Key<1>(n-generation,{l[0]>>generation});
-    }
-    
-    template <> inline Key<2> Key<2>::parent(Level generation) const {
-        generation = std::min(generation,n);
-        return Key<2>(n-generation,{l[0]>>generation,l[1]>>generation});
-    }
-    
-    template <> inline Key<3> Key<3>::parent(Level generation) const {
-        generation = std::min(generation,n);
-        return Key<3>(n-generation,{l[0]>>generation,l[1]>>generation,l[2]>>generation});
-    }
-    
-    template <> inline Key<1> Key<1>::first_child() const {
-        assert(n<MAX_LEVEL);
-        return Key<1>(n+1, {l[0]<<1});
-    }
-    
-    template <> inline Key<2> Key<2>::first_child() const {
-        assert(n<MAX_LEVEL);
-        return Key<2>(n+1, {l[0]<<1,l[1]<<1});
-    }
-    
-    template <> inline Key<3> Key<3>::first_child() const {
-        assert(n<MAX_LEVEL);
-        return Key<3>(n+1, {l[0]<<1,l[1]<<1,l[2]<<1});
-    }
-    
-    template <> inline Key<1> Key<1>::last_child() const {
-        assert(n<MAX_LEVEL);
-        return Key<1>(n+1, {(l[0]<<1)+1});
-    }
-    
-    template <> inline Key<2> Key<2>::last_child() const {
-        assert(n<MAX_LEVEL);
-        return Key<2>(n+1, {(l[0]<<1)+1,(l[1]<<1)+1});
-     
-    }
-    
-    template <> inline Key<3> Key<3>::last_child() const {
-        assert(n<MAX_LEVEL);
-        return Key<3>(n+1, {(l[0]<<1)+1,(l[1]<<1)+1,(l[2]<<1)+1});
-    }
-    
-    template <> inline void Key<1>::next_child(size_t& bits) {
-        bits++; l[0]++;
-        rehash();
-    }
-    
-    template <> inline void Key<2>::next_child(size_t& bits) {
-        size_t oldbits = bits++;
-        l[0] +=  (bits&0x1)     -  (oldbits&0x1);
-        l[1] += ((bits&0x2)>>1) - ((oldbits&0x2)>>1);
-        rehash();
-    }
-    
-    template <> inline void Key<3>::next_child(size_t& bits) {
-        size_t oldbits = bits++;
-        l[0] +=  (bits&0x1)     -  (oldbits&0x1);
-        l[1] += ((bits&0x2)>>1) - ((oldbits&0x2)>>1);
-        l[2] += ((bits&0x4)>>2) - ((oldbits&0x4)>>2);
-        rehash();
-    }
-    
-    template <> inline size_t Key<1>::childindex() const {
-        return l[0]&0x1;
-    }
-    
-    template <> inline size_t Key<2>::childindex() const {
-        return ((l[1]&0x1)<<1) | (l[0]&0x1);
-    }
-    
-    template <> inline size_t Key<3>::childindex() const {
-        return ((l[2]&0x1)<<2)  | ((l[1]&0x1)<<1) | (l[0]&0x1);
-    }
-    
     /// Range object used to iterate over children of a key
     template <Dimension NDIM>
     class KeyChildren {
