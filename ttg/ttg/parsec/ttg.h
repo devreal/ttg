@@ -2836,7 +2836,9 @@ namespace ttg_parsec {
                 * at the end */
                 assert(task->copies[i] == nullptr);
                 assert(elem->get_copy() != nullptr);
-                task->copies[i] = elem->get_copy();
+                using valueT = std::tuple_element_t<i, input_values_full_tuple_type>;
+                constexpr const bool input_is_const = std::is_const_v<valueT>;
+                task->copies[i] = detail::register_data_copy<valueT>(elem->get_copy(), task, input_is_const);
                 elem->clear_copy(); // so no other task can pick it up
                 elem->set_active_task(task);
                 count = numins; // all inputs available
@@ -4011,7 +4013,7 @@ namespace ttg_parsec {
       /* handle mutex flows */
       // TODO: outline this into separate function
 
-      auto handle_mutexflow = [&](auto& mf) {
+      auto handle_mutexflow = [&]<std::size_t I>(auto& mf) {
         if (mf) {
           detail::mutexflow_elem<keyT> *elem;
           detail::parsec_ttg_task_base_t *next_task = nullptr;
@@ -4021,12 +4023,19 @@ namespace ttg_parsec {
           assert(elem->get_active_task() == task);
           auto count = elem->clear_active_task();
           if (count == 0) {
-            /* we're done, release the copy and remove the element */
+            /* we're done, remove the element */
             parsec_hash_table_nolock_remove(mf.get_hash_table(), task->pkey());
             delete elem;
-          } else if (elem->has_task() && elem->has_copy()) {
-            /* get the next task */
-            next_task = elem->next_task();
+            elem = nullptr;
+          } else {
+            if (elem->has_copy()) {
+              /* make sure the copy can be transferred to the new task */
+              elem->get_copy()->reset_readers();
+              if (elem->has_task()) {
+                /* get the next task */
+                next_task = elem->next_task();
+              }
+            }
           }
           parsec_hash_table_unlock_bucket(mf.get_hash_table(), task->pkey());
           /* release the next mutex task */
@@ -4037,7 +4046,7 @@ namespace ttg_parsec {
         }
         return false;
       };
-      detail::apply_mutexflow(handle_mutexflow, task->tt->mutexflows);
+      detail::apply_mutexflow_with_index(handle_mutexflow, task->tt->mutexflows);
 
       /* release our data copies */
       for (int i = 0; i < task->data_count; i++) {
