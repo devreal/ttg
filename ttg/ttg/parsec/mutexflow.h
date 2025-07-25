@@ -45,7 +45,7 @@ namespace ttg_parsec::detail {
       }
 
       void remove_task(parsec_ttg_task_base_t* task) {
-        parsec_list_nolock_remove(&m_tasks, task);
+        parsec_list_nolock_remove(&m_tasks, &task->parsec_task.super);
       }
 
       parsec_ttg_task_base_t* next_task() {
@@ -104,6 +104,23 @@ namespace ttg_parsec::detail {
       }
     };
 
+    template<typename Key, typename Value>
+    struct finalizer_trait {
+      using type = std::conditional_t<ttg::meta::is_void_v<Value>,
+                                      std::function<void(const Key&)>,
+                                      std::function<void(const Key&, const Value&)>>;
+    };
+
+    template<typename Value>
+    struct finalizer_trait<ttg::Void, Value> {
+      using type = std::conditional_t<ttg::meta::is_void_v<Value>,
+                                      std::function<void()>,
+                                      std::function<void(const Value&)>>;
+    };
+    template<typename Key, typename Value>
+    using finalizer_type = finalizer_trait<Key, Value>::type;
+
+
     template<typename Key, typename Value = ttg::Void>
     struct mutexflow {
 
@@ -111,21 +128,7 @@ namespace ttg_parsec::detail {
       using value_type  = std::conditional_t<ttg::meta::is_void_v<Value>, ttg::Void, Value>;
       using keymap_t    = ttg::meta::detail::keymap_t<key_type, key_type>;
       using countmap_t  = ttg::meta::detail::keymap_t<key_type, std::size_t>;
-
-      template<typename KeyT>
-      struct finalizer_trait {
-        using type = std::conditional_t<ttg::meta::is_void_v<Value>,
-                                        std::function<void(const key_type&)>,
-                                        std::function<void(const key_type&, const value_type&)>>;
-      };
-
-      template<>
-      struct finalizer_trait<ttg::Void> {
-        using type = std::conditional_t<ttg::meta::is_void_v<Value>,
-                                        std::function<void()>,
-                                        std::function<void(const value_type&)>>;
-      };
-      using finalizer_t = finalizer_trait<key_type>::type;
+      using finalizer_t = finalizer_type<key_type, value_type>;
 
     private:
 
