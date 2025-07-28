@@ -1235,12 +1235,12 @@ namespace ttg_parsec {
 
     bool alive = true;
 
+  public:
     static constexpr int numinedges = std::tuple_size_v<input_tuple_type>;     // number of input edges
     static constexpr int numins = std::tuple_size_v<actual_input_tuple_type>;  // number of input arguments
     static constexpr int numouts = std::tuple_size_v<output_terminalsT>;       // number of outputs
     static constexpr int numflows = std::max(numins, numouts);                 // max number of flows
 
-   public:
     /// @return true if derivedT::have_cuda_op exists and is defined to true
     template<typename DerivedT = derivedT>
     static constexpr bool derived_has_cuda_op() {
