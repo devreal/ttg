@@ -1360,8 +1360,8 @@ namespace ttg_parsec {
     ttg::meta::detail::keymap_t<keyT> priomap;
     ttg::meta::detail::keymap_t<keyT, ttg::device::Device> devicemap;
 
-    detail::mutexflow_tuple_type<keyT, input_tuple_type> mutexflows;  //!< mutex flow functions
-    std::size_t num_mutexflow = 0;  //!< number of mutex flows in the task
+    detail::mutexflow_tuple_type<TT> mutexflows;  //!< mutex flow functions
+    int num_mutexflow = 0;  //!< number of mutex flows in the task
 
 
     // For now use same type for unary/streaming input terminals, and stream reducers assigned at runtime
@@ -2504,21 +2504,22 @@ namespace ttg_parsec {
           bool need_finalize = false;
           /* check if there is a task in the mutexflow and put in a dummy if not */
           parsec_hash_table_lock_bucket(mf.get_hash_table(), hk);
-          detail::mutexflow_elem<keyT>* elem;
-          elem = (detail::mutexflow_elem<keyT>*)parsec_hash_table_nolock_find(mf.get_hash_table(), hk);
+          using mutexflow_elem_t = typename std::tuple_element_t<i, decltype(mutexflows)>::element_type;
+          mutexflow_elem_t* elem;
+          elem = (mutexflow_elem_t*)parsec_hash_table_nolock_find(mf.get_hash_table(), hk);
           if (nullptr == elem) {
             /* there is no task yet, which means that no task has all their other inputs fulfilled yet
             * we create a new element int the bucket and store the value in it so that it can be used by
             * another task later */
-            auto copy = get_copy_fn(nullptr, std::forward<Value>(value), input_is_const);
-            assert(nullptr != copy);
-
-            elem = new detail::mutexflow_elem<keyT>(mf.map_key(key), mf.get_count(key), copy);
+            elem = new mutexflow_elem_t(mf.map_key(key), mf.get_count(key), nullptr, this);
+            /* the dummy task is associated with the copy and we will move the copy into the element
+             * when the dummy task completes */
+            task = elem->dummy_task();
+            auto copy = get_copy_fn(task, std::forward<Value>(value), input_is_const);
+            task->copies[i] = copy;
+            release = (copy->get_next_task() != &task->parsec_task);
             parsec_hash_table_nolock_insert(mf.get_hash_table(), &elem->item());
-          } else if (elem->has_task()) {
-            /* there is a task, we can use it */
-            task = static_cast<task_t*>(elem->next_task());
-            /* don't set the input here, that will be done in release_task() */
+            ttg::trace(world.rank(), ":", get_name(), " : ", key, ": new mutexflow elem : count ", elem->get_count(), " : release ", release);
           } else {
             /* no task but we already have an element */
             /* make sure the element does not have a value set already */
@@ -2530,12 +2531,19 @@ namespace ttg_parsec {
               /* there are no tasks left to execute so we finalize and are done */
               need_finalize = true;
             } else {
-              /* set the value in the element */
-              elem->set_copy(get_copy_fn(nullptr, std::forward<Value>(value), input_is_const));
+              /* attach the dummy task to the copy */
+              task = elem->dummy_task();
+              auto copy = get_copy_fn(task, std::forward<Value>(value), input_is_const);
+              task->copies[i] = copy;
+              remove_from_hash = false; // we will remove the element from the mutexflow
+              release = (copy->get_next_task() != &task->parsec_task);
+              ttg::trace(world.rank(), ":", get_name(), " : ", key, ": attaching copy to dummy task, release ", release);
             }
           }
           parsec_hash_table_unlock_bucket(mf.get_hash_table(), hk);
           if (need_finalize) {
+            ttg::trace(world.rank(), ":", get_name(), " : ", key, ": finalizing mutexflow for input : ", i);
+
             /* TODO: we need a function that encapsulates this, called here and in make_tt */
             auto old_output_tls_ptr = this->outputs_tls_ptr_accessor();
             this->set_outputs_tls_ptr();
@@ -2703,7 +2711,8 @@ namespace ttg_parsec {
             release = (copy->get_next_task() != &task->parsec_task);
             task->copies[i] = copy;
           } else {
-            release = true; // always call into release if we have a mutexflow
+            //release = (copy->get_next_task() != &task->parsec_task);
+            //release = true; // always call into release if we have a mutexflow
           }
         } else {
           release = true; // always call into release if the value is void
@@ -2806,52 +2815,102 @@ namespace ttg_parsec {
                       parsec_task_t **task_ring = nullptr) {
       constexpr const bool keyT_is_Void = ttg::meta::is_void_v<keyT>;
 
+      auto &world_impl = world.impl();
+      ttT *baseobj = task->tt;
+      int32_t count = task->in_data_count + 1; // +1 for the current input
+
       /* if remove_from_hash == false, someone has already removed the task from the hash table
        * so we know that the task is ready, no need to do atomic increments here */
-      bool is_ready = (!task->remove_from_hash) && (num_mutexflow == 0);
-      int32_t count;
+      bool is_ready = (count == numins) || (!task->remove_from_hash);
       if (is_ready) {
-        assert(num_mutexflow == 0);
         count = numins;
       } else {
         count = parsec_atomic_fetch_inc_int32(&task->in_data_count) + 1;
         assert(count <= self.dependencies_goal);
       }
 
-      auto &world_impl = world.impl();
-      ttT *baseobj = task->tt;
+
+      ttg::trace(world.rank(), ":", get_name(), " : ", task->key, ": release task : count ", count, " : numins ", numins, " : remove_from_hash ", task->remove_from_hash);
 
       /* handle mutex flows (we have either 1 or 0 inputs outstanding) */
-      if (num_mutexflow > 0 && (numins - count) <= num_mutexflow) {
+      if (num_mutexflow > 0) {
         /* check if this task can be released from the mutexflow */
         auto handle_mutexflow = [&]<std::size_t i>(auto& mf) {
           if (mf) {
             parsec_key_t hk = task->pkey();
             parsec_hash_table_lock_bucket(mf.get_hash_table(), hk);
-            detail::mutexflow_elem<keyT>* elem;
-            if (nullptr != (elem = (detail::mutexflow_elem<keyT>*)parsec_hash_table_nolock_find(mf.get_hash_table(), hk))) {
-              if (!elem->has_active_task() && elem->has_copy()) {
+            using mutexflow_elem_t = detail::mutexflow_elem<ttT>;
+            mutexflow_elem_t* elem;
+            elem = (mutexflow_elem_t*)parsec_hash_table_nolock_find(mf.get_hash_table(), hk);
+            if (elem != nullptr) {
+              /* lambda that is called to enable a task */
+              auto enable_task = [&](auto* task, auto* elem){
                 /* we can set the active task
-                * ownership of the copy transfers to the task, i.e., the task will release the copy
-                * at the end */
-                assert(task->copies[i] == nullptr);
-                assert(elem->get_copy() != nullptr);
+                 * ownership of the copy transfers to the task, i.e., the task will release the copy
+                 * at the end */
                 using valueT = std::tuple_element_t<i, input_values_full_tuple_type>;
                 constexpr const bool input_is_const = std::is_const_v<valueT>;
-                task->copies[i] = detail::register_data_copy<valueT>(elem->get_copy(), task, input_is_const);
+                assert(task != elem->dummy_task());
+                auto *copy = elem->get_copy();
+                //copy->reset_readers();
+                //task->copies[i] = detail::register_data_copy<valueT>(copy, task, input_is_const);
+                task->copies[i] = copy; // we can use the copy directly
                 elem->clear_copy(); // so no other task can pick it up
                 elem->set_active_task(task);
                 count = numins; // all inputs available
+                task->in_data_count = numins; // set the in_data_count to the number of inputs we have
+                if constexpr (!input_is_const) {
+                  copy->mark_mutable();
+                }
+                ttg::trace(world.rank(), ":", get_name(), " : ", task->key, ": release task : enabling mutexflow task : bucket size : ", elem->get_count());
+              };
+              if (task == elem->dummy_task()) {
+                assert(elem->get_copy() == nullptr);
+                auto* dummy_task = task;
+                auto* copy = dummy_task->copies[i];
+                dummy_task->copies[i] = nullptr;
+                elem->set_copy(copy);
+                /* no available task so set the copy on the mutexflow */
+                copy->reset_readers();
+                // make sure the copy stays alive
+                // we will reset the readers once it is assigned to a task
+                copy->increment_readers();
+                ttg::trace(world.rank(), ":", get_name(), " : ", task->key, ": release task : assigning data to bucket : bucket size : ", elem->get_count());
+
+                /* the task we release is the dummy task, so pick a ready task if any exists */
+                auto* new_task = static_cast<task_t*>(elem->next_task());
+                if (new_task != nullptr) {
+                  assert(new_task->copies[i] == nullptr);
+                  assert(elem->get_copy() != nullptr);
+                  /* we got a task that can be enabled */
+                  enable_task(new_task, elem);
+                } else {
+                  ttg::trace(world.rank(), ":", get_name(), " : ", task->key, ": release task : no next task available : bucket size : ", elem->get_count());
+                }
+                task = new_task; // may be nullptr if no task was available
+              } else if ((numins - task->in_data_count) == num_mutexflow) {
+                /* we have a task that is not the dummy and otherwise ready to execute */
+                if (elem->has_copy()) {
+                  assert(!elem->has_active_task()); // we should not have an active task if we have a copy
+                  /* enable the task with the copy we have */
+                  enable_task(task, elem);
+                } else {
+                  /* we have a task that is not a dummy but we have no copy yet */
+                  elem->add_task(task);
+                  ttg::trace(world.rank(), ":", get_name(), " : ", task->key, ": release task : assigning task to bucket, waiting for data : bucket size : ", elem->get_count());
+                  task = nullptr; // we will not use the task anymore, it is now in the mutexflow
+                }
               } else {
-                // add the task to the mutexflow as ready to run later
-                task->in_data_count = numins-1; // we're waiting for the mutexflow
-                elem->add_task(task);
+                /* the task is not the dummy but not yet ready to execute,
+                 * so go through the rest of the function below */
               }
             } else {
-              /* insert a new element that contains this task */
-              assert(count < numins);
-              elem = new detail::mutexflow_elem<keyT>(mf.map_key(task->key), mf.get_count(task->key), task);
+              /* we have no element yet, create one */
+              assert(task->in_data_count < numins);
+              elem = new mutexflow_elem_t(task, mf.get_count(task->key));
+              ttg::trace(world.rank(), ":", get_name(), " : ", task->key, ": release task : creating new mutexflow bucket : count : ", elem->get_count());
               parsec_hash_table_nolock_insert(mf.get_hash_table(), &elem->item());
+              task = nullptr;
             }
             parsec_hash_table_unlock_bucket(mf.get_hash_table(), hk);
             /* only one mutexflow */
@@ -2863,19 +2922,25 @@ namespace ttg_parsec {
         detail::apply_mutexflow_with_index(handle_mutexflow, mutexflows);
       }
 
+      if (task == nullptr) {
+        /* we did not find a task so nothing else to do here */
+        return;  // no task created, nothing to do
+      }
+
       if (count == numins) {
         parsec_execution_stream_t *es = world_impl.execution_stream();
         parsec_key_t hk = task->pkey();
         if (tracing()) {
           if constexpr (!keyT_is_Void) {
-            ttg::trace(world.rank(), ":", get_name(), " : ", task->key, ": submitting task for op ");
+            ttg::trace(world.rank(), ":", get_name(), " : ", task->key, ": release task : submitting task for op ");
           } else {
-            ttg::trace(world.rank(), ":", get_name(), ": submitting task for op ");
+            ttg::trace(world.rank(), ":", get_name(), ": release task : submitting task for op ");
           }
         }
         if (task->remove_from_hash) parsec_hash_table_remove(&tasks_table, hk);
 
         if (check_constraints(task)) {
+          PARSEC_LIST_ITEM_SINGLETON(&task->parsec_task.super);
           if (nullptr == task_ring) {
             parsec_task_t *vp_task_rings[1] = { &task->parsec_task };
             __parsec_schedule_vp(es, vp_task_rings, 0);
@@ -4015,10 +4080,11 @@ namespace ttg_parsec {
 
       auto handle_mutexflow = [&]<std::size_t I>(auto& mf) {
         if (mf) {
-          detail::mutexflow_elem<keyT> *elem;
+          using mutexflow_elem_t = detail::mutexflow_elem<ttT>;
+          mutexflow_elem_t *elem;
           detail::parsec_ttg_task_base_t *next_task = nullptr;
           parsec_hash_table_lock_bucket(mf.get_hash_table(), task->pkey());
-          elem = (detail::mutexflow_elem<keyT> *)parsec_hash_table_nolock_find(mf.get_hash_table(), task->pkey());
+          elem = (mutexflow_elem_t *)parsec_hash_table_nolock_find(mf.get_hash_table(), task->pkey());
           assert(elem != nullptr);
           assert(elem->get_active_task() == task);
           auto count = elem->clear_active_task();
@@ -4027,21 +4093,8 @@ namespace ttg_parsec {
             parsec_hash_table_nolock_remove(mf.get_hash_table(), task->pkey());
             delete elem;
             elem = nullptr;
-          } else {
-            if (elem->has_copy()) {
-              /* make sure the copy can be transferred to the new task */
-              elem->get_copy()->reset_readers();
-              if (elem->has_task()) {
-                /* get the next task */
-                next_task = elem->next_task();
-              }
-            }
           }
           parsec_hash_table_unlock_bucket(mf.get_hash_table(), task->pkey());
-          /* release the next mutex task */
-          if (nullptr != next_task) {
-            next_task->release_task();
-          }
           return true;
         }
         return false;

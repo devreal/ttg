@@ -5,7 +5,6 @@
 #include <ttg.h>
 
 #if __has_include(<btas/features.h>)
-#pragma message("C Preprocessor got here!")
 #include <btas/features.h>
 #ifdef BTAS_IS_USABLE
 #include <btas/btas.h>

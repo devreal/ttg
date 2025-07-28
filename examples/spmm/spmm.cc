@@ -767,9 +767,9 @@ class SpMM25D {
               result);
         }
       } else {
-        // no mutex flows, just send the result
+        // mutex flows, just send the result
         ::send<1>(
-            ijk, // reuse the key, it will be mapped to the same bucket
+            Key<3>(i, j, Key<3>::max_index-1),
             std::move(C),
             result);
       }
