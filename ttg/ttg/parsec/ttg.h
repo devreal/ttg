@@ -2888,7 +2888,7 @@ namespace ttg_parsec {
                   ttg::trace(world.rank(), ":", get_name(), " : ", task->key, ": release task : no next task available : bucket size : ", elem->get_count());
                 }
                 task = new_task; // may be nullptr if no task was available
-              } else if ((numins - task->in_data_count) == num_mutexflow) {
+              } else if ((numins - count) == num_mutexflow) {
                 /* we have a task that is not the dummy and otherwise ready to execute */
                 if (elem->has_copy()) {
                   assert(!elem->has_active_task()); // we should not have an active task if we have a copy
@@ -2896,8 +2896,8 @@ namespace ttg_parsec {
                   enable_task(task, elem);
                 } else {
                   /* we have a task that is not a dummy but we have no copy yet */
-                  elem->add_task(task);
                   ttg::trace(world.rank(), ":", get_name(), " : ", task->key, ": release task : assigning task to bucket, waiting for data : bucket size : ", elem->get_count());
+                  elem->add_task(task);
                   task = nullptr; // we will not use the task anymore, it is now in the mutexflow
                 }
               } else {
@@ -2906,7 +2906,7 @@ namespace ttg_parsec {
               }
             } else {
               /* we have no element yet, create one */
-              assert(task->in_data_count < numins);
+              assert(count < numins);
               elem = new mutexflow_elem_t(task, mf.get_count(task->key));
               ttg::trace(world.rank(), ":", get_name(), " : ", task->key, ": release task : creating new mutexflow bucket : count : ", elem->get_count());
               parsec_hash_table_nolock_insert(mf.get_hash_table(), &elem->item());
