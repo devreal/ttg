@@ -315,7 +315,8 @@ class SpMM25D {
           const std::vector<std::vector<long>> &b_cols_of_row,
           const std::vector<std::vector<long>> &b_rows_of_col, const std::vector<int> &mTiles,
           const std::vector<int> &nTiles, const std::vector<int> &kTiles, Keymap2 ij_keymap, Keymap3 ijk_keymap,
-          long P, long Q, long R, long parallel_bcasts = 1, bool enable_device_map = true, bool enable_mutexflows = false)
+          long P, long Q, long R, long parallel_bcasts = 1, bool enable_device_map = true,
+          bool enable_constraints=true, bool enable_mutexflows = false)
       : a_cols_of_row_(a_cols_of_row)
       , b_rows_of_col_(b_rows_of_col)
       , a_rows_of_col_(a_rows_of_col)
@@ -327,15 +328,19 @@ class SpMM25D {
       , enable_device_map_(enable_device_map) {
     Edge<Key<2>, void> a_ctl, b_ctl;
     Edge<Key<2>, int> a_rowctl, b_colctl; // TODO: can we have multiple control inputs per TT?
-    auto constraint = ttg::make_shared_constraint<ttg::SequencedKeysConstraint<Key<2>>>(USE_AUTO_CONSTRAINT);
     bcast_a_ = std::make_unique<BcastA>(a, local_a_ijk_, b_cols_of_row_, ij_keymap_, ijk_keymap_);
-    // add constraint with external mapper: key[1] represents `k`
-    bcast_a_->add_constraint(constraint, [](const Key<2>& key){ return key[1]; });
     local_bcast_a_ = std::make_unique<LocalBcastA>(local_a_ijk_, a_ijk_, b_cols_of_row_, ijk_keymap_);
     bcast_b_ = std::make_unique<BcastB>(b, local_b_ijk_, a_rows_of_col_, ij_keymap_, ijk_keymap_);
-    // add constraint with external mapper: key[0] represents `k`
-    bcast_b_->add_constraint(constraint, [](const Key<2>& key){ return key[0]; });
     local_bcast_b_ = std::make_unique<LocalBcastB>(local_b_ijk_, b_ijk_, a_rows_of_col_, ijk_keymap_);
+    std::shared_ptr<ttg::SequencedKeysConstraint<Key<2>>> constraint;
+    if (enable_constraints) {
+      constraint = ttg::make_shared_constraint<ttg::SequencedKeysConstraint<Key<2>>>(USE_AUTO_CONSTRAINT);
+      // add constraint with external mapper: key[1] represents `k`
+      bcast_a_->add_constraint(constraint, [](const Key<2>& key){ return key[1]; });
+      // add constraint with external mapper: key[0] represents `k`
+      bcast_b_->add_constraint(constraint, [](const Key<2>& key){ return key[0]; });
+      /* release the first parallel_bcasts_ k that are non-zero */
+    }
     multiplyadd_ = std::make_unique<MultiplyAdd<Space>>(a_ijk_, b_ijk_, c_ijk_, c_ij_p_, a_cols_of_row_,
                                                         b_rows_of_col_, mTiles, nTiles, ijk_keymap_, constraint,
                                                         k_cnt_, P, Q, parallel_bcasts_, enable_device_map_,
@@ -396,12 +401,13 @@ class SpMM25D {
       k_cnt_[i++].store(c, std::memory_order_relaxed);
     }
 
-    /* release the first parallel_bcasts_ k that are non-zero */
-    auto k_cnt_iter = k_cnt.begin();
-    do {
-      k_cnt_iter = std::find_if(k_cnt_iter, k_cnt.end(), [](auto c){ return c > 0; });
-    } while (++k_cnt_iter != k_cnt.end() && std::distance(k_cnt_iter, k_cnt.end()) < parallel_bcasts_);
-    constraint->release(std::distance(k_cnt.begin(), k_cnt_iter));
+    if (enable_constraints) {
+      auto k_cnt_iter = k_cnt.begin();
+      do {
+        k_cnt_iter = std::find_if(k_cnt_iter, k_cnt.end(), [](auto c){ return c > 0; });
+      } while (++k_cnt_iter != k_cnt.end() && std::distance(k_cnt_iter, k_cnt.end()) < parallel_bcasts_);
+      constraint->release(std::distance(k_cnt.begin(), k_cnt_iter));
+    }
 
     TTGUNUSED(bcast_a_);
     TTGUNUSED(bcast_b_);
@@ -582,18 +588,20 @@ class SpMM25D {
     using task_return_type = std::conditional_t<is_device_space, ttg::device::Task, void>;
 
     void release_next_k(long k) {
-      assert(k_cnt_.size() > k);
-      long cnt = k_cnt_[k].fetch_sub(1, std::memory_order_relaxed)-1;
-      assert(cnt >= 0);
-      if (0 == cnt) {
-        auto release_k = k;
-        auto bcasts_ahead = parallel_bcasts_;
-        // this was the last gemm in this k, find the next one to release
-        while (++release_k < k_cnt_.size() &&
-                (0 == k_cnt_[release_k].load(std::memory_order_relaxed)
-                || --bcasts_ahead > 0))
-        { }
-        constraint->release(release_k);
+      if (constraint) {
+        assert(k_cnt_.size() > k);
+        long cnt = k_cnt_[k].fetch_sub(1, std::memory_order_relaxed)-1;
+        assert(cnt >= 0);
+        if (0 == cnt) {
+          auto release_k = k;
+          auto bcasts_ahead = parallel_bcasts_;
+          // this was the last gemm in this k, find the next one to release
+          while (++release_k < k_cnt_.size() &&
+                  (0 == k_cnt_[release_k].load(std::memory_order_relaxed)
+                  || --bcasts_ahead > 0))
+          { }
+          constraint->release(release_k);
+        }
       }
     }
 
@@ -1505,7 +1513,7 @@ static void timed_measurement(SpMatrix<> &A, SpMatrix<> &B, const std::function<
                               const std::vector<std::vector<long>> &b_rows_of_col, std::vector<int> &mTiles,
                               std::vector<int> &nTiles, std::vector<int> &kTiles, int M, int N, int K, int minTs,
                               int maxTs, int P, int Q, int R, int parallel_bcasts, bool enable_device_map,
-                              bool enable_mutexflow) {
+                              bool enable_constraints, bool enable_mutexflow) {
   int MT = (int)A.rows();
   int NT = (int)B.cols();
   int KT = (int)A.cols();
@@ -1533,7 +1541,7 @@ static void timed_measurement(SpMatrix<> &A, SpMatrix<> &B, const std::function<
   //  SpMM25D a_times_b(world, eA, eB, eC, A, B);
   SpMM25D<> a_times_b(eA, eB, eC, A, B, a_cols_of_row, a_rows_of_col, b_cols_of_row, b_rows_of_col,
                       mTiles, nTiles, kTiles, ij_keymap, ijk_keymap, P, Q, R, parallel_bcasts, enable_device_map,
-                      enable_mutexflow);
+                      enable_constraints, enable_mutexflow);
   TTGUNUSED(a);
   TTGUNUSED(b);
   TTGUNUSED(a_times_b);
@@ -1770,6 +1778,7 @@ int main(int argc, char **argv) {
       ttg_broadcast(ttg::default_execution_context(), seed, 0);
 
       bool enable_mutexflow = cmdOptionExists(argv, argv + argc, "-mf");
+      bool enable_constraints = cmdOptionExists(argv, argv + argc, "-constraints");
 
       bool enable_tracing  = cmdOptionExists(argv, argv + argc, "-trace");
       if (enable_tracing) {
@@ -1868,7 +1877,7 @@ int main(int argc, char **argv) {
           timed_measurement(A, B, ij_keymap, ijk_keymap, tiling_type, gflops, avg_nb, Adensity, Bdensity,
                             a_cols_of_row, a_rows_of_col, b_cols_of_row, b_rows_of_col, mTiles,
                             nTiles, kTiles, M, N, K, minTs, maxTs, P, Q, R, parallel_bcasts, enable_device_map,
-                            enable_mutexflow);
+                            enable_constraints, enable_mutexflow);
 #if TTG_USE_PARSEC
           /* reset PaRSEC's load tracking */
           parsec_devices_reset_load(default_execution_context().impl().context());
@@ -1893,7 +1902,8 @@ int main(int argc, char **argv) {
         assert(!has_value(c_status));
         //  SpMM25D a_times_b(world, eA, eB, eC, A, B);
         SpMM25D<> a_times_b(eA, eB, eC, A, B, a_cols_of_row, a_rows_of_col, b_cols_of_row,
-                            b_rows_of_col, mTiles, nTiles, kTiles, ij_keymap, ijk_keymap, P, Q, R);
+                            b_rows_of_col, mTiles, nTiles, kTiles, ij_keymap, ijk_keymap, P, Q, R,
+                            parallel_bcasts, enable_device_map, enable_constraints, enable_mutexflow);
         TTGUNUSED(a_times_b);
         // calling the Dot constructor with 'true' argument disables the type
         if (default_execution_context().rank() == 0) std::cout << Dot{/*disable_type=*/true}(&control) << std::endl;
