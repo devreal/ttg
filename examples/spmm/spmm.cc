@@ -749,13 +749,13 @@ class SpMM25D {
                                                   Key<2>({i, j}),
                                                   std::move(C),
                                                   result));
-        } else {
-          // no mutex flows, just send the result
-          co_await ttg::device::forward(ttg::device::send<1>(
-                                                ijk, // reuse the key, it will be mapped to the same bucket
-                                                std::move(C),
-                                                result));
         }
+      } else {
+        // no mutex flows, just send the result
+        co_await ttg::device::forward(ttg::device::send<1>(
+                                              ijk, // reuse the key, it will be mapped to the same bucket
+                                              std::move(C),
+                                              result));
       }
 #else  // HAVE_SPMM_DEVICE
       gemm(C, A, B);
