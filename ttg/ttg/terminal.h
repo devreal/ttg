@@ -156,6 +156,7 @@ namespace ttg {
     using setsize_callback_type = typename base_type::setsize_callback_type;
     using finalize_callback_type = typename base_type::finalize_callback_type;
     using prepare_send_callback_type = meta::detail::prepare_send_callback_t<keyT, std::decay_t<valueT>>;
+    using query_processes_callback_type = meta::detail::query_processes_callback_t<keyT>;
     static constexpr bool is_an_input_terminal = true;
     ttg::detail::ContainerWrapper<keyT, valueT> container;
 
@@ -164,6 +165,7 @@ namespace ttg {
     move_callback_type move_callback;
     broadcast_callback_type broadcast_callback;
     prepare_send_callback_type prepare_send_callback;
+    query_processes_callback_type query_processes_callback;
 
     // No moving, copying, assigning permitted
     In(In &&other) = delete;
@@ -193,11 +195,13 @@ namespace ttg {
                       const broadcast_callback_type &bcast_callback = broadcast_callback_type{},
                       const setsize_callback_type &setsize_callback = setsize_callback_type{},
                       const finalize_callback_type &finalize_callback = finalize_callback_type{},
-                      const prepare_send_callback_type &prepare_send_callback = prepare_send_callback_type{}) {
+                      const prepare_send_callback_type &prepare_send_callback = prepare_send_callback_type{},
+                      const query_processes_callback_type &query_processes_callback = query_processes_callback_type{}) {
       this->send_callback = send_callback;
       this->move_callback = move_callback;
       this->broadcast_callback = bcast_callback;
       this->prepare_send_callback = prepare_send_callback;
+      this->query_processes_callback = query_processes_callback;
       base_type::set_callback(setsize_callback, finalize_callback);
     }
 
@@ -335,6 +339,26 @@ namespace ttg {
       const std::remove_reference_t<Value> &v = value;
       if (prepare_send_callback) {
           prepare_send_callback(v);
+      }
+    }
+
+    template<typename Key = keyT>
+    requires(!ttg::meta::is_void_v<Key>)
+    void query_processes(const ttg::span<Key>& keys, std::function<void(const Key&, int, ttg::device::Device)> cb) {
+      if (query_processes_callback) {
+        query_processes_callback(keys, cb);
+      } else {
+        throw std::runtime_error("No query_processes_callback set");
+      }
+    }
+
+    template<typename Key = keyT>
+    requires(ttg::meta::is_void_v<Key>)
+    void query_processes(std::function<void(int, ttg::device::Device)> cb) {
+      if (query_processes_callback) {
+        query_processes_callback(cb);
+      } else {
+        throw std::runtime_error("No query_processes_callback set");
       }
     }
   };
@@ -607,6 +631,37 @@ namespace ttg {
         }
       }
     }
+
+    /**
+     * Queries the processes for the given key. Iterates over all connected input terminals
+     * and queries the
+     */
+    template<typename Key = keyT>
+    requires(!meta::is_void_v<Key>)
+    void query_processes(const ttg::span<Key>& keys, std::function<void(const Key&, int, ttg::device::Device)> cb) {
+      for (auto &&successor : this->successors()) {
+        assert(successor->get_type() != TerminalBase::Type::Write);
+        if (successor->get_type() == TerminalBase::Type::Read) {
+          static_cast<In<keyT, std::add_const_t<valueT>> *>(successor)->query_processes(keys, cb);
+        } else if (successor->get_type() == TerminalBase::Type::Consume) {
+          static_cast<In<keyT, valueT> *>(successor)->query_processes(keys, cb);
+        }
+      }
+    }
+
+    template<typename Key = keyT>
+    requires(meta::is_void_v<Key>)
+    void query_processes(std::function<void(int, ttg::device::Device)> cb) {
+      for (auto &&successor : this->successors()) {
+        assert(successor->get_type() != TerminalBase::Type::Write);
+        if (successor->get_type() == TerminalBase::Type::Read) {
+          static_cast<In<keyT, std::add_const_t<valueT>> *>(successor)->query_processes(cb);
+        } else if (successor->get_type() == TerminalBase::Type::Consume) {
+          static_cast<In<keyT, valueT> *>(successor)->query_processes(cb);
+        }
+      }
+    }
+
   };
 
   namespace meta {

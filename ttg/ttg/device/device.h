@@ -4,8 +4,6 @@
 #include "ttg/execution.h"
 #include "ttg/impl_selector.h"
 #include "ttg/fwd.h"
-#include "ttg/util/meta.h"
-
 
 
 namespace ttg::device {
