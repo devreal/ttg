@@ -3477,6 +3477,10 @@ namespace ttg_parsec {
               }
             }
 
+            /* pack the key and set the right offset */
+            msg->tt_id.key_offset = pos;
+            pos = pack(key, msg->bytes, pos);
+
             parsec_taskpool_t *tp = world_impl.taskpool();
             tp->tdm.module->outgoing_message_start(tp, proc, NULL);
             tp->tdm.module->outgoing_message_pack(tp, proc, NULL, NULL, 0);
