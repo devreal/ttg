@@ -2043,25 +2043,63 @@ namespace ttg_parsec {
       return &mempools.thread_mempools[index];
     }
 
+
+    /**
+     * Manages the lifetime of a dummy task. Sets the parsec_ttg_caller and resets
+     * it at the end of its lifetime (typically when the function exits).
+     */
+    struct DummyTaskManager {
+    private:
+      detail::parsec_ttg_task_base_t *m_save;
+      TT* m_tt;
+      detail::parsec_ttg_task_base_t *m_dummy;
+
+      detail::parsec_ttg_task_base_t * create_dummy(detail::ttg_data_copy_t *copy) {
+        parsec_execution_stream_s *es = m_tt->world.impl().execution_stream();
+        parsec_thread_mempool_t *mempool = m_tt->get_task_mempool();
+        task_t *dummy = new (parsec_thread_mempool_allocate(mempool)) task_t(mempool, &m_tt->self, m_tt);
+        dummy->set_dummy(true);
+        // TODO: do we need to copy static_stream_goal in dummy?
+
+        /* set the received value as the dummy's only data */
+        dummy->copies[0] = copy;
+
+        /* We received the task on this world, so it's using the same taskpool */
+        dummy->parsec_task.taskpool = m_tt->world.impl().taskpool();
+
+        detail::parsec_ttg_caller = dummy;
+
+        return dummy;
+      }
+
+    public:
+
+      DummyTaskManager(TT* tt, detail::ttg_data_copy_t *copy)
+      : m_save(detail::parsec_ttg_caller)
+      , m_tt(tt)
+      , m_dummy(create_dummy(copy))
+      { }
+
+      auto get() {
+        return m_dummy;
+      }
+
+      ~DummyTaskManager() {
+        parsec_execution_stream_s *es = m_tt->world.impl().execution_stream();
+        parsec_thread_mempool_t *mempool = m_tt->get_task_mempool();
+        detail::parsec_ttg_caller = m_save;
+        m_save = nullptr;
+        complete_task_and_release(es, &m_dummy->parsec_task);
+        parsec_thread_mempool_free(mempool, &m_dummy->parsec_task);
+      }
+    };
+
     template <size_t i, typename valueT>
     void set_arg_from_msg_keylist(const ttg::span<const keyT> &keylist, detail::ttg_data_copy_t *copy) {
       /* create a dummy task that holds the copy, which can be reused by others */
-      task_t *dummy;
       parsec_execution_stream_s *es = world.impl().execution_stream();
       parsec_thread_mempool_t *mempool = get_task_mempool();
-      dummy = new (parsec_thread_mempool_allocate(mempool)) task_t(mempool, &this->self, this);
-      dummy->set_dummy(true);
-      // TODO: do we need to copy static_stream_goal in dummy?
-
-      /* set the received value as the dummy's only data */
-      dummy->copies[0] = copy;
-
-      /* We received the task on this world, so it's using the same taskpool */
-      dummy->parsec_task.taskpool = world.impl().taskpool();
-
-      /* save the current task and set the dummy task */
-      auto parsec_ttg_caller_save = detail::parsec_ttg_caller;
-      detail::parsec_ttg_caller = dummy;
+      DummyTaskManager dtm(this, copy); // set the parsec_ttg_caller and holds on to it until the end of the function
 
       /* iterate over the keys and have them use the copy we made */
       parsec_task_t *task_ring = nullptr;
@@ -2086,13 +2124,6 @@ namespace ttg_parsec {
         parsec_task_t *vp_task_ring[1] = { task_ring };
         __parsec_schedule_vp(world_impl.execution_stream(), vp_task_ring, 0);
       }
-
-      /* restore the previous task */
-      detail::parsec_ttg_caller = parsec_ttg_caller_save;
-
-      /* release the dummy task */
-      complete_task_and_release(es, &dummy->parsec_task);
-      parsec_thread_mempool_free(mempool, &dummy->parsec_task);
     }
 
 
@@ -2148,7 +2179,6 @@ namespace ttg_parsec {
           auto activation = new detail::rma_delayed_activate(copy, num_iovecs,
             [this, &val, release](detail::ttg_data_copy_t *copy) {
                 release(copy);
-                //set_arg_from_msg_keylist<i, ValueT>(keylist, copy);
                 this->world.impl().decrement_inflight_msg();
                 detail::foreach_parsec_data(val, [&](parsec_data_t* data){
                   /* decrement readers we incremented before the transfer */
@@ -2362,9 +2392,12 @@ namespace ttg_parsec {
                                std::make_index_sequence<std::tuple_size_v<broadcast_keygen_tuple_type>>{});
 
         set_arg_fetch_value_and_release<value_type>(msg, deviceset.value(),
-          [this,
-           local_bcast_keys_tuple = std::move(local_bcast_keys_tuple)](detail::ttg_data_copy_t *copy) {
+          [this, local_bcast_keys_tuple = std::move(local_bcast_keys_tuple)]
+          (detail::ttg_data_copy_t *copy) {
             value_type& value = *reinterpret_cast<value_type *>(copy->get_ptr());
+
+            auto dtm = DummyTaskManager(this, copy); // set the parsec_ttg_caller and holds on to it until the end of the function
+
             bcast_keygen_local(local_bcast_keys_tuple, value,
                                std::make_index_sequence<std::tuple_size_v<broadcast_keygen_tuple_type>>{});
           });
