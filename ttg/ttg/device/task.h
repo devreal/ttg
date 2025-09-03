@@ -327,7 +327,7 @@ namespace ttg::device {
 
     template<typename T, typename Enabler = void>
     struct broadcast_keylist_trait {
-      using type = T;
+      using key_type = T;
     };
 
     /* overload for iterable types that extracts the type of the first element */
@@ -494,10 +494,11 @@ namespace ttg::device {
     template<typename keyT, typename valueT,
               ttg::Runtime Runtime = ttg::ttg_runtime>
     inline send_coro_state
-    broadcast_keygen(const keyT& key, valueT&& value,
+    broadcast_keygen_coro(const keyT& key, valueT&& value,
                     ttg::detail::value_copy_handler<Runtime>&& ch) {
       ttg::detail::value_copy_handler<Runtime> copy_handler = std::move(ch); // destroyed at the end of the coro
       if constexpr(ttg::runtime_traits<ttg::ttg_runtime>::supports_broadcast_keygen) {
+        co_await ttg::Void{}; // we'll come back once the task is done
         TTG_IMPL_NS::broadcast_keygen(key, copy_handler(std::forward<valueT>(value)));
       } else {
         // TODO: need to implement a mechanism for MADNESS
@@ -521,12 +522,12 @@ namespace ttg::device {
                                             t, std::move(copy_handler))};
   }
 
-  /* overload with implicit terminals and keylist passed by const reference */
-  template <size_t i, typename rangeT, typename valueT,
+  /* overload with keylist passed by const reference */
+  template <size_t i, size_t... Is, typename rangeT, typename valueT,
             ttg::Runtime Runtime = ttg::ttg_runtime>
   inline detail::send_t broadcast(rangeT &&keylist, valueT &&value) {
     ttg::detail::value_copy_handler<Runtime> copy_handler;
-    return detail::send_t{detail::broadcast_coro<i>(std::tie(keylist),
+    return detail::send_t{detail::broadcast_coro<i, Is...>(std::forward<rangeT>(keylist),
                                                     copy_handler(std::forward<valueT>(value)),
                                                     std::move(copy_handler))};
   }
@@ -552,6 +553,17 @@ namespace ttg::device {
       return detail::send_t{detail::broadcastk_coro<i>(std::tie(keylist))};
     }
   }
+
+  /* overload with implicit terminals and keylist passed by const reference */
+  template <typename keyT, typename valueT,
+            ttg::Runtime Runtime = ttg::ttg_runtime>
+  inline detail::send_t broadcast_keygen(keyT&& key, valueT &&value) {
+    ttg::detail::value_copy_handler<Runtime> copy_handler;
+    return detail::send_t{detail::broadcast_keygen_coro(std::forward<keyT>(key),
+                                                        copy_handler(std::forward<valueT>(value)),
+                                                        std::move(copy_handler))};
+  }
+
 
   template<typename... Args, ttg::Runtime Runtime = ttg::ttg_runtime>
   [[nodiscard]]
