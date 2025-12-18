@@ -737,7 +737,7 @@ class SpMM25D {
 
       // pass the running total to the next flow, if needed
       // otherwise write to the result flow
-      if (enable_mutexflows_) {
+      if (!enable_mutexflows_) {
         if (have_next_k) {
           co_await ttg::device::forward(ttg::device::send<1>(
                                                   Key<3>({i, j, next_k}),
@@ -751,7 +751,7 @@ class SpMM25D {
                                                   result));
         }
       } else {
-        // no mutex flows, just send the result
+        // mutex flows, just send the result
         co_await ttg::device::forward(ttg::device::send<1>(
                                               ijk, // reuse the key, it will be mapped to the same bucket
                                               std::move(C),
