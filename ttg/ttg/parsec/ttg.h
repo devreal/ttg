@@ -4042,6 +4042,8 @@ namespace ttg_parsec {
 
       task_t *task = (task_t*)parsec_task;
 
+      ttg::trace(task->tt->world.rank(), ":", task->tt->get_name(), ": completing task ");
+
 #ifdef TTG_HAVE_COROUTINE
       /* if we still have a coroutine handle we invoke it one more time to get the sends/broadcasts */
       if (task->suspended_task_address) {
