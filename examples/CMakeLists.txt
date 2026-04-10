@@ -15,6 +15,12 @@ if (TARGET tiledarray)
     add_ttg_executable(bspmm spmm/spmm.cc LINK_LIBRARIES tiledarray TiledArray_Eigen BTAS
                                           COMPILE_DEFINITIONS BLOCK_SPARSE_GEMM=1;BTAS_TARGET_MAX_INDEX_RANK=2)
 
+    # Dense 2.5D SUMMA (no sparsity handling)
+    add_ttg_executable(gemm gemm/gemm.cc LINK_LIBRARIES tiledarray BTAS
+                                         COMPILE_DEFINITIONS BTAS_TARGET_MAX_INDEX_RANK=2)
+    add_ttg_executable(gemm2 gemm/gemm2.cc LINK_LIBRARIES tiledarray BTAS
+                                           COMPILE_DEFINITIONS BTAS_TARGET_MAX_INDEX_RANK=2)
+
     add_ttg_executable(testing_dpotrf potrf/testing_dpotrf.cc LINK_LIBRARIES tiledarray lapackpp)
     add_ttg_executable(testing_dtrtri potrf/testing_dtrtri.cc LINK_LIBRARIES tiledarray lapackpp)
     add_ttg_executable(testing_dlauum potrf/testing_dlauum.cc LINK_LIBRARIES tiledarray lapackpp)
@@ -24,6 +30,14 @@ if (TARGET tiledarray)
       add_ttg_executable(bspmm-cuda spmm/spmm.cc
                          LINK_LIBRARIES tiledarray TiledArray_Eigen BTAS CUDA::cublas
                          COMPILE_DEFINITIONS BLOCK_SPARSE_GEMM=1;BTAS_TARGET_MAX_INDEX_RANK=2;TTG_ENABLE_CUDA=1
+                         RUNTIMES "parsec")
+      add_ttg_executable(gemm-cuda gemm/gemm.cc
+                         LINK_LIBRARIES tiledarray BTAS CUDA::cublas
+                         COMPILE_DEFINITIONS BTAS_TARGET_MAX_INDEX_RANK=2;TTG_ENABLE_CUDA=1
+                         RUNTIMES "parsec")
+      add_ttg_executable(gemm2-cuda gemm/gemm2.cc
+                         LINK_LIBRARIES tiledarray BTAS CUDA::cublas
+                         COMPILE_DEFINITIONS BTAS_TARGET_MAX_INDEX_RANK=2;TTG_ENABLE_CUDA=1
                          RUNTIMES "parsec")
 
       if (TARGET CUDA::cusolver)
@@ -37,6 +51,14 @@ if (TARGET tiledarray)
                           LINK_LIBRARIES tiledarray TiledArray_Eigen roc::hipblas
                           COMPILE_DEFINITIONS BLOCK_SPARSE_GEMM=1;BTAS_TARGET_MAX_INDEX_RANK=2;TTG_ENABLE_HIP=1
                           RUNTIMES "parsec")
+      add_ttg_executable(gemm-hip gemm/gemm.cc
+                          LINK_LIBRARIES tiledarray roc::hipblas
+                          COMPILE_DEFINITIONS BTAS_TARGET_MAX_INDEX_RANK=2;TTG_ENABLE_HIP=1
+                          RUNTIMES "parsec")
+      add_ttg_executable(gemm2-hip gemm/gemm2.cc
+                          LINK_LIBRARIES tiledarray roc::hipblas
+                          COMPILE_DEFINITIONS BTAS_TARGET_MAX_INDEX_RANK=2;TTG_ENABLE_HIP=1
+                          RUNTIMES "parsec")
       if (TARGET roc::hipsolver)
         add_ttg_executable(testing_dpotrf_hip potrf/testing_dpotrf.cc
                            LINK_LIBRARIES lapackpp tiledarray roc::hipblas roc::hipsolver
@@ -47,6 +69,14 @@ if (TARGET tiledarray)
       add_ttg_executable(bspmm-lz spmm/spmm.cc
                           LINK_LIBRARIES tiledarray TiledArray_Eigen BTAS MKL::MKL_DPCPP level_zero::ze_loader m
                           COMPILE_DEFINITIONS BLOCK_SPARSE_GEMM=1;BTAS_TARGET_MAX_INDEX_RANK=2;TTG_ENABLE_LEVEL_ZERO=1
+                          RUNTIMES "parsec")
+      add_ttg_executable(gemm-lz gemm/gemm.cc
+                          LINK_LIBRARIES tiledarray BTAS MKL::MKL_DPCPP level_zero::ze_loader m
+                          COMPILE_DEFINITIONS BTAS_TARGET_MAX_INDEX_RANK=2;TTG_ENABLE_LEVEL_ZERO=1
+                          RUNTIMES "parsec")
+      add_ttg_executable(gemm2-lz gemm/gemm2.cc
+                          LINK_LIBRARIES tiledarray BTAS MKL::MKL_DPCPP level_zero::ze_loader m
+                          COMPILE_DEFINITIONS BTAS_TARGET_MAX_INDEX_RANK=2;TTG_ENABLE_LEVEL_ZERO=1
                           RUNTIMES "parsec")
     endif()
 
