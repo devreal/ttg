@@ -44,8 +44,8 @@ namespace ttg_parsec {
                                 .flow_index = I,
                                 .flow_datatype_mask = ~0 };
 
-        gpu_task->flow_nb_elts[I] = data->nb_elts; // size in bytes
-        gpu_task->flow[I] = &flows[I];
+        gpu_task->flow_info[I].flow_span = data->span; // size in bytes
+        gpu_task->flow_info[I].flow = &flows[I];
 
         /* set the input data copy, parsec will take care of the transfer
         * and the buffer will look at the parsec_data_t for the current pointer */
@@ -61,8 +61,8 @@ namespace ttg_parsec {
                                  .flow_flags = 0,
                                  .flow_index = I,
                                  .flow_datatype_mask = ~0 };
-        gpu_task->flow[I] = &flows[I];
-        gpu_task->flow_nb_elts[I] = 0; // size in bytes
+        gpu_task->flow_info[I].flow = &flows[I];
+        gpu_task->flow_info[I].flow_span = 0; // size in bytes
         caller->parsec_task.data[I].data_in = nullptr;
       }
 
@@ -96,8 +96,8 @@ namespace ttg_parsec {
       detail::parsec_ttg_caller->parsec_task.data[i].data_in = nullptr;
       detail::parsec_ttg_caller->dev_ptr->flows[i].flow_flags = PARSEC_FLOW_ACCESS_NONE;
       detail::parsec_ttg_caller->dev_ptr->flows[i].flow_index = i;
-      detail::parsec_ttg_caller->dev_ptr->gpu_task->flow[i] = &detail::parsec_ttg_caller->dev_ptr->flows[i];
-      detail::parsec_ttg_caller->dev_ptr->gpu_task->flow_nb_elts[i] = 0;
+      detail::parsec_ttg_caller->dev_ptr->gpu_task->flow_info[i].flow = &detail::parsec_ttg_caller->dev_ptr->flows[i];
+      detail::parsec_ttg_caller->dev_ptr->gpu_task->flow_info[i].flow_span = 0;
     }
 
     return is_current;
@@ -151,8 +151,8 @@ namespace ttg_parsec {
                                 .flow_index = i,
                                 .flow_datatype_mask = ~0 };
 
-        gpu_task->flow_nb_elts[i] = data->nb_elts; // size in bytes
-        gpu_task->flow[i] = &flows[i];
+        gpu_task->flow_info[i].flow_span = data->span; // size in bytes
+        gpu_task->flow_info[i].flow = &flows[i];
 
         /* set the input data copy, parsec will take care of the transfer
         * and the buffer will look at the parsec_data_t for the current pointer */
@@ -183,8 +183,8 @@ namespace ttg_parsec {
                                  .flow_flags = 0,
                                  .flow_index = i,
                                  .flow_datatype_mask = ~0 };
-        gpu_task->flow[i] = &flows[i];
-        gpu_task->flow_nb_elts[i] = 0; // size in bytes
+        gpu_task->flow_info[i].flow = &flows[i];
+        gpu_task->flow_info[i].flow_span = 0; // size in bytes
         caller->parsec_task.data[i].data_in = nullptr;
       }
     }
@@ -194,8 +194,8 @@ namespace ttg_parsec {
       detail::parsec_ttg_caller->parsec_task.data[i].data_in = nullptr;
       detail::parsec_ttg_caller->dev_ptr->flows[i].flow_flags = PARSEC_FLOW_ACCESS_NONE;
       detail::parsec_ttg_caller->dev_ptr->flows[i].flow_index = i;
-      detail::parsec_ttg_caller->dev_ptr->gpu_task->flow[i] = &detail::parsec_ttg_caller->dev_ptr->flows[i];
-      detail::parsec_ttg_caller->dev_ptr->gpu_task->flow_nb_elts[i] = 0;
+      detail::parsec_ttg_caller->dev_ptr->gpu_task->flow_info[i].flow = &detail::parsec_ttg_caller->dev_ptr->flows[i];
+      detail::parsec_ttg_caller->dev_ptr->gpu_task->flow_info[i].flow_span = 0;
     }
     // we cannot allow the calling thread to submit kernels so say we're not ready
     return is_current;
@@ -223,7 +223,7 @@ namespace ttg_parsec {
         int ret = device_module->memcpy_async(device_module, stream,
                                               data->device_copies[0]->device_private,
                                               data->device_copies[data->owner_device]->device_private,
-                                              data->nb_elts, parsec_device_gpu_transfer_direction_d2h);
+                                              data->span, parsec_device_gpu_transfer_direction_d2h);
         if (ret != PARSEC_SUCCESS) throw std::runtime_error("Failed to copy data from device to host!");
       }
       if constexpr (sizeof...(Is) > 0) {

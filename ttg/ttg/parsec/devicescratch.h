@@ -111,7 +111,7 @@ public:
   }
 
   std::size_t size() const {
-    return (m_data->nb_elts / sizeof(element_type));
+    return (m_data->span / sizeof(element_type));
   }
 
 };

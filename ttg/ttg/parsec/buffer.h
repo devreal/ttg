@@ -185,7 +185,7 @@ namespace detail {
                                        const allocator_type& allocator = allocator_type()) {
       parsec_data_t *data = PARSEC_OBJ_NEW(parsec_data_t);
       data->owner_device = 0;
-      data->nb_elts = size*sizeof(value_type);
+      data->span = size*sizeof(value_type);
 
       /* create the host copy and allocate host memory */
       data_copy_type *copy = PARSEC_OBJ_NEW(data_copy_type);
@@ -209,7 +209,7 @@ namespace detail {
     static parsec_data_t * create_data(PtrT& ptr, std::size_t size, ttg::scope scope) {
       parsec_data_t *data = PARSEC_OBJ_NEW(parsec_data_t);
       data->owner_device = 0;
-      data->nb_elts = size*sizeof(value_type);
+      data->span = size*sizeof(value_type);
 
       /* create the host copy and allocate host memory */
       data_copy_type *copy = PARSEC_OBJ_NEW(data_copy_type);

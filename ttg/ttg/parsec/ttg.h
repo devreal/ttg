@@ -1492,9 +1492,9 @@ namespace ttg_parsec {
 
       auto discard_tmp_flows = [&](){
         for (int i = 0; i < MAX_PARAM_COUNT; ++i) {
-          if (gpu_task->flow[i]->flow_flags & TTG_PARSEC_FLOW_ACCESS_TMP) {
+          if (gpu_task->flow_info[i].flow->flow_flags & TTG_PARSEC_FLOW_ACCESS_TMP) {
             /* temporary flow, discard by setting it to read-only to avoid evictions */
-            const_cast<parsec_flow_t*>(gpu_task->flow[i])->flow_flags = PARSEC_FLOW_ACCESS_READ;
+            gpu_task->flow_info[i].flow->flow_flags = PARSEC_FLOW_ACCESS_READ;
             task->parsec_task.data[i].data_out->readers = 1;
           }
         }
@@ -1534,10 +1534,14 @@ namespace ttg_parsec {
       if (task->dev_ptr->gpu_task == nullptr) {
 
         /* set up a device task */
-        parsec_gpu_task_t *gpu_task;
+        /**
+         * TODO: don't use gpu_dsl_task here! We store out own set of flows.
+         */
+        parsec_gpu_dsl_task_t *dsl_gpu_task;
         /* PaRSEC wants to free the gpu_task, because F***K ownerships */
-        gpu_task = static_cast<parsec_gpu_task_t*>(std::calloc(1, sizeof(*gpu_task)));
-        PARSEC_OBJ_CONSTRUCT(gpu_task, parsec_list_item_t);
+        dsl_gpu_task = static_cast<parsec_gpu_dsl_task_t*>(std::calloc(1, sizeof(*dsl_gpu_task)));
+        PARSEC_OBJ_CONSTRUCT(dsl_gpu_task, parsec_gpu_dsl_task_t);
+        parsec_gpu_task_t *gpu_task = &dsl_gpu_task->super;
         gpu_task->ec = parsec_task;
         gpu_task->task_type = 0; // user task
         gpu_task->last_data_check_epoch = std::numeric_limits<uint64_t>::max(); // used internally
@@ -1546,7 +1550,7 @@ namespace ttg_parsec {
         parsec_flow_t *flows = task->dev_ptr->flows;
         /* set up flow information so it is available for pushout */
         for (uint8_t i = 0; i < MAX_PARAM_COUNT; ++i) {
-          gpu_task->flow[i] = &flows[i]; // will be set in register_device_memory
+          gpu_task->flow_info[i].flow = &flows[i]; // will be set in register_device_memory
           /* ignore the flow */
           flows[i] = parsec_flow_t{.name = nullptr,
                                    .sym_type = PARSEC_FLOW_ACCESS_NONE,
@@ -1579,10 +1583,11 @@ namespace ttg_parsec {
 
         // input flows are set up during register_device_memory as part of the first invocation above
         for (int i = 0; i < MAX_PARAM_COUNT; ++i) {
-          tc.in[i]  = gpu_task->flow[i];
-          tc.out[i] = gpu_task->flow[i];
+          tc.in[i]  = gpu_task->flow_info[i].flow;
+          tc.out[i] = gpu_task->flow_info[i].flow;
         }
         tc.nb_flows = MAX_PARAM_COUNT;
+        gpu_task->nb_flows = MAX_PARAM_COUNT;
 
         /* set the device hint on the data */
         TT *tt = task->tt;
@@ -2262,13 +2267,13 @@ namespace ttg_parsec {
             } else if constexpr (!ttg::has_split_metadata<decvalueT>::value) {
               if (inline_data) {
                 detail::foreach_parsec_data(val, [&](parsec_data_t* data){
-                  read_inline_data(ttg::iovec{data->nb_elts, data->device_copies[data->owner_device]->device_private});
+                  read_inline_data(ttg::iovec{data->span, data->device_copies[data->owner_device]->device_private});
                 });
               } else {
                 auto activation = create_activation_fn();
                 detail::foreach_parsec_data(val, [&](parsec_data_t* data){
                   parsec_atomic_fetch_inc_int32(&data->device_copies[data->owner_device]->readers);
-                  handle_iovec_fn(ttg::iovec{data->nb_elts, data->device_copies[data->owner_device]->device_private}, activation);
+                  handle_iovec_fn(ttg::iovec{data->span, data->device_copies[data->owner_device]->device_private}, activation);
                 });
               }
             }
@@ -2819,7 +2824,7 @@ namespace ttg_parsec {
       } else {
         /* TODO: how can we query the iovecs of the buffers here without actually packing the data? */
         metadata_size = ttg::default_data_descriptor<ttg::meta::remove_cvr_t<Value>>::payload_size(value_ptr);
-        detail::foreach_parsec_data(*value_ptr, [&](parsec_data_t* data){ iov_size += data->nb_elts; });
+        detail::foreach_parsec_data(*value_ptr, [&](parsec_data_t* data){ iov_size += data->span; });
       }
       /* key is packed at the end */
       std::size_t key_pack_size = ttg::default_data_descriptor<Key>::payload_size(&key);
@@ -2968,7 +2973,7 @@ namespace ttg_parsec {
               /* Try to find a device that is not the host and has the latest version. */
               std::tie(device, device_copy) = detail::find_device_copy(data);
             }
-            handle_iovec_fn(ttg::iovec{data->nb_elts, data->device_copies[device]->device_private},
+            handle_iovec_fn(ttg::iovec{data->span, data->device_copies[device]->device_private},
                             device_copy);
           });
         }
@@ -3159,7 +3164,7 @@ namespace ttg_parsec {
               /* Try to find a device that is not the host and has the latest version. */
               std::tie(device, device_copy) = detail::find_device_copy(data);
             }
-            handle_iov_fn(ttg::iovec{data->nb_elts,
+            handle_iov_fn(ttg::iovec{data->span,
                                      data->device_copies[device]->device_private},
                           device_copy);
           });
@@ -3533,8 +3538,8 @@ namespace ttg_parsec {
           /* find the flow */
           int flowidx = 0;
           while (flowidx < MAX_PARAM_COUNT &&
-                gpu_task->flow[flowidx] != nullptr &&
-                gpu_task->flow[flowidx]->flow_flags != PARSEC_FLOW_ACCESS_NONE) {
+                gpu_task->flow_info[flowidx].flow != nullptr &&
+                gpu_task->flow_info[flowidx].flow->flow_flags != PARSEC_FLOW_ACCESS_NONE) {
             if (detail::parsec_ttg_caller->parsec_task.data[flowidx].data_in->original == data) {
               /* found the right data, set the corresponding flow as pushout */
               break;
@@ -3544,14 +3549,14 @@ namespace ttg_parsec {
           if (flowidx == MAX_PARAM_COUNT) {
             throw std::runtime_error("Cannot add more than MAX_PARAM_COUNT flows to a task!");
           }
-          if (gpu_task->flow[flowidx]->flow_flags == PARSEC_FLOW_ACCESS_NONE) {
+          if (gpu_task->flow_info[flowidx].flow->flow_flags == PARSEC_FLOW_ACCESS_NONE) {
             /* no flow found, add one and mark it pushout */
             detail::parsec_ttg_caller->parsec_task.data[flowidx].data_in = data->device_copies[0];
             detail::parsec_ttg_caller->parsec_task.data[flowidx].data_out = data->device_copies[data->owner_device];
-            gpu_task->flow_nb_elts[flowidx] = data->nb_elts;
+            gpu_task->flow_info[flowidx].flow_span = data->span;
           }
           /* need to mark the flow WRITE, otherwise PaRSEC will not do the pushout */
-          ((parsec_flow_t *)gpu_task->flow[flowidx])->flow_flags |= PARSEC_FLOW_ACCESS_WRITE;
+          const_cast<parsec_flow_t*>(gpu_task->flow_info[flowidx].flow)->flow_flags |= PARSEC_FLOW_ACCESS_WRITE;
           gpu_task->pushout |= 1<<flowidx;
         }
       };

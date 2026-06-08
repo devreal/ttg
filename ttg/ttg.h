@@ -31,6 +31,7 @@
 #include "ttg/util/dot.h"
 #include "ttg/util/macro.h"
 #include "ttg/util/print.h"
+#include "ttg/util/multiindex.h"
 #include "ttg/world.h"
 
 #include "ttg/constraint.h"
