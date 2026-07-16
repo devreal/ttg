@@ -33,6 +33,9 @@
 /** whether TTG has any device programming model (CUDA/HIP/LEVEL_ZERO) support */
 #cmakedefine TTG_HAVE_DEVICE
 
+/** whether the linked PaRSEC supports GPU kernel batching (see ttg::device::coop) */
+#cmakedefine TTG_HAVE_PARSEC_DEV_BATCH
+
 /** whether TTG has MPI library */
 #cmakedefine TTG_HAVE_MPI
 

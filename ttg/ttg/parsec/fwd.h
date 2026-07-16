@@ -5,6 +5,7 @@
 #include "ttg/fwd.h"
 #include "ttg/util/typelist.h"
 #include "ttg/util/span.h"
+#include "ttg/device/batch.h"
 
 #include <future>
 
@@ -95,6 +96,16 @@ namespace ttg_parsec {
 
   template<typename T>
   parsec_data_t* buffer_data(T&& buffer);
+
+#ifdef TTG_HAVE_COROUTINE
+  namespace detail {
+    /* implements ttg::device::coop()'s await_resume (see ttg/device/task.h);
+     * defined in ttg/parsec/ttg.h since it needs types from ttg/device/task.h,
+     * which is included after this forward declaration is needed. */
+    template <typename Key, typename... Args>
+    ttg::device::batch_view<Key, Args...> make_batch_view();
+  }  // namespace detail
+#endif  // TTG_HAVE_COROUTINE
 
 }  // namespace ttg_parsec
 
