@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
+#include <atomic>
 #include <ttg.h>
 #include <ttg/config.h>
 #include "lapack.hh"
@@ -86,6 +87,87 @@ namespace potrf {
     hipblasDnrm2(hipblas_handle(), size, buffer, 1, norm);
   #endif
   }
+
+#if defined(ENABLE_DEVICE_KERNEL)
+  /**
+   * Small round-robin pool of pinned host / device pointer-array triples used
+   * to build a single cublasDgemmBatched/hipblasDgemmBatched call from the
+   * ttg::device::batch collected via ttg::device::coop (see make_gemm_batched
+   * below). `num_slots` is sized generously so that an in-flight batch -- in
+   * practice bounded by the number of concurrent device streams -- does not
+   * reuse a slot before its batched kernel has completed. This is
+   * illustrative example code, not a general-purpose device allocator.
+   * Works (as a degenerate size-1 batch) even if the linked PaRSEC lacks
+   * kernel-batching support; no TTG_HAVE_PARSEC_DEV_BATCH guard is needed.
+   */
+  template <typename T>
+  struct GemmBatchPointerPool {
+    explicit GemmBatchPointerPool(std::size_t max_batch_size, std::size_t num_slots = 8)
+        : max_batch_size(max_batch_size), slots(num_slots) {
+      for (auto &s : slots) {
+        s.hostA.resize(max_batch_size);
+        s.hostB.resize(max_batch_size);
+        s.hostC.resize(max_batch_size);
+#if defined(TTG_ENABLE_CUDA)
+        cudaHostRegister(s.hostA.data(), max_batch_size * sizeof(const T *), cudaHostRegisterDefault);
+        cudaHostRegister(s.hostB.data(), max_batch_size * sizeof(const T *), cudaHostRegisterDefault);
+        cudaHostRegister(s.hostC.data(), max_batch_size * sizeof(T *), cudaHostRegisterDefault);
+        cudaMalloc(&s.devA, max_batch_size * sizeof(const T *));
+        cudaMalloc(&s.devB, max_batch_size * sizeof(const T *));
+        cudaMalloc(&s.devC, max_batch_size * sizeof(T *));
+#elif defined(TTG_ENABLE_HIP)
+        hipHostRegister(s.hostA.data(), max_batch_size * sizeof(const T *), hipHostRegisterDefault);
+        hipHostRegister(s.hostB.data(), max_batch_size * sizeof(const T *), hipHostRegisterDefault);
+        hipHostRegister(s.hostC.data(), max_batch_size * sizeof(T *), hipHostRegisterDefault);
+        hipMalloc(&s.devA, max_batch_size * sizeof(const T *));
+        hipMalloc(&s.devB, max_batch_size * sizeof(const T *));
+        hipMalloc(&s.devC, max_batch_size * sizeof(T *));
+#endif
+      }
+    }
+
+    ~GemmBatchPointerPool() {
+      for (auto &s : slots) {
+#if defined(TTG_ENABLE_CUDA)
+        cudaHostUnregister(s.hostA.data());
+        cudaHostUnregister(s.hostB.data());
+        cudaHostUnregister(s.hostC.data());
+        cudaFree(s.devA);
+        cudaFree(s.devB);
+        cudaFree(s.devC);
+#elif defined(TTG_ENABLE_HIP)
+        hipHostUnregister(s.hostA.data());
+        hipHostUnregister(s.hostB.data());
+        hipHostUnregister(s.hostC.data());
+        hipFree(s.devA);
+        hipFree(s.devB);
+        hipFree(s.devC);
+#endif
+      }
+    }
+
+    struct slot_t {
+      std::vector<const T *> hostA, hostB;
+      std::vector<T *> hostC;
+      const T **devA = nullptr;
+      const T **devB = nullptr;
+      T **devC = nullptr;
+    };
+
+    /* acquire the next slot (round-robin); the caller fills hostA/hostB/hostC
+     * (up to `count` entries) with this batch's device pointers and then
+     * copies them to devA/devB/devC (e.g. via cudaMemcpyAsync/hipMemcpyAsync
+     * on the current stream) before launching the batched kernel. */
+    slot_t &acquire() {
+      std::size_t idx = next.fetch_add(1, std::memory_order_relaxed) % slots.size();
+      return slots[idx];
+    }
+
+    std::size_t max_batch_size;
+    std::vector<slot_t> slots;
+    std::atomic<std::size_t> next{0};
+  };
+#endif  // defined(ENABLE_DEVICE_KERNEL)
 #endif // ENABLE_DEVICE_KERNEL
 
   template <typename MatrixT>
@@ -530,14 +612,9 @@ namespace potrf {
       assert(tile_nk.rows() == tile_mn.cols());
 
       if (ttg::tracing()) ttg::print("GEMM(", key, ")");
-#if defined(DEBUG_TILES_VALUES) && 0
-      //std::cout << "Before GEMM(" << key << "), A(" << M << ", " << K << ") is " << tile_mk << " and A(" << K << ", "
-      //          << N << ") is " << tile_nk << " and A(" << M << ", " << N << ") is " << tile_mn;
-#endif
 
 #ifdef DEBUG_TILES_VALUES
       std::array<T, 4> norms; // input for tile_mk & tile_nk & tile_mn and output
-      //auto norms_s  = ttg::make_scratch(norms.data(), ttg::scope::Allocate, norms.size());
       co_await ttg::device::select(tile_mk.buffer(), tile_nk.buffer(), tile_mn.buffer());
 
       /* compute the norms at input */
@@ -548,7 +625,6 @@ namespace potrf {
       co_await ttg::device::select(tile_mk.buffer(), tile_nk.buffer(), tile_mn.buffer());
 #endif // DEBUG_TILES_VALUES
 
-      int device = ttg::device::current_device();
       double alpha = -1.0;
       double beta  =  1.0;
 
@@ -569,7 +645,6 @@ namespace potrf {
                    tile_nk.buffer().current_device_ptr(), tile_nk.lda(), &beta,
                    tile_mn.buffer().current_device_ptr(), tile_mn.lda());
 #endif
-
 
 #ifdef DEBUG_TILES_VALUES
       /* compute the norm at output */
@@ -639,6 +714,113 @@ namespace potrf {
 #endif // defined(ENABLE_DEVICE_KERNEL)
   }
 
+#if defined(ENABLE_DEVICE_KERNEL)
+  /**
+   * Batching-enabled variant of make_gemm: collects the batch of sibling
+   * GEMMs the runtime forms via ttg::device::coop/TT::set_batch_matcher and,
+   * if this task is the batch's leader, submits ONE cublasDgemmBatched/
+   * hipblasDgemmBatched call on behalf of every member. A batch of size 1
+   * (e.g. because the linked PaRSEC lacks kernel-batching support, or no
+   * siblings were ready) takes the exact same code path, so this is always
+   * correct to use, just without the performance benefit in that case.
+   * Does not support DEBUG_TILES_VALUES (see make_gemm for that).
+   */
+  template <typename MatrixT>
+  auto make_gemm_batched(MatrixT& A,
+                 ttg::Edge<Key3, MatrixTile<typename MatrixT::element_type>>& input_disp,   // From the dispatcher
+                 ttg::Edge<Key3, MatrixTile<typename MatrixT::element_type>>& input_mk,     // from TRSM
+                 ttg::Edge<Key3, MatrixTile<typename MatrixT::element_type>>& input_nk,     // from TRSM
+                 ttg::Edge<Key3, MatrixTile<typename MatrixT::element_type>>& input_mn,     // from TRSM
+                 ttg::Edge<Key2, MatrixTile<typename MatrixT::element_type>>& output_trsm,  // to TRSM
+                 ttg::Edge<Key3, MatrixTile<typename MatrixT::element_type>>& output_gemm,
+                 std::size_t max_batch_size = 32) {
+    using T = typename MatrixT::element_type;
+    auto ptr_pool = std::make_shared<GemmBatchPointerPool<T>>(max_batch_size);
+    auto f = [=](const Key3& key, const MatrixTile<T>& tile_mk, const MatrixTile<T>& tile_nk, MatrixTile<T>&& tile_mn,
+                 std::tuple<ttg::Out<Key2, MatrixTile<T>>, ttg::Out<Key3, MatrixTile<T>>>& out) TASKRET {
+      const int M = key[0];
+      const int N = key[1];
+      const int K = key[2];
+      assert(M != N && M > K && N > K);
+
+      assert(tile_mk.cols() == tile_nk.cols());
+      assert(tile_mk.rows() == tile_mn.rows());
+      assert(tile_nk.rows() == tile_mn.cols());
+
+      if (ttg::tracing()) ttg::print("GEMM(", key, ")");
+
+      co_await ttg::device::select(tile_mk.buffer(), tile_nk.buffer(), tile_mn.buffer());
+
+      /* Collect the batch of GEMMs the runtime formed together with this task
+       * (see set_batch_matcher below) and, if we're the batch's leader, submit
+       * ONE batched kernel on behalf of every member. */
+      auto batch = co_await ttg::device::coop<Key3>(tile_mk, tile_nk, tile_mn);
+
+      if (batch.is_leader()) {
+        const std::size_t nb = batch.size();
+        auto &slot = ptr_pool->acquire();
+        for (std::size_t i = 0; i < nb; ++i) {
+          slot.hostA[i] = batch[i].template get<0>().buffer().current_device_ptr();
+          slot.hostB[i] = batch[i].template get<1>().buffer().current_device_ptr();
+          slot.hostC[i] = batch[i].template get<2>().buffer().current_device_ptr();
+        }
+        double alpha = -1.0;
+        double beta  =  1.0;
+        int mb = tile_mk.rows(), nnb = tile_nk.rows(), kb = tile_nk.cols();
+#if defined(TTG_ENABLE_CUDA)
+        cudaMemcpyAsync(slot.devA, slot.hostA.data(), nb * sizeof(const T *), cudaMemcpyHostToDevice,
+                        ttg::device::current_stream());
+        cudaMemcpyAsync(slot.devB, slot.hostB.data(), nb * sizeof(const T *), cudaMemcpyHostToDevice,
+                        ttg::device::current_stream());
+        cudaMemcpyAsync(slot.devC, slot.hostC.data(), nb * sizeof(T *), cudaMemcpyHostToDevice,
+                        ttg::device::current_stream());
+        cublasDgemmBatched(cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_T, mb, nnb, kb, &alpha,
+                           slot.devA, tile_mk.lda(), slot.devB, tile_nk.lda(), &beta,
+                           slot.devC, tile_mn.lda(), (int)nb);
+#elif defined(TTG_ENABLE_HIP)
+        hipMemcpyAsync(slot.devA, slot.hostA.data(), nb * sizeof(const T *), hipMemcpyHostToDevice,
+                       ttg::device::current_stream());
+        hipMemcpyAsync(slot.devB, slot.hostB.data(), nb * sizeof(const T *), hipMemcpyHostToDevice,
+                       ttg::device::current_stream());
+        hipMemcpyAsync(slot.devC, slot.hostC.data(), nb * sizeof(T *), hipMemcpyHostToDevice,
+                       ttg::device::current_stream());
+        hipblasDgemmBatched(hipblas_handle(), HIPBLAS_OP_N, HIPBLAS_OP_T, mb, nnb, kb, &alpha,
+                            slot.devA, tile_mk.lda(), slot.devB, tile_nk.lda(), &beta,
+                            slot.devC, tile_mn.lda(), (int)nb);
+#endif
+      }
+      // followers: the leader's batched call already covers our output tile.
+
+      // matching the non-batched GEMM, no explicit device::wait() is needed
+      // here: nothing downstream needs this tile back on the host, so we
+      // forward it directly (PaRSEC's own data-copy tracking, plus the fact
+      // that the kernel and any subsequent transfers of this tile are
+      // enqueued on the same device stream, take care of ordering).
+      if (N == K + 1) {
+        /* send the tile to trsm */
+        if (ttg::tracing()) ttg::print("GEMM(", key, "): sending output to TRSM(", Key2{M, N}, ")");
+        co_await ttg::device::send<0>(Key2(M, N), std::move(tile_mn), out);
+      } else {
+        /* send the tile to the next gemm */
+        if (ttg::tracing()) ttg::print("GEMM(", key, "): sending output to GEMM(", Key3{M, N, K + 1}, ")");
+        co_await ttg::device::send<1>(Key3(M, N, K + 1), std::move(tile_mn), out);
+      }
+    };
+    auto tt_gemm = ttg::make_tt<ES>(f, ttg::edges(input_mk, input_nk, ttg::fuse(input_disp, input_mn)),
+                            ttg::edges(output_trsm, output_gemm), "GEMM", {"input_mk", "input_kn", "input_mn/dispatcher"},
+                            {"output_trsm", "outout_gemm"});
+    // cublasDgemmBatched/hipblasDgemmBatched require identical (m,n,k) and
+    // leading dimensions across the whole batch; tiles sharing the same K
+    // column in this tiling always have matching geometry, so that is a
+    // sufficient compatibility test. Unconditionally safe to call: it is a
+    // no-op unless the linked PaRSEC actually supports kernel batching.
+    tt_gemm->set_batch_matcher(
+        [](const Key3& head, const Key3& cand) { return head[2] == cand[2]; },
+        max_batch_size);
+    return tt_gemm;
+  }
+#endif // defined(ENABLE_DEVICE_KERNEL)
+
   template <typename T>
   auto make_dispatcher(ttg::Edge<Key2, MatrixTile<T>>& input, ttg::Edge<Key1, MatrixTile<T>>& to_potrf,
                        ttg::Edge<Key2, MatrixTile<T>>& to_trsm, ttg::Edge<Key2, MatrixTile<T>>& to_syrk,
@@ -679,7 +861,7 @@ namespace potrf {
   template <typename MatrixT>
   auto make_potrf_ttg(MatrixT& A, ttg::Edge<Key2, MatrixTile<typename MatrixT::element_type>>& input,
                       ttg::Edge<Key2, MatrixTile<typename MatrixT::element_type>>& output, bool defer_write,
-                      bool enable_device_map = true) {
+                      bool enable_device_map = true, bool enable_gemm_batching = false) {
     using T = typename MatrixT::element_type;
     auto keymap1 = [&](const Key1& key) { return A.rank_of(key[0], key[0]); };
 
@@ -744,15 +926,6 @@ namespace potrf {
     }
 #endif // 0
 
-    auto tt_gemm = make_gemm(A, disp_gemm, trsm_gemm_row, trsm_gemm_col, gemm_gemm, gemm_trsm, gemm_gemm);
-    tt_gemm->set_keymap(keymap3);
-    tt_gemm->set_defer_writer(defer_write);
-#ifdef ENABLE_DEVICE_KERNEL
-    if (enable_device_map) {
-      tt_gemm->set_devicemap(devmap3);
-    }
-#endif // 0
-
     /* Priorities taken from DPLASMA */
     auto nt = A.cols();
     tt_potrf->set_priomap([nt](const Key1& key) { return ((nt - key[0]) * (nt - key[0]) * (nt - key[0])); });
@@ -761,10 +934,33 @@ namespace potrf {
     });
     tt_syrk->set_priomap(
         [nt](const Key2& key) { return ((nt - key[0]) * (nt - key[0]) * (nt - key[0]) + 3 * (key[0] - key[1])); });
-    tt_gemm->set_priomap([nt](const Key3& key) {
-      return ((nt - key[0]) * (nt - key[0]) * (nt - key[0]) + 3 * ((2 * nt) - key[0] - key[1] - 3) * (key[0] - key[1]) +
-              6 * (key[0] - key[2]));
-    });
+
+    // GEMM: pick the plain or batching-enabled implementation (driver's choice);
+    // apply the common setup to whichever concrete TT gets constructed, then
+    // erase to TTBase to store alongside the other TTs.
+    auto configure_gemm = [&](auto tt) -> std::unique_ptr<ttg::TTBase> {
+      tt->set_keymap(keymap3);
+      tt->set_defer_writer(defer_write);
+#ifdef ENABLE_DEVICE_KERNEL
+      if (enable_device_map) {
+        tt->set_devicemap(devmap3);
+      }
+#endif // 0
+      tt->set_priomap([nt](const Key3& key) {
+        return ((nt - key[0]) * (nt - key[0]) * (nt - key[0]) + 3 * ((2 * nt) - key[0] - key[1] - 3) * (key[0] - key[1]) +
+                6 * (key[0] - key[2]));
+      });
+      return tt;
+    };
+    std::unique_ptr<ttg::TTBase> tt_gemm;
+#ifdef ENABLE_DEVICE_KERNEL
+    if (enable_gemm_batching) {
+      tt_gemm = configure_gemm(make_gemm_batched(A, disp_gemm, trsm_gemm_row, trsm_gemm_col, gemm_gemm, gemm_trsm, gemm_gemm));
+    } else
+#endif // ENABLE_DEVICE_KERNEL
+    {
+      tt_gemm = configure_gemm(make_gemm(A, disp_gemm, trsm_gemm_row, trsm_gemm_col, gemm_gemm, gemm_trsm, gemm_gemm));
+    }
 
     auto ins = std::make_tuple(tt_dispatch->template in<0>());
     auto outs = std::make_tuple(tt_potrf->template out<0>());

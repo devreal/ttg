@@ -17,6 +17,10 @@ namespace ttg_parsec {
       parsec_gpu_exec_stream_t* stream = nullptr;
       parsec_device_gpu_module_t* device = nullptr;
       parsec_task_class_t task_class; // copy of the taskclass
+      /* head of the ring of gpu_task's batched together with this task (see
+       * TT::set_batch_matcher); always set to this task's own gpu_task when
+       * no batching occurred, so it is safe to dereference unconditionally. */
+      parsec_gpu_task_t* batch_ring_head = nullptr;
     };
 
     template<bool SupportDevice>
@@ -136,6 +140,14 @@ namespace ttg_parsec {
       bool dummy = false;
       bool defer_writer = TTG_PARSEC_DEFER_WRITER; // whether to defer writer instead of creating a new copy
       ttg_parsec_data_flags data_flags; // HACKY: flags set by prepare_send and reset by the copy_handler
+#ifdef TTG_HAVE_COROUTINE
+      /* Hoisted up from parsec_ttg_task_t<TT,...> so that TT-agnostic code (e.g.
+       * batching, which walks a ring of tasks whose concrete TT is not known
+       * at that point) can resume/inspect a suspended coroutine without
+       * needing the derived task type. */
+      void* suspended_task_address = nullptr;  // if not null the function is suspended
+      ttg::TaskCoroutineID coroutine_id = ttg::TaskCoroutineID::Invalid;
+#endif // TTG_HAVE_COROUTINE
 
       /*
       virtual void release_task() = 0;
@@ -210,10 +222,6 @@ namespace ttg_parsec {
       TT* tt = nullptr;
       key_type key;
       std::array<stream_info_t, num_streams> streams;
-#ifdef TTG_HAVE_COROUTINE
-      void* suspended_task_address = nullptr;  // if not null the function is suspended
-      ttg::TaskCoroutineID coroutine_id = ttg::TaskCoroutineID::Invalid;
-#endif
       device_state_t<TT::derived_has_device_op()> dev_state;
       ttg_data_copy_t *copies[num_copies] = { nullptr };  // the data copies tracked by this task
 
@@ -277,10 +285,6 @@ namespace ttg_parsec {
       static constexpr size_t num_streams = TT::numins;
       TT* tt = nullptr;
       std::array<stream_info_t, num_streams> streams;
-#ifdef TTG_HAVE_COROUTINE
-      void* suspended_task_address = nullptr;  // if not null the function is suspended
-      ttg::TaskCoroutineID coroutine_id = ttg::TaskCoroutineID::Invalid;
-#endif
       device_state_t<TT::derived_has_device_op()> dev_state;
       ttg_data_copy_t *copies[num_streams+1] = { nullptr };  // the data copies tracked by this task
                                                              // +1 for the copy needed during send/bcast

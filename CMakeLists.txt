@@ -217,6 +217,51 @@ include(FindOrFetchPARSEC)
 if (TARGET PaRSEC::parsec)
   message(STATUS "PARSEC_FOUND=1")
 endif(TARGET PaRSEC::parsec)
+
+# whether the linked PaRSEC supports GPU kernel batching
+# (parsec_gpu_task_collect_batch / PARSEC_DEV_CHORE_ALLOW_BATCH); older
+# PaRSEC checkouts lack this API entirely, so probe for it rather than
+# assuming its presence. Use CMAKE_REQUIRED_INCLUDES with PaRSEC's plain
+# source/build directories rather than CMAKE_REQUIRED_LIBRARIES with the
+# PaRSEC::parsec target: that target's INTERFACE_INCLUDE_DIRECTORIES is a
+# generator-expression-laden list (BUILD_INTERFACE/INSTALL_INTERFACE/
+# conditional wrappers) that try_compile does not reliably resolve. Note:
+# TTG_HAVE_PARSEC_DEV_BATCH must NOT be set before check_cxx_source_compiles
+# runs -- check_xxx macros treat an already-DEFINED result variable as a
+# cached prior result and silently skip re-running the check, which was
+# quietly defeating this probe (it kept "detecting" whatever it was
+# pre-set to, without ever invoking the compiler).
+if (TARGET PaRSEC::parsec AND TTG_HAVE_DEVICE)
+  include(CheckCXXSourceCompiles)
+  include(CMakePushCheckState)
+  # PaRSEC's headers (parsec/datatype.h) include <mpi.h> transitively; find it
+  # here (harmless/idempotent if found again later by the full MPI section).
+  find_package(MPI QUIET COMPONENTS CXX)
+  cmake_push_check_state()
+  set(CMAKE_REQUIRED_INCLUDES
+      ${PARSEC_SOURCE_DIR} ${PARSEC_SOURCE_DIR}/parsec/include
+      ${PARSEC_BINARY_DIR} ${PARSEC_BINARY_DIR}/parsec/include
+      ${MPI_CXX_INCLUDE_DIRS})
+  # Skip OpenMPI's deprecated C++ bindings (<mpi.h> pulls them in by default,
+  # requiring extra libraries to link a trivial try_compile executable); we
+  # never call any MPI function here, we just need the headers to parse.
+  set(CMAKE_REQUIRED_DEFINITIONS -DOMPI_SKIP_MPICXX -DMPICH_SKIP_MPICXX)
+  check_cxx_source_compiles("
+    #include <parsec.h>
+    #include <parsec/mca/device/device.h>
+    #include <parsec/mca/device/device_gpu.h>
+    int main() {
+      (void)&parsec_gpu_task_collect_batch;
+      (void)&parsec_mca_device_type_supports_batch;
+      unsigned f = PARSEC_DEV_CHORE_ALLOW_BATCH;
+      (void)f;
+      return 0;
+    }
+  " TTG_HAVE_PARSEC_DEV_BATCH)
+  cmake_pop_check_state()
+else()
+  set(TTG_HAVE_PARSEC_DEV_BATCH FALSE)
+endif()
 # MADNESS
 include(FindOrFetchMADNESS)
 if (TARGET MADworld)

@@ -11,6 +11,7 @@
 #include "ttg/impl_selector.h"
 #include "ttg/ptr.h"
 #include "ttg/devicescope.h"
+#include "ttg/device/batch.h"
 
 #ifdef TTG_HAVE_COROUTINE
 
@@ -111,6 +112,11 @@ namespace ttg::device {
       TTG_DEVICE_CORO_STATE_NONE,
       TTG_DEVICE_CORO_INIT,
       TTG_DEVICE_CORO_WAIT_TRANSFER,
+      /* suspended inside ttg::device::coop(), having registered this task's
+       * batch arguments; resumed once every sibling task collected into the
+       * same batch has also registered (see TT::set_batch_matcher and the
+       * parsec backend's device_static_submit). */
+      TTG_DEVICE_CORO_WAIT_BATCH,
       TTG_DEVICE_CORO_WAIT_KERNEL,
       TTG_DEVICE_CORO_SENDOUT,
       TTG_DEVICE_CORO_COMPLETE
@@ -132,6 +138,31 @@ namespace ttg::device {
           /* hook to allow the backend to handle the data after pushout */
           TTG_IMPL_NS::post_device_out(ties);
         }
+      }
+    };
+
+    /* the awaiter behind ttg::device::coop(); stores this task's batch
+     * arguments (a copy of the tuple of references built by coop(), kept
+     * alive as part of this awaiter, which itself lives in the coroutine
+     * frame across the suspension) so that whichever task ends up building
+     * the batch_view (see TTG_IMPL_NS::make_batch_view) can read them back
+     * off of every collected sibling task's own promise. */
+    template <typename Key, typename... Args>
+    struct coop_awaiter {
+      std::tuple<Args&...> args;
+
+      /* always suspend: the runtime resumes this a second time, once every
+       * sibling task collected into the same batch has also registered its
+       * own arguments (see the parsec backend's device_static_submit). */
+      constexpr bool await_ready() const noexcept { return false; }
+
+      template <typename Promise>
+      void await_suspend(ttg::coroutine_handle<Promise> h) noexcept {
+        h.promise().set_batch_args(static_cast<void*>(&args));
+      }
+
+      ttg::device::batch_view<Key, Args...> await_resume() {
+        return TTG_IMPL_NS::detail::make_batch_view<Key, Args...>();
       }
     };
   }  // namespace detail
@@ -685,6 +716,24 @@ namespace ttg::device {
         return {};
       }
 
+      template <typename Key, typename... Args>
+      auto await_transform(detail::coop_t<Key, Args...>&& a) {
+        return detail::coop_awaiter<Key, Args...>{a.args};
+      }
+
+      /* invoked by coop_awaiter::await_suspend; not for direct use */
+      void set_batch_args(void* erased_args_tuple) {
+        m_batch_args_erased = erased_args_tuple;
+        m_state = ttg::device::detail::TTG_DEVICE_CORO_WAIT_BATCH;
+      }
+
+      /* @return the (type-erased) tuple of references this task passed to
+       * ttg::device::coop(), or nullptr if it never called coop(). Only
+       * meaningful while this task is suspended at TTG_DEVICE_CORO_WAIT_BATCH
+       * or later. Used by TTG_IMPL_NS::make_batch_view to read back the
+       * arguments of every task collected into a batch. */
+      void* batch_args_erased() const { return m_batch_args_erased; }
+
       void return_void() {
         m_state = ttg::device::detail::TTG_DEVICE_CORO_COMPLETE;
       }
@@ -717,6 +766,7 @@ namespace ttg::device {
     private:
       std::vector<device::detail::send_t> m_sends;
       ttg_device_coro_state m_state = ttg::device::detail::TTG_DEVICE_CORO_STATE_NONE;
+      void* m_batch_args_erased = nullptr;
 
     };
 

@@ -101,6 +101,16 @@
 #endif //PARSEC_HAVE_DEV_LEVEL_ZERO_SUPPORT
 
 #include <parsec/mca/device/device_gpu.h>
+
+#if defined(TTG_HAVE_PARSEC_DEV_BATCH)
+/* OR'd into a device incarnation's type to mark it as eligible for
+ * parsec_gpu_task_collect_batch(); harmless unless a TT actually calls
+ * TT::set_batch_matcher (see device_static_submit). */
+#define TTG_PARSEC_BATCH_CHORE_BIT PARSEC_DEV_CHORE_ALLOW_BATCH
+#else
+#define TTG_PARSEC_BATCH_CHORE_BIT 0u
+#endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
+
 #if defined(PARSEC_PROF_TRACE)
 #include <parsec/profiling.h>
 #undef PARSEC_TTG_PROFILE_BACKEND
@@ -1202,6 +1212,75 @@ namespace ttg_parsec {
       parsec_task_class_t self;
     };
 
+#ifdef TTG_HAVE_COROUTINE
+    /* Type of the predicate passed to TT::set_batch_matcher, as a function of
+     * the TT's key type. Deliberately NOT std::conditional_t: unlike
+     * if-constexpr, conditional_t requires BOTH alternative types to already
+     * be well-formed before one is selected, and std::function<bool(const
+     * void&, const void&)> is ill-formed (can't form a reference to void) --
+     * so a void-keyed TT would fail to compile even though it never uses this
+     * type. Partial specialization instead avoids ever forming the
+     * non-selected alternative. */
+    template <typename Key, typename Enable = void>
+    struct batch_matcher_type {
+      using type = std::function<bool()>;  // void-keyed TT: batching is never enabled (see TT::batching_enabled)
+    };
+    template <typename Key>
+    struct batch_matcher_type<Key, std::enable_if_t<!ttg::meta::is_void_v<Key>>> {
+      using type = std::function<bool(const Key &, const Key &)>;
+    };
+
+    /* Implements ttg::device::coop()'s await_resume (see ttg/device/task.h
+     * and its forward declaration in ttg/parsec/fwd.h). Reads the ring of
+     * tasks batched together with the currently-executing task (see
+     * TT::set_batch_matcher and device_static_submit) and builds a
+     * ttg::device::batch_view over the batch arguments each of those tasks
+     * registered via its own coop() call. Requires every member of the ring
+     * to have already been resumed at least once past its own coop() call
+     * (i.e., to be suspended at TTG_DEVICE_CORO_WAIT_BATCH or later) --
+     * device_static_submit guarantees this by resuming the whole ring before
+     * resuming any member a second time. */
+    template <typename Key, typename... Args>
+    ttg::device::batch_view<Key, Args...> make_batch_view() {
+      parsec_ttg_task_base_t *caller = detail::parsec_ttg_caller;
+      assert(nullptr != caller && nullptr != caller->dev_ptr);
+      parsec_gpu_task_t *ring_head = caller->dev_ptr->batch_ring_head;
+      assert(nullptr != ring_head);  // device_static_submit always sets this before resuming
+
+      using batch_view_t = ttg::device::batch_view<Key, Args...>;
+      using member_t = typename batch_view_t::member_type;
+      std::vector<member_t> members;
+
+      parsec_gpu_task_t *cur = ring_head;
+      do {
+        auto *mtask = reinterpret_cast<parsec_ttg_task_base_t *>(cur->ec);
+        /* A member reaches here only if it is suspended at (or past) its own
+         * coop() call; nothing upstream (batch_match_cb, the matcher predicate)
+         * knows or enforces whether a matched candidate's coroutine body will
+         * actually reach coop() before completing. Check for real instead of
+         * asserting, since an assert compiles out under NDEBUG and this would
+         * otherwise be a silent null-dereference in release builds. */
+        if (nullptr == mtask->suspended_task_address) {
+          throw std::runtime_error(
+              "ttg::device::coop(): a task participating in a batch (see TT::set_batch_matcher) completed "
+              "without ever reaching its co_await ttg::device::coop() call; every task matched into a batch "
+              "must call coop() unconditionally");
+        }
+        auto handle = ttg::device::detail::device_task_handle_type::from_address(mtask->suspended_task_address);
+        auto *args_ptr = static_cast<std::tuple<Args &...> *>(handle.promise().batch_args_erased());
+        if (nullptr == args_ptr) {
+          throw std::runtime_error(
+              "ttg::device::coop(): a batched task is suspended but never registered its coop() arguments");
+        }
+        members.emplace_back(*args_ptr);
+        cur = (parsec_gpu_task_t *)cur->list_item.list_next;
+      } while (cur != ring_head);
+
+      bool is_leader = (caller->dev_ptr->gpu_task == ring_head);
+      return batch_view_t(std::move(members), is_leader);
+    }
+#endif  // TTG_HAVE_COROUTINE
+
   }  // namespace detail
 
   template <typename keyT, typename output_terminalsT, typename derivedT, typename input_valueTs, ttg::ExecutionSpace Space>
@@ -1357,6 +1436,14 @@ namespace ttg_parsec {
     ttg::meta::detail::keymap_t<keyT> keymap;
     ttg::meta::detail::keymap_t<keyT> priomap;
     ttg::meta::detail::keymap_t<keyT, ttg::device::Device> devicemap;
+#ifdef TTG_HAVE_COROUTINE
+    // matcher used to decide which sibling tasks may be collected together into
+    // a single GPU kernel batch (see set_batch_matcher); disabled (empty) by default,
+    // in which case device_static_submit behaves exactly as without batching support.
+    using batch_matcher_t = typename detail::batch_matcher_type<keyT>::type;
+    batch_matcher_t m_batch_matcher;
+    std::size_t m_max_batch_size = 1;
+#endif  // TTG_HAVE_COROUTINE
     // For now use same type for unary/streaming input terminals, and stream reducers assigned at runtime
     ttg::meta::detail::input_reducers_t<actual_input_tuple_type>
         input_reducers;  //!< Reducers for the input terminals (empty = expect single value)
@@ -1436,6 +1523,74 @@ namespace ttg_parsec {
     }
 
 #ifdef TTG_HAVE_DEVICE
+#if defined(TTG_HAVE_PARSEC_DEV_BATCH)
+    struct batch_match_ctx_t {
+      TT *tt;
+      const keyT *head_key;
+      std::size_t accepted = 0;
+      std::size_t max_size = 1;
+    };
+
+    /* Callback bridging PaRSEC's C parsec_gpu_task_batch_cb_t to the TT's
+     * batch matcher (see TT::set_batch_matcher). PaRSEC's collector filters
+     * candidates only by batch-capable incarnation and matching selected
+     * device (see docs/doxygen/task-batching.md); it does NOT filter by task
+     * class. Every device-enabled TT's incarnation is marked batch-capable
+     * unconditionally (see the incarnation wiring below), and TTs sharing a
+     * device share that device's stream/fifo_pending, so a candidate here may
+     * belong to an entirely different TT (different key type, different
+     * task_t layout) -- exactly the failure mode the doc's own example
+     * callback guards against by checking task_class itself. We must do the
+     * same before ever reinterpreting candidate->ec as this TT's task_t.
+     *
+     * Per parsec_gpu_task_batch_cb_t's contract: <0 stops the scan entirely
+     * (tasks already spliced into the ring remain attached; this is how we
+     * signal "batch is full", not an error), 0 accepts the candidate, >0
+     * leaves it pending and continues scanning.
+     *
+     * NB: we cannot compare task_class *pointers* here. device_static_evaluate
+     * gives every task instance its own private copy of the task_class struct
+     * (task->dev_ptr->task_class = *task->parsec_task.task_class;), so two
+     * tasks belonging to the very same TT always have distinct task_class
+     * pointers -- comparing pointers would reject every candidate. Compare
+     * task_class_id instead: it is assigned once per TT object (see
+     * get_instance_id() at TT construction) and copied by value into that
+     * per-task struct, so it is stable and identical across all tasks of the
+     * same TT while still distinguishing different TTs. */
+    static int batch_match_cb(parsec_gpu_task_t *candidate, parsec_gpu_task_t *batch_head, void *cb_data) {
+      if (candidate->ec->task_class->task_class_id != batch_head->ec->task_class->task_class_id ||
+          candidate->ec->selected_chore != batch_head->ec->selected_chore) {
+        return 1;  // a different TT (or incarnation): not compatible, keep scanning
+      }
+      if constexpr (ttg::meta::is_void_v<keyT>) {
+        return -1;  // batching is not supported for void-keyed TTs (see set_batch_matcher)
+      } else {
+        auto *ctx = static_cast<batch_match_ctx_t *>(cb_data);
+        if (ctx->accepted + 1 >= ctx->max_size) {
+          return -1;  // batch already at capacity (including the head): stop scanning
+        }
+        auto *ctask = (task_t *)candidate->ec;
+        bool ok;
+        try {
+          ok = ctx->tt->m_batch_matcher(*ctx->head_key, ctask->key);
+        } catch (...) {
+          /* treat a throwing predicate as "incompatible" rather than stopping
+           * collection, so tasks already accepted are not left stranded; still
+           * surface it, since a matcher that throws is very likely a bug and
+           * silently degrading to unbatched execution is easy to miss otherwise */
+          ttg::print_error(ctx->tt->get_name(), ": batch matcher threw an exception, treating candidate ",
+                            ctask->key, " as incompatible with batch head ", *ctx->head_key);
+          return 1;
+        }
+        if (ok) {
+          ++ctx->accepted;
+          return 0;  // accept: splice into the batch ring
+        }
+        return 1;  // reject: leave candidate pending, keep scanning
+      }
+    }
+#endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
+
     /**
      * Submit callback called by PaRSEC once all input transfers have completed.
      */
@@ -1464,6 +1619,10 @@ namespace ttg_parsec {
       assert(dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER ||
              dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL);
 
+      /* Never batch a task re-entering purely to resolve a pending kernel wait;
+       * only tasks fresh off their select() (WAIT_TRANSFER) can become a batch head. */
+      bool is_first_entry = (dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER);
+
 #if defined(PARSEC_HAVE_DEV_CUDA_SUPPORT) && defined(TTG_HAVE_CUDA)
       {
         parsec_cuda_exec_stream_t *cuda_stream = (parsec_cuda_exec_stream_t *)gpu_stream;
@@ -1485,47 +1644,136 @@ namespace ttg_parsec {
       }
 #endif // defined(PARSEC_HAVE_DEV_LEVEL_ZERO_SUPPORT) && defined(TTG_HAVE_LEVEL_ZERO)
 
-      /* Here we call back into the coroutine again after the transfers have completed */
-      static_op(&task->parsec_task);
+      /* the head of the ring of tasks batched together with this one (a
+       * singleton ring containing just `task` if no batching occurred or was
+       * ever configured for this TT) */
+      parsec_gpu_task_t *ring_head = gpu_task;
+
+      if (is_first_entry) {
+        task->dev_ptr->batch_ring_head = gpu_task;
+
+#if defined(TTG_HAVE_PARSEC_DEV_BATCH)
+        // batching requires a non-void key (see TT::set_batch_matcher); guarded with
+        // if constexpr (rather than relying on the runtime batching_enabled() check
+        // alone) because task_t has no `key` member at all for void-keyed TTs.
+        if constexpr (!ttg::meta::is_void_v<keyT>) {
+          TT *tt = task->tt;
+          if (tt->batching_enabled() && parsec_mca_device_type_supports_batch(gpu_device->super.type)) {
+            batch_match_ctx_t ctx{tt, &task->key, 0, tt->m_max_batch_size};
+            int nb = parsec_gpu_task_collect_batch(gpu_stream, gpu_task, &batch_match_cb, &ctx);
+            /* nb < 0 means the callback stopped the scan early (batch_match_cb
+             * only ever does so once capacity is reached, never on a genuine
+             * error) -- tasks already accepted before that point are still
+             * spliced into the ring and must be stamped just the same, so
+             * treat any non-zero result (positive or negative) alike. */
+            if (nb != 0) {
+              /* stamp every collected member so it (and make_batch_view, which may
+               * be invoked from any member's own resume) can find the ring head
+               * and the stream/device shared by the whole batch */
+              parsec_gpu_task_t *cur = (parsec_gpu_task_t *)gpu_task->list_item.list_next;
+              while (cur != gpu_task) {
+                task_t *mtask = (task_t *)cur->ec;
+                mtask->dev_ptr->batch_ring_head = gpu_task;
+                mtask->dev_ptr->stream = gpu_stream;
+                mtask->dev_ptr->device = gpu_device;
+                cur = (parsec_gpu_task_t *)cur->list_item.list_next;
+              }
+            }
+          }
+        }
+#endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
+      } else {
+        /* second (or later) entry: the ring was already formed on the first entry */
+        ring_head = task->dev_ptr->batch_ring_head;
+      }
+
+      auto resume_member = [](parsec_gpu_task_t *member_gpu_task) {
+        task_t *mtask = (task_t *)member_gpu_task->ec;
+        static_op(&mtask->parsec_task);
+      };
+
+      auto member_state = [](parsec_gpu_task_t *member_gpu_task) {
+        task_t *mtask = (task_t *)member_gpu_task->ec;
+        if (nullptr == mtask->suspended_task_address) return ttg::device::detail::TTG_DEVICE_CORO_COMPLETE;
+        auto h = ttg::device::detail::device_task_handle_type::from_address(mtask->suspended_task_address);
+        return h.promise().state();
+      };
+
+      if (is_first_entry) {
+        /* Registration pass: resume every ring member once. A task using
+         * ttg::device::coop() suspends at WAIT_BATCH having registered its
+         * batch arguments; an ordinary (non-batching) device task runs
+         * straight through its inline kernel-launch code to WAIT_KERNEL, just
+         * as it always has -- for a singleton ring this loop degenerates to
+         * exactly the single static_op() call this replaced. */
+        parsec_gpu_task_t *cur = ring_head;
+        do {
+          resume_member(cur);
+          cur = (parsec_gpu_task_t *)cur->list_item.list_next;
+        } while (cur != ring_head);
+
+        /* Delivery pass: resume every member still parked at WAIT_BATCH a
+         * second time, now that the whole ring has registered; this is what
+         * hands each of them the completed ttg::device::batch_view. Members
+         * that never called coop() are already past WAIT_BATCH and are left
+         * alone here. */
+        cur = ring_head;
+        do {
+          if (member_state(cur) == ttg::device::detail::TTG_DEVICE_CORO_WAIT_BATCH) {
+            resume_member(cur);
+          }
+          cur = (parsec_gpu_task_t *)cur->list_item.list_next;
+        } while (cur != ring_head);
+      } else {
+        /* Completion pass: the shared stream event fired, so the kernel and
+         * every member's D2H copies (enqueued during the delivery pass above,
+         * on the same stream, hence ordered after the kernel) have completed.
+         * Resume every member still at WAIT_KERNEL to run its post-wait code
+         * and reach SENDOUT. */
+        parsec_gpu_task_t *cur = ring_head;
+        do {
+          if (member_state(cur) == ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL) {
+            resume_member(cur);
+          }
+          cur = (parsec_gpu_task_t *)cur->list_item.list_next;
+        } while (cur != ring_head);
+      }
 
       ttg::device::detail::reset_current();
 
-      auto discard_tmp_flows = [&](){
+      auto discard_tmp_flows = [](parsec_gpu_task_t *member_gpu_task, task_t *mtask){
         for (int i = 0; i < MAX_PARAM_COUNT; ++i) {
-          if (gpu_task->flow[i]->flow_flags & TTG_PARSEC_FLOW_ACCESS_TMP) {
+          if (member_gpu_task->flow[i]->flow_flags & TTG_PARSEC_FLOW_ACCESS_TMP) {
             /* temporary flow, discard by setting it to read-only to avoid evictions */
-            const_cast<parsec_flow_t*>(gpu_task->flow[i])->flow_flags = PARSEC_FLOW_ACCESS_READ;
-            task->parsec_task.data[i].data_out->readers = 1;
+            const_cast<parsec_flow_t*>(member_gpu_task->flow[i])->flow_flags = PARSEC_FLOW_ACCESS_READ;
+            mtask->parsec_task.data[i].data_out->readers = 1;
           }
         }
       };
 
-      /* we will come back into this function once the kernel and transfers are done */
-      int rc = PARSEC_HOOK_RETURN_DONE;
-      if (nullptr != task->suspended_task_address) {
-        /* Get a new handle for the promise*/
-        dev_task = ttg::device::detail::device_task_handle_type::from_address(task->suspended_task_address);
-        dev_data = dev_task.promise();
-
-        assert(dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL ||
-               dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT     ||
-               dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE);
-
-        if (ttg::device::detail::TTG_DEVICE_CORO_SENDOUT == dev_data.state() ||
-            ttg::device::detail::TTG_DEVICE_CORO_COMPLETE == dev_data.state()) {
-          /* the task started sending so we won't come back here */
-          //std::cout << "device_static_submit task " << task << " complete" << std::endl;
-          discard_tmp_flows();
-        } else {
-          //std::cout << "device_static_submit task " << task << " return-again" << std::endl;
-          rc = PARSEC_HOOK_RETURN_AGAIN;
-        }
-      } else {
-        /* the task is done so we won't come back here */
-        //std::cout << "device_static_submit task " << task << " complete" << std::endl;
-        discard_tmp_flows();
+      /* We will come back into this function once the kernel and transfers
+       * are done, unless every member of the ring has already fully completed
+       * (reached SENDOUT/COMPLETE, or returned immediately without
+       * suspending at all). For a singleton ring this is exactly the
+       * single-task check this replaced. */
+      bool any_pending = false;
+      {
+        parsec_gpu_task_t *cur = ring_head;
+        do {
+          task_t *mtask = (task_t *)cur->ec;
+          auto state = member_state(cur);
+          if (state == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT ||
+              state == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE) {
+            /* the task started sending (or returned immediately) so we won't come back for it */
+            discard_tmp_flows(cur, mtask);
+          } else {
+            any_pending = true;
+          }
+          cur = (parsec_gpu_task_t *)cur->list_item.list_next;
+        } while (cur != ring_head);
       }
-      return rc;
+
+      return any_pending ? PARSEC_HOOK_RETURN_AGAIN : PARSEC_HOOK_RETURN_DONE;
     }
 
     static parsec_hook_return_t device_static_evaluate(parsec_task_t* parsec_task) {
@@ -1939,7 +2187,10 @@ namespace ttg_parsec {
       //std::cout << "static_reducer_op size " << size
       //          << " of " << parent_task->streams[i].goal << " complete " << complete
       //          << " c " << c << std::endl;
-      ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : ", parent_task->key, ": size ", size, " of ", parent_task->streams[i].goal, " complete ", complete, " c ", c);
+      if constexpr (!ttg::meta::is_void_v<keyT>)
+        ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : ", parent_task->key, ": size ", size, " of ", parent_task->streams[i].goal, " complete ", complete, " c ", c);
+      else
+        ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : size ", size, " of ", parent_task->streams[i].goal, " complete ", complete, " c ", c);
       if (complete && c == 0) {
         if constexpr(input_is_const) {
           /* make the consumer task a reader if its input is const */
@@ -3540,18 +3791,30 @@ namespace ttg_parsec {
         if (data->owner_device != 0) {
           /* find the flow */
           int flowidx = 0;
+          /**
+           * TODO: We should support cases where empty flows are in the middle of the flow array.
+           *       Right now this happens in MRA if the norm check is disabled and the norm buffer is in the middle of the flows.
+           *       We should iterate over all of the array to find the right flow and remember which flows are empty.
+           */
+          int empty_flowidx = -1;
           while (flowidx < MAX_PARAM_COUNT &&
-                gpu_task->flow[flowidx] != nullptr &&
-                gpu_task->flow[flowidx]->flow_flags != PARSEC_FLOW_ACCESS_NONE) {
+                gpu_task->flow[flowidx] != nullptr) {
+            if (gpu_task->flow[flowidx]->flow_flags == PARSEC_FLOW_ACCESS_NONE) {
+              empty_flowidx = flowidx;
+            }
             if (detail::parsec_ttg_caller->parsec_task.data[flowidx].data_in->original == data) {
               /* found the right data, set the corresponding flow as pushout */
               break;
             }
             ++flowidx;
           }
-          if (flowidx == MAX_PARAM_COUNT) {
+          if (flowidx == MAX_PARAM_COUNT && empty_flowidx == -1) {
             throw std::runtime_error("Cannot add more than MAX_PARAM_COUNT flows to a task!");
+          } else if (empty_flowidx != -1) {
+            /* we found an empty flow, use it */
+            empty_flowidx = flowidx;
           }
+          flowidx = (empty_flowidx != -1) ? empty_flowidx : flowidx;
           if (gpu_task->flow[flowidx]->flow_flags == PARSEC_FLOW_ACCESS_NONE) {
             /* no flow found, add one and mark it pushout */
             detail::parsec_ttg_caller->parsec_task.data[flowidx].data_in = data->device_copies[0];
@@ -4026,7 +4289,7 @@ namespace ttg_parsec {
 //#if 0
       if constexpr (derived_has_cuda_op()) {
         self.incarnations = (__parsec_chore_t *)malloc(3 * sizeof(__parsec_chore_t));
-        ((__parsec_chore_t *)self.incarnations)[0].type = PARSEC_DEV_CUDA;
+        ((__parsec_chore_t *)self.incarnations)[0].type = PARSEC_DEV_CUDA | TTG_PARSEC_BATCH_CHORE_BIT;
         ((__parsec_chore_t *)self.incarnations)[0].evaluate = &detail::evaluate_cuda<TT>;
         ((__parsec_chore_t *)self.incarnations)[0].hook = &detail::hook_cuda<TT>;
         ((__parsec_chore_t *)self.incarnations)[1].type = PARSEC_DEV_NONE;
@@ -4034,7 +4297,7 @@ namespace ttg_parsec {
         ((__parsec_chore_t *)self.incarnations)[1].hook = NULL;
       } else if constexpr (derived_has_hip_op()) {
         self.incarnations = (__parsec_chore_t *)malloc(3 * sizeof(__parsec_chore_t));
-        ((__parsec_chore_t *)self.incarnations)[0].type = PARSEC_DEV_HIP;
+        ((__parsec_chore_t *)self.incarnations)[0].type = PARSEC_DEV_HIP | TTG_PARSEC_BATCH_CHORE_BIT;
         ((__parsec_chore_t *)self.incarnations)[0].evaluate = &detail::evaluate_hip<TT>;
         ((__parsec_chore_t *)self.incarnations)[0].hook = &detail::hook_hip<TT>;
 
@@ -4044,7 +4307,7 @@ namespace ttg_parsec {
 #if defined(PARSEC_HAVE_DEV_LEVEL_ZERO_SUPPORT)
       } else if constexpr (derived_has_level_zero_op()) {
         self.incarnations = (__parsec_chore_t *)malloc(3 * sizeof(__parsec_chore_t));
-        ((__parsec_chore_t *)self.incarnations)[0].type = PARSEC_DEV_LEVEL_ZERO;
+        ((__parsec_chore_t *)self.incarnations)[0].type = PARSEC_DEV_LEVEL_ZERO | TTG_PARSEC_BATCH_CHORE_BIT;
         ((__parsec_chore_t *)self.incarnations)[0].evaluate = &detail::evaluate_level_zero<TT>;
         ((__parsec_chore_t *)self.incarnations)[0].hook = &detail::hook_level_zero<TT>;
 
@@ -4480,6 +4743,36 @@ namespace ttg_parsec {
     /// device map accessor
     /// @return the device map
     auto get_devicemap() { return devicemap; }
+
+#ifdef TTG_HAVE_COROUTINE
+    /// Enable application-driven GPU kernel batching for this TT (requires a
+    /// PaRSEC built with kernel batching support; see TTG_HAVE_PARSEC_DEV_BATCH).
+    /// Device tasks may then use \sa ttg::device::coop to collect the batch of
+    /// sibling tasks the runtime forms using \c matcher and submit a single
+    /// (batched) kernel on behalf of all of them. If the linked PaRSEC lacks
+    /// batching support, or batching is disabled at runtime, this has no
+    /// effect and every task behaves as a singleton batch (as if this were
+    /// never called), so device task code does not need to special-case it.
+    /// @arg matcher returns true if \c candidate may be collected into the
+    ///      same batch as \c head; only ever called with tasks of this TT.
+    /// @arg max_batch_size upper bound on the number of tasks (including the
+    ///      head) collected into a single batch.
+    template <typename Matcher>
+    void set_batch_matcher(Matcher&& matcher, std::size_t max_batch_size) {
+      static_assert(!ttg::meta::is_void_v<keyT>, "Batching requires a non-void key type!");
+      m_batch_matcher = std::forward<Matcher>(matcher);
+      m_max_batch_size = std::max(std::size_t{1}, max_batch_size);
+    }
+
+    /// @return true if \sa set_batch_matcher was called with a matcher
+    bool batching_enabled() const {
+      if constexpr (ttg::meta::is_void_v<keyT>) {
+        return false;
+      } else {
+        return static_cast<bool>(m_batch_matcher);
+      }
+    }
+#endif  // TTG_HAVE_COROUTINE
 
     /// add a shared constraint
     /// the constraint must provide a valid override of `check_key(key)`

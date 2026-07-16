@@ -70,6 +70,9 @@ int main(int argc, char **argv)
   /* whether we set a device mapping */
   bool enable_device_map = !cmdOptionExists(argv, argv+argc, "--default-device-map");
 
+  /* whether to batch GEMM kernel submissions (see make_gemm_batched) */
+  bool enable_gemm_batching = cmdOptionExists(argv, argv+argc, "--gemm-batching");
+
   // TODO: need to filter out our arguments to make parsec happy
   ttg::initialize(1, argv, nthreads);
 
@@ -136,7 +139,7 @@ int main(int argc, char **argv)
       ttg::Edge<Key2, MatrixTile<double>> result("To result");
 
       auto potrf_init_tt = make_load_tt(A, startup, cow_hint);
-      auto potrf_ttg = potrf::make_potrf_ttg(A, startup, result, cow_hint, enable_device_map);
+      auto potrf_ttg = potrf::make_potrf_ttg(A, startup, result, cow_hint, enable_device_map, enable_gemm_batching);
       auto potrf_result_ttg = make_result_ttg(A, result, cow_hint);
 
       auto connected = make_graph_executable(potrf_init_tt.get());
@@ -184,7 +187,7 @@ int main(int argc, char **argv)
     ttg::Edge<Key2, MatrixTile<double>> toresult("To Result");
 
     auto init_tt = make_load_tt(A, topotrf, cow_hint);
-    auto potrf_ttg = potrf::make_potrf_ttg(A, topotrf, toresult, cow_hint);
+    auto potrf_ttg = potrf::make_potrf_ttg(A, topotrf, toresult, cow_hint, enable_device_map, enable_gemm_batching);
     auto result2_ttg = make_result_ttg(A, toresult, cow_hint);
 
     bool connected = make_graph_executable(init_tt.get());
