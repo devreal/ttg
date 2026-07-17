@@ -3800,7 +3800,11 @@ namespace ttg_parsec {
           while (flowidx < MAX_PARAM_COUNT &&
                 gpu_task->flow[flowidx] != nullptr) {
             if (gpu_task->flow[flowidx]->flow_flags == PARSEC_FLOW_ACCESS_NONE) {
-              empty_flowidx = flowidx;
+              if (empty_flowidx == -1) {
+                empty_flowidx = flowidx;
+              }
+              flowidx++;
+              continue;
             }
             if (detail::parsec_ttg_caller->parsec_task.data[flowidx].data_in->original == data) {
               /* found the right data, set the corresponding flow as pushout */
@@ -3808,13 +3812,14 @@ namespace ttg_parsec {
             }
             ++flowidx;
           }
-          if (flowidx == MAX_PARAM_COUNT && empty_flowidx == -1) {
-            throw std::runtime_error("Cannot add more than MAX_PARAM_COUNT flows to a task!");
-          } else if (empty_flowidx != -1) {
-            /* we found an empty flow, use it */
-            empty_flowidx = flowidx;
+          if (flowidx == MAX_PARAM_COUNT) {
+            if (empty_flowidx == -1) {
+              throw std::runtime_error("Cannot add more than MAX_PARAM_COUNT flows to a task!");
+            } else {
+              /* we found an empty flow, use it */
+              flowidx = empty_flowidx;
+            }
           }
-          flowidx = (empty_flowidx != -1) ? empty_flowidx : flowidx;
           if (gpu_task->flow[flowidx]->flow_flags == PARSEC_FLOW_ACCESS_NONE) {
             /* no flow found, add one and mark it pushout */
             detail::parsec_ttg_caller->parsec_task.data[flowidx].data_in = data->device_copies[0];
