@@ -1609,7 +1609,20 @@ namespace ttg_parsec {
       // get the promise which contains the views
       auto dev_data = dev_task.promise();
 
-      if (dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT) {
+
+      auto is_singleton = [](parsec_gpu_task_t *task)
+      {
+        parsec_list_item_t *item = &task->list_item;
+        return (item->list_next == item) && (item->list_prev == item);
+      };
+
+
+      /**
+       * NOTE: we can only take this short-cut if the device is a singleton, i.e., it
+       *       is not the leader of a ring. If it is, we have to make sure we account
+       *       for all other tasks in the ring.
+       */
+      if (dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT && is_singleton(gpu_task)) {
         /* The device task is sending out already but we go through the device scheduler
          * for a pushout. We just report this task done, no callbacks to invoke. */
         return PARSEC_HOOK_RETURN_DONE;
@@ -1617,7 +1630,8 @@ namespace ttg_parsec {
 
       /* we're waiting for the initial transfers or for the kernel to complete */
       assert(dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER ||
-             dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL);
+             dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL ||
+             dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT);
 
       /* Never batch a task re-entering purely to resolve a pending kernel wait;
        * only tasks fresh off their select() (WAIT_TRANSFER) can become a batch head. */
@@ -1734,6 +1748,11 @@ namespace ttg_parsec {
         do {
           if (member_state(cur) == ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL) {
             resume_member(cur);
+            if (member_state(cur) == ttg::device::detail::TTG_DEVICE_CORO_WAIT_BATCH) {
+              throw std::runtime_error("Repeated coop() calls are not allowed.");
+            }
+            assert(member_state(cur) == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT ||
+                   member_state(cur) == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE);
           }
           cur = (parsec_gpu_task_t *)cur->list_item.list_next;
         } while (cur != ring_head);
