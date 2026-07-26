@@ -93,10 +93,13 @@ namespace potrf {
    * Small round-robin pool of pinned host / device pointer-array triples used
    * to build a single cublasDgemmBatched/hipblasDgemmBatched call from the
    * ttg::device::batch collected via ttg::device::coop (see make_gemm_batched
-   * below). `num_slots` is sized generously so that an in-flight batch -- in
-   * practice bounded by the number of concurrent device streams -- does not
-   * reuse a slot before its batched kernel has completed. This is
-   * illustrative example code, not a general-purpose device allocator.
+   * below). A larger `num_slots` reduces contention (how often acquire()
+   * blocks, see below), but correctness does not depend on sizing it to
+   * exceed the number of concurrent in-flight batches: acquire()/release()
+   * use a per-slot event to block a new leader until the previous occupant's
+   * batched kernel/copies have actually completed, so a slot is never reused
+   * while still in flight. This is illustrative example code, not a
+   * general-purpose device allocator.
    * Works (as a degenerate size-1 batch) even if the linked PaRSEC lacks
    * kernel-batching support; no TTG_HAVE_PARSEC_DEV_BATCH guard is needed.
    */
@@ -115,6 +118,7 @@ namespace potrf {
         cudaMalloc(&s.devA, max_batch_size * sizeof(const T *));
         cudaMalloc(&s.devB, max_batch_size * sizeof(const T *));
         cudaMalloc(&s.devC, max_batch_size * sizeof(T *));
+        cudaEventCreateWithFlags(&s.ready, cudaEventDisableTiming);
 #elif defined(TTG_ENABLE_HIP)
         hipHostRegister(s.hostA.data(), max_batch_size * sizeof(const T *), hipHostRegisterDefault);
         hipHostRegister(s.hostB.data(), max_batch_size * sizeof(const T *), hipHostRegisterDefault);
@@ -122,6 +126,7 @@ namespace potrf {
         hipMalloc(&s.devA, max_batch_size * sizeof(const T *));
         hipMalloc(&s.devB, max_batch_size * sizeof(const T *));
         hipMalloc(&s.devC, max_batch_size * sizeof(T *));
+        hipEventCreateWithFlags(&s.ready, hipEventDisableTiming);
 #endif
       }
     }
@@ -135,6 +140,7 @@ namespace potrf {
         cudaFree(s.devA);
         cudaFree(s.devB);
         cudaFree(s.devC);
+        cudaEventDestroy(s.ready);
 #elif defined(TTG_ENABLE_HIP)
         hipHostUnregister(s.hostA.data());
         hipHostUnregister(s.hostB.data());
@@ -142,6 +148,7 @@ namespace potrf {
         hipFree(s.devA);
         hipFree(s.devB);
         hipFree(s.devC);
+        hipEventDestroy(s.ready);
 #endif
       }
     }
@@ -152,15 +159,55 @@ namespace potrf {
       const T **devA = nullptr;
       const T **devB = nullptr;
       T **devC = nullptr;
+#if defined(TTG_ENABLE_CUDA)
+      cudaEvent_t ready = nullptr;
+#elif defined(TTG_ENABLE_HIP)
+      hipEvent_t ready = nullptr;
+#endif
+      // whether `ready` was ever recorded (i.e. this slot has a prior
+      // occupant to wait for); false only before this slot's first release().
+      bool ready_pending = false;
     };
 
-    /* acquire the next slot (round-robin); the caller fills hostA/hostB/hostC
-     * (up to `count` entries) with this batch's device pointers and then
-     * copies them to devA/devB/devC (e.g. via cudaMemcpyAsync/hipMemcpyAsync
-     * on the current stream) before launching the batched kernel. */
+    /* acquire the next slot (round-robin). Blocks (host-side) until the
+     * previous occupant's batched kernel/copies -- which read this exact
+     * slot's host/device pointer buffers -- have completed, so the caller
+     * can safely overwrite hostA/hostB/hostC without racing an in-flight
+     * H2D copy of the old contents. This host-side wait, not just device-
+     * stream ordering, is required because the race is the CPU overwriting
+     * pinned host memory while the GPU DMA engine may still be reading it;
+     * ordering only the *device*-side work (e.g. cudaStreamWaitEvent) would
+     * not protect the CPU write. The caller fills hostA/hostB/hostC (up to
+     * `count` entries) with this batch's device pointers, copies them to
+     * devA/devB/devC (e.g. via cudaMemcpyAsync/hipMemcpyAsync on the current
+     * stream), launches the batched kernel, and must call release() with
+     * that same stream so the next acquire() of this slot knows what to
+     * wait for. */
     slot_t &acquire() {
       std::size_t idx = next.fetch_add(1, std::memory_order_relaxed) % slots.size();
-      return slots[idx];
+      auto &slot = slots[idx];
+      if (slot.ready_pending) {
+#if defined(TTG_ENABLE_CUDA)
+        cudaEventSynchronize(slot.ready);
+#elif defined(TTG_ENABLE_HIP)
+        hipEventSynchronize(slot.ready);
+#endif
+      }
+      return slot;
+    }
+
+    /* mark `slot` as in-use until every operation enqueued on `stream` so far
+     * (in particular, the H2D copies and the batched kernel reading it) has
+     * completed; must be called by the leader right after those are
+     * enqueued, before the slot can be safely acquire()'d again. */
+    template <typename Stream>
+    void release(slot_t &slot, Stream stream) {
+#if defined(TTG_ENABLE_CUDA)
+      cudaEventRecord(slot.ready, stream);
+#elif defined(TTG_ENABLE_HIP)
+      hipEventRecord(slot.ready, stream);
+#endif
+      slot.ready_pending = true;
     }
 
     std::size_t max_batch_size;
@@ -777,6 +824,7 @@ namespace potrf {
         cublasDgemmBatched(cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_T, mb, nnb, kb, &alpha,
                            slot.devA, tile_mk.lda(), slot.devB, tile_nk.lda(), &beta,
                            slot.devC, tile_mn.lda(), (int)nb);
+        ptr_pool->release(slot, ttg::device::current_stream());
 #elif defined(TTG_ENABLE_HIP)
         hipMemcpyAsync(slot.devA, slot.hostA.data(), nb * sizeof(const T *), hipMemcpyHostToDevice,
                        ttg::device::current_stream());
@@ -787,6 +835,7 @@ namespace potrf {
         hipblasDgemmBatched(hipblas_handle(), HIPBLAS_OP_N, HIPBLAS_OP_T, mb, nnb, kb, &alpha,
                             slot.devA, tile_mk.lda(), slot.devB, tile_nk.lda(), &beta,
                             slot.devC, tile_mn.lda(), (int)nb);
+        ptr_pool->release(slot, ttg::device::current_stream());
 #endif
       }
       // followers: the leader's batched call already covers our output tile.
@@ -810,12 +859,24 @@ namespace potrf {
                             ttg::edges(output_trsm, output_gemm), "GEMM", {"input_mk", "input_kn", "input_mn/dispatcher"},
                             {"output_trsm", "outout_gemm"});
     // cublasDgemmBatched/hipblasDgemmBatched require identical (m,n,k) and
-    // leading dimensions across the whole batch; tiles sharing the same K
-    // column in this tiling always have matching geometry, so that is a
-    // sufficient compatibility test. Unconditionally safe to call: it is a
-    // no-op unless the linked PaRSEC actually supports kernel batching.
+    // leading dimensions across the whole batch. Sharing the same K only
+    // guarantees a common k (tile_nk.cols(), fixed by the K-th column tile);
+    // M and N range independently over all tile indices > K, and the last
+    // row tile of the matrix is smaller than the nominal tile size whenever
+    // A.rows_in_matrix() is not an exact multiple of A.rows_in_tile(), so two
+    // same-K candidates can still disagree on tile_mk.rows()/tile_nk.rows().
+    // Compare the actual (boundary-aware) tile row-counts for M and N too --
+    // a constant-time index computation, no data access needed.
+    auto tile_rows_at = [rows = A.rows(), tile_rows = A.rows_in_tile(), m = A.rows_in_matrix()](std::size_t idx) {
+      return (idx < rows - 1) ? tile_rows : m - idx * tile_rows;
+    };
+    // Unconditionally safe to call: it is a no-op unless the linked PaRSEC
+    // actually supports kernel batching.
     tt_gemm->set_batch_matcher(
-        [](const Key3& head, const Key3& cand) { return head[2] == cand[2]; },
+        [tile_rows_at](const Key3& head, const Key3& cand) {
+          return head[2] == cand[2] && tile_rows_at(head[0]) == tile_rows_at(cand[0]) &&
+                 tile_rows_at(head[1]) == tile_rows_at(cand[1]);
+        },
         max_batch_size);
     return tt_gemm;
   }
