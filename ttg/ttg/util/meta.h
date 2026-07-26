@@ -953,6 +953,89 @@ namespace ttg {
     template <class F, class... ArgTypes>
     using invoke_result_typelist_t = typename invoke_result_typelist<F, ArgTypes...>::type;
 
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    // remove any wrapper from a type, specializations provided where the wrapper is implemented (e.g., Aggregator)
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    template <typename T>
+    struct remove_wrapper {
+      using type = T;
+    };
+
+    // NOTE: does NOT decay T -- only unwraps types with a remove_wrapper specialization (e.g. Aggregator<T>,
+    // possibly const-qualified); anything else (including const-qualified plain types) passes through unchanged
+    // so as to not disturb const-ness relied upon elsewhere (e.g. detecting readonly reducer/plain inputs).
+    template <typename T>
+    using remove_wrapper_t = typename remove_wrapper<T>::type;
+
+    template <typename T>
+    struct remove_wrapper_tuple;
+
+    template <typename... Ts>
+    struct remove_wrapper_tuple<std::tuple<Ts...>> {
+      using type = std::tuple<remove_wrapper_t<Ts>...>;
+    };
+
+    template <typename T>
+    using remove_wrapper_tuple_t = typename remove_wrapper_tuple<T>::type;
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    // type of an aggregator factory (returned by Edge::aggregator_factory()), with an empty default for plain edges
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    template <typename EdgeT, typename Enabler = void>
+    struct edge_has_aggregator_factory : std::false_type {};
+
+    template <typename EdgeT>
+    struct edge_has_aggregator_factory<
+        EdgeT, std::void_t<decltype(std::declval<EdgeT>().aggregator_factory())>> : std::true_type {};
+
+    template <typename T>
+    constexpr bool edge_has_aggregator_factory_v = edge_has_aggregator_factory<T>::value;
+
+    template <typename EdgeT, bool HasAggregatorFactory>
+    struct aggregator_factory {
+      using type = std::byte;
+    };
+
+    template <typename EdgeT>
+    struct aggregator_factory<EdgeT, true> {
+      using type = decltype(std::declval<EdgeT>().aggregator_factory());
+    };
+
+    template <typename EdgeT>
+    using aggregator_factory_t = typename aggregator_factory<EdgeT, edge_has_aggregator_factory_v<EdgeT>>::type;
+
+    template <typename T>
+    struct aggregator_factory_tuple_type;
+
+    template <typename... EdgeTs>
+    struct aggregator_factory_tuple_type<std::tuple<EdgeTs...>> {
+      using type = std::tuple<aggregator_factory_t<EdgeTs>...>;
+    };
+
+    template <typename T>
+    using aggregator_factory_tuple_type_t = typename aggregator_factory_tuple_type<T>::type;
+
+    namespace detail {
+      template <typename EdgeT>
+      auto make_aggregator_factory(const EdgeT &edge) {
+        if constexpr (edge_has_aggregator_factory_v<EdgeT>) {
+          return edge.aggregator_factory();
+        } else {
+          return std::byte();
+        }
+      }
+
+      template <typename... EdgesT, std::size_t... Is>
+      auto make_aggregator_factory_tuple(const std::tuple<EdgesT...> &edges, std::index_sequence<Is...>) {
+        return std::make_tuple(make_aggregator_factory(std::get<Is>(edges))...);
+      }
+    }  // namespace detail
+
+    template <typename... EdgesT>
+    auto make_aggregator_factory_tuple(const std::tuple<EdgesT...> &edges) {
+      return detail::make_aggregator_factory_tuple(edges, std::make_index_sequence<sizeof...(EdgesT)>());
+    }
+
   }  // namespace meta
 }  // namespace ttg
 

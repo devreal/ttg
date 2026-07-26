@@ -42,6 +42,7 @@
 #include "ttg/serialization/data_descriptor.h"
 
 #include "ttg/parsec/fwd.h"
+#include "ttg/aggregator.h"
 
 #include "ttg/parsec/buffer.h"
 #include "ttg/parsec/devicescratch.h"
@@ -1290,8 +1291,12 @@ namespace ttg_parsec {
     static_assert(ttg::meta::is_typelist_v<input_valueTs>,
                   "The fourth template for ttg::TT must be a ttg::typelist containing the input types");
     // create a virtual control input if the input list is empty, to be used in invoke()
-    using actual_input_tuple_type = std::conditional_t<!ttg::meta::typelist_is_empty_v<input_valueTs>,
-                                                       ttg::meta::typelist_to_tuple_t<input_valueTs>, std::tuple<void>>;
+    // input types are unwrapped here (e.g. Aggregator<T> -> T) so that reducers/streams operate on the
+    // underlying per-value type; input_tuple_type (below) retains the wrapped type for the op() signature
+    using actual_input_tuple_type =
+        std::conditional_t<!ttg::meta::typelist_is_empty_v<input_valueTs>,
+                            ttg::meta::remove_wrapper_tuple_t<ttg::meta::typelist_to_tuple_t<input_valueTs>>,
+                            std::tuple<void>>;
     using input_tuple_type = ttg::meta::typelist_to_tuple_t<input_valueTs>;
     static_assert(ttg::meta::is_tuple_v<output_terminalsT>,
                   "Second template argument for ttg::TT must be std::tuple containing the output terminal types");
@@ -1353,6 +1358,7 @@ namespace ttg_parsec {
     using input_terminals_type = ttg::detail::input_terminals_tuple_t<keyT, input_tuple_type>;
     using input_args_type = actual_input_tuple_type;
     using input_edges_type = ttg::detail::edges_tuple_t<keyT, ttg::meta::decayed_typelist_t<input_tuple_type>>;
+    using aggregator_factory_tuple_type = ttg::meta::aggregator_factory_tuple_type_t<input_edges_type>;
     // if have data inputs and (always last) control input, convert last input to Void to make logic easier
     using input_values_full_tuple_type =
         ttg::meta::void_to_Void_tuple_t<ttg::meta::decayed_typelist_t<actual_input_tuple_type>>;
@@ -1388,6 +1394,7 @@ namespace ttg_parsec {
 
     input_terminals_type input_terminals;
     output_terminalsT output_terminals;
+    aggregator_factory_tuple_type aggregator_factories;
 
    protected:
     const auto &get_output_terminals() const { return output_terminals; }
@@ -2128,6 +2135,8 @@ namespace ttg_parsec {
       using value_t = std::tuple_element_t<i, actual_input_tuple_type>;
       constexpr const bool val_is_void = ttg::meta::is_void_v<value_t>;
       constexpr const bool input_is_const = std::is_const_v<value_t>;
+      constexpr const bool is_aggregator =
+          !val_is_void && ttg::detail::is_aggregator_v<typename std::tuple_element_t<i, input_edges_type>::value_type>;
       rtask_t *rtask = (rtask_t*)parsec_task;
       task_t *parent_task = static_cast<task_t*>(rtask->parent_task);
       ttT *baseobj = parent_task->tt;
@@ -2188,9 +2197,17 @@ namespace ttg_parsec {
           source_copy = item;
           assert(target_copy->num_readers() == target_copy->mutable_tag);
           assert(source_copy->num_readers() > 0);
-          reducer(*reinterpret_cast<std::decay_t<value_t> *>(target_copy->get_ptr()),
-                  *reinterpret_cast<std::decay_t<value_t> *>(source_copy->get_ptr()));
-          detail::release_data_copy(source_copy);
+          if constexpr (is_aggregator) {
+            using aggregator_t = typename std::tuple_element_t<i, input_edges_type>::value_type;
+            aggregator_t *agg = reinterpret_cast<aggregator_t *>(target_copy->get_ptr());
+            agg->add_value(*reinterpret_cast<std::decay_t<value_t> *>(source_copy->get_ptr()), source_copy);
+            /* ownership of source_copy transfers into the aggregator; released when the
+             * aggregator itself is released (see complete_task_and_release) */
+          } else {
+            reducer(*reinterpret_cast<std::decay_t<value_t> *>(target_copy->get_ptr()),
+                    *reinterpret_cast<std::decay_t<value_t> *>(source_copy->get_ptr()));
+            detail::release_data_copy(source_copy);
+          }
         } else if constexpr(val_is_void) {
           reducer(); // invoke control reducer
         }
@@ -2689,6 +2706,22 @@ namespace ttg_parsec {
     }
 
 
+    /* Ensures inpute_reducers_taskclass[I] exists for every aggregator input, by piggy-backing on the
+     * same lazy task-class creation that set_input_reducer() performs for a real streaming reducer. */
+    template <std::size_t I, std::size_t... Is>
+    void setup_aggregator_reducer_taskclasses(std::index_sequence<I, Is...>) {
+      using edge_value_type = typename std::tuple_element_t<I, input_edges_type>::value_type;
+      if constexpr (ttg::detail::is_aggregator_v<edge_value_type>) {
+        using elem_type = typename edge_value_type::decay_value_type;
+        set_input_reducer<I>([](elem_type &, const elem_type &) {
+          ttg::abort();  // never invoked: aggregator inputs are drained by add_value, not a reducer
+        });
+      }
+      if constexpr (sizeof...(Is) > 0) {
+        setup_aggregator_reducer_taskclasses(std::index_sequence<Is...>());
+      }
+    }
+
     template <std::size_t i>
     detail::reducer_task_t *create_new_reducer_task(task_t *task, bool is_first) {
       /* make sure we can reuse the existing memory pool and don't have to create a new one */
@@ -2736,6 +2769,11 @@ namespace ttg_parsec {
       task_t *task;
       auto &world_impl = world.impl();
       auto &reducer = std::get<i>(input_reducers);
+      auto is_aggregator_check = [&]() {
+        if constexpr (valueT_is_Void) return false;
+        else return ttg::detail::is_aggregator_v<typename std::tuple_element_t<i, input_edges_type>::value_type>;
+      };
+      constexpr bool is_aggregator = is_aggregator_check();
       bool release = false;
       bool remove_from_hash = true;
 #if defined(PARSEC_PROF_GRAPHER)
@@ -2743,8 +2781,8 @@ namespace ttg_parsec {
 #endif
       bool get_pull_data = false;
       bool has_lock = false;
-      /* If we have only one input and no reducer on that input we can skip the hash table */
-      if (numins > 1 || reducer) {
+      /* If we have only one input and no reducer/aggregator on that input we can skip the hash table */
+      if (numins > 1 || reducer || is_aggregator) {
         has_lock = true;
         parsec_hash_table_lock_bucket(&tasks_table, hk);
         if (nullptr == (task = (task_t *)parsec_hash_table_nolock_find(&tasks_table, hk))) {
@@ -2758,13 +2796,13 @@ namespace ttg_parsec {
                                      key_hash(make_key(task->parsec_task.taskpool, task->parsec_task.locals), nullptr));
 #endif
           }
-        } else if (!reducer && numins == (task->in_data_count + 1)) {
+        } else if (!reducer && !is_aggregator && numins == (task->in_data_count + 1)) {
           /* remove while we have the lock */
           parsec_hash_table_nolock_remove(&tasks_table, hk);
           remove_from_hash = false;
         }
-        /* if we have a reducer, we need to hold on to the lock for just a little longer */
-        if (!reducer) {
+        /* if we have a reducer/aggregator, we need to hold on to the lock for just a little longer */
+        if (!reducer && !is_aggregator) {
           parsec_hash_table_unlock_bucket(&tasks_table, hk);
           has_lock = false;
         }
@@ -2819,7 +2857,43 @@ namespace ttg_parsec {
         return copy;
       };
 
-      if (reducer && 1 != task->streams[i].goal) {  // is this a streaming input? reduce the received value
+      if constexpr (is_aggregator) {
+        // aggregating input: accumulate the received value into this key's Aggregator, firing once
+        // the (possibly per-key) target size is reached. Reuses the same lock-free single-consumer
+        // drain (reduce_copies/reducer_task_t) as a plain streaming reducer -- see static_reducer_op.
+        using aggregator_t = typename std::tuple_element_t<i, input_edges_type>::value_type;
+        if constexpr (!valueT_is_Void) {
+          if (nullptr == task->copies[i]) {
+            /* first value for this key: create the aggregator and fix its target size */
+            auto &factory = std::get<i>(aggregator_factories);
+            aggregator_t agg = factory(key);
+            std::size_t target = agg.target();
+            detail::ttg_data_copy_t *agg_copy = detail::create_new_datacopy(std::move(agg));
+            agg_copy->mark_mutable();
+            task->copies[i] = agg_copy;
+            task->streams[i].goal = target;
+            task->streams[i].size = 0;
+            task->streams[i].reduce_count.store(0, std::memory_order_relaxed);
+          }
+          /* unlock the bucket, not needed anymore -- the queue + atomic counter below take over */
+          parsec_hash_table_unlock_bucket(&tasks_table, hk);
+
+          /* aggregated values are always read-only */
+          detail::ttg_data_copy_t *val_copy = get_copy_fn(task, std::forward<Value>(value), /* is_const = */ true);
+          {
+            std::lock_guard<std::mutex> lock(task->streams[i].reduce_copies_lock);
+            task->streams[i].reduce_copies.push_back(val_copy);
+          }
+          std::size_t c = task->streams[i].reduce_count.fetch_add(1, std::memory_order_acquire);
+          if (0 == c) {
+            /* we are responsible for creating the drain task */
+            detail::reducer_task_t *agg_task = create_new_reducer_task<i>(task, false);
+            agg_task->release_task(agg_task);
+          }
+        } else {
+          parsec_hash_table_unlock_bucket(&tasks_table, hk);
+        }
+      } else if (reducer && 1 != task->streams[i].goal) {  // is this a streaming input? reduce the received value
         auto submit_reducer_task = [&](auto *parent_task){
           /* check if we need to create a task */
           std::size_t c = parent_task->streams[i].reduce_count.fetch_add(1, std::memory_order_acquire);
@@ -4187,6 +4261,28 @@ namespace ttg_parsec {
 
     parsec_key_fn_t tasks_hash_fcts = {key_equal, key_print, key_hash};
 
+    /* Releases the individual value copies collected inside any aggregator inputs of this task.
+     * Must run before the generic copy-release loop below releases the aggregators' own copies. */
+    template <std::size_t I, std::size_t... Is>
+    static void release_aggregator_contents(task_t *task, std::index_sequence<I, Is...>) {
+      using edge_value_type = typename std::tuple_element_t<I, input_edges_type>::value_type;
+      if constexpr (ttg::detail::is_aggregator_v<edge_value_type>) {
+        detail::ttg_data_copy_t *copy = task->copies[I];
+        if (nullptr != copy) {
+          auto *agg = reinterpret_cast<edge_value_type *>(copy->get_ptr());
+          for (auto &&elem : agg->data()) {
+            auto *elem_copy = reinterpret_cast<detail::ttg_data_copy_t *>(elem.ptr);
+            if (nullptr != elem_copy) {
+              detail::release_data_copy(elem_copy);
+            }
+          }
+        }
+      }
+      if constexpr (sizeof...(Is) > 0) {
+        release_aggregator_contents(task, std::index_sequence<Is...>());
+      }
+    }
+
     static parsec_hook_return_t complete_task_and_release(parsec_execution_stream_t *es, parsec_task_t *parsec_task) {
 
       //std::cout << "complete_task_and_release: task " << parsec_task << std::endl;
@@ -4226,6 +4322,11 @@ namespace ttg_parsec {
       }
 #endif // TTG_HAVE_COROUTINE
 
+      /* release the contents of any aggregator inputs before releasing the aggregators themselves below */
+      if constexpr (numinedges > 0) {
+        release_aggregator_contents(task, std::make_index_sequence<numinedges>{});
+      }
+
       /* release our data copies */
       for (int i = 0; i < task->data_count; i++) {
         detail::ttg_data_copy_t *copy = task->copies[i];
@@ -4247,7 +4348,8 @@ namespace ttg_parsec {
    public:
     template <typename keymapT = ttg::detail::default_keymap<keyT>,
               typename priomapT = ttg::detail::default_priomap<keyT>>
-    TT(const std::string &name, const std::vector<std::string> &innames, const std::vector<std::string> &outnames,
+    TT(const input_edges_type &inedges,
+       const std::string &name, const std::vector<std::string> &innames, const std::vector<std::string> &outnames,
        ttg::World world, keymapT &&keymap_ = keymapT(), priomapT &&priomap_ = priomapT())
         : ttg::TTBase(name, numinedges, numouts)
         , world(world)
@@ -4255,7 +4357,8 @@ namespace ttg_parsec {
         , keymap(std::is_same<keymapT, ttg::detail::default_keymap<keyT>>::value
                      ? decltype(keymap)(ttg::detail::default_keymap<keyT>(world))
                      : decltype(keymap)(std::forward<keymapT>(keymap_)))
-        , priomap(decltype(keymap)(std::forward<priomapT>(priomap_))) {
+        , priomap(decltype(keymap)(std::forward<priomapT>(priomap_)))
+        , aggregator_factories(ttg::meta::make_aggregator_factory_tuple(inedges)) {
       // Cannot call these in base constructor since terminals not yet constructed
       if (innames.size() != numinedges) throw std::logic_error("ttg_parsec::TT: #input names != #input terminals");
       if (outnames.size() != numouts) throw std::logic_error("ttg_parsec::TT: #output names != #output terminals");
@@ -4398,21 +4501,28 @@ namespace ttg_parsec {
 
       parsec_hash_table_init(&task_constraint_table, offsetof(detail::parsec_ttg_task_base_t, tt_ht_item), 8, tasks_hash_fcts,
                              NULL);
+
+      /* aggregator inputs drain through the same task class as a streaming reducer input (see
+       * create_new_reducer_task/static_reducer_op); make sure that task class exists even though
+       * the user never calls set_input_reducer for an aggregator input. */
+      if constexpr (numinedges > 0) {
+        setup_aggregator_reducer_taskclasses(std::make_index_sequence<numinedges>{});
+      }
     }
 
     template <typename keymapT = ttg::detail::default_keymap<keyT>,
               typename priomapT = ttg::detail::default_priomap<keyT>>
     TT(const std::string &name, const std::vector<std::string> &innames, const std::vector<std::string> &outnames,
        keymapT &&keymap = keymapT(ttg::default_execution_context()), priomapT &&priomap = priomapT())
-        : TT(name, innames, outnames, ttg::default_execution_context(), std::forward<keymapT>(keymap),
-             std::forward<priomapT>(priomap)) {}
+        : TT(input_edges_type(), name, innames, outnames, ttg::default_execution_context(),
+             std::forward<keymapT>(keymap), std::forward<priomapT>(priomap)) {}
 
     template <typename keymapT = ttg::detail::default_keymap<keyT>,
               typename priomapT = ttg::detail::default_priomap<keyT>>
     TT(const input_edges_type &inedges, const output_edges_type &outedges, const std::string &name,
        const std::vector<std::string> &innames, const std::vector<std::string> &outnames, ttg::World world,
        keymapT &&keymap_ = keymapT(), priomapT &&priomap = priomapT())
-        : TT(name, innames, outnames, world, std::forward<keymapT>(keymap_), std::forward<priomapT>(priomap)) {
+        : TT(inedges, name, innames, outnames, world, std::forward<keymapT>(keymap_), std::forward<priomapT>(priomap)) {
       connect_my_inputs_to_incoming_edge_outputs(std::make_index_sequence<numinedges>{}, inedges);
       connect_my_outputs_to_outgoing_edge_inputs(std::make_index_sequence<numouts>{}, outedges);
       //DO NOT MOVE THIS - information about the number of pull terminals is only available after connecting the edges.
