@@ -8,7 +8,8 @@ set(ut_src
         sizeclass_pool.cc
         tt.cc
         unit_main.cpp
-		streams.cc
+        streams.cc
+        aggregator.cc
     )
 set(ut_libs Catch2::Catch2)
 
