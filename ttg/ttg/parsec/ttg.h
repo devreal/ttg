@@ -479,6 +479,10 @@ namespace ttg_parsec {
     const ttg::Edge<> &ctl_edge() const { return m_ctl_edge; }
 
     void increment_created() { taskpool()->tdm.module->taskpool_addto_nb_tasks(taskpool(), 1); }
+    /* counterpart to increment_created(), for tasks that were counted as created but, unlike normal tasks,
+     * never go through the scheduler/execute/complete pipeline that would otherwise account for them
+     * (e.g. the bookkeeping "parent" task of a chunked aggregator input, torn down manually) */
+    void decrement_created() { taskpool()->tdm.module->taskpool_addto_nb_tasks(taskpool(), -1); }
 
     void increment_inflight_msg() { taskpool()->tdm.module->taskpool_addto_runtime_actions(taskpool(), 1); }
     void decrement_inflight_msg() { taskpool()->tdm.module->taskpool_addto_runtime_actions(taskpool(), -1); }
@@ -1359,6 +1363,39 @@ namespace ttg_parsec {
     using input_args_type = actual_input_tuple_type;
     using input_edges_type = ttg::detail::edges_tuple_t<keyT, ttg::meta::decayed_typelist_t<input_tuple_type>>;
     using aggregator_factory_tuple_type = ttg::meta::aggregator_factory_tuple_type_t<input_edges_type>;
+
+    template <std::size_t... Is>
+    static constexpr int count_aggregator_inputs(std::index_sequence<Is...>) {
+      return (int(ttg::detail::is_aggregator_v<typename std::tuple_element_t<Is, input_edges_type>::value_type>) +
+              ... + 0);
+    }
+    static constexpr int num_aggregator_inputs_v =
+        count_aggregator_inputs(std::make_index_sequence<std::tuple_size_v<input_edges_type>>{});
+    // coordinating chunk boundaries across more than one independently-chunking aggregator input would
+    // require synchronizing their forks with each other; not supported.
+    static_assert(num_aggregator_inputs_v <= 1, "ttg::TT: at most one aggregating input is supported per TT");
+
+    template <std::size_t... Is>
+    static constexpr int find_aggregator_input_index(std::index_sequence<Is...>) {
+      int idx = -1;
+      ((ttg::detail::is_aggregator_v<typename std::tuple_element_t<Is, input_edges_type>::value_type>
+            ? (idx = static_cast<int>(Is))
+            : 0),
+       ...);
+      return idx;
+    }
+    // -1 if this TT has no aggregating input
+    static constexpr int aggregator_input_index_v =
+        find_aggregator_input_index(std::make_index_sequence<std::tuple_size_v<input_edges_type>>{});
+    // v1 restriction: a chunked/capped-batch aggregator input fires its consumer task more than once per
+    // key, forking off a fresh task_t per batch. Coordinating that with other ("shared") inputs on the same
+    // TT -- which would need to be visible to every such firing -- is intentionally out of scope: compose
+    // instead, e.g. by having the aggregator-consuming TT emit a partial result per chunk (using
+    // Aggregator::is_final() to know when it's processing the last one) into a separate, ordinary reducer
+    // that combines them; see tests/unit/aggregator.cc.
+    static_assert(num_aggregator_inputs_v == 0 || numins == 1,
+                  "ttg::TT: a TT with an aggregating input may not have any other data inputs");
+
     // if have data inputs and (always last) control input, convert last input to Void to make logic easier
     using input_values_full_tuple_type =
         ttg::meta::void_to_Void_tuple_t<ttg::meta::decayed_typelist_t<actual_input_tuple_type>>;
@@ -1395,6 +1432,7 @@ namespace ttg_parsec {
     input_terminals_type input_terminals;
     output_terminalsT output_terminals;
     aggregator_factory_tuple_type aggregator_factories;
+    std::array<std::size_t, numinedges> aggregator_chunk_sizes;
 
    protected:
     const auto &get_output_terminals() const { return output_terminals; }
@@ -2133,10 +2171,10 @@ namespace ttg_parsec {
     static parsec_hook_return_t static_reducer_op(parsec_execution_stream_s *es, parsec_task_t *parsec_task) {
       using rtask_t = detail::reducer_task_t;
       using value_t = std::tuple_element_t<i, actual_input_tuple_type>;
+      using edge_value_t = typename std::tuple_element_t<i, input_edges_type>::value_type;
       constexpr const bool val_is_void = ttg::meta::is_void_v<value_t>;
       constexpr const bool input_is_const = std::is_const_v<value_t>;
-      constexpr const bool is_aggregator =
-          !val_is_void && ttg::detail::is_aggregator_v<typename std::tuple_element_t<i, input_edges_type>::value_type>;
+      constexpr const bool is_aggregator = !val_is_void && ttg::detail::is_aggregator_v<edge_value_t>;
       rtask_t *rtask = (rtask_t*)parsec_task;
       task_t *parent_task = static_cast<task_t*>(rtask->parent_task);
       ttT *baseobj = parent_task->tt;
@@ -2198,8 +2236,7 @@ namespace ttg_parsec {
           assert(target_copy->num_readers() == target_copy->mutable_tag);
           assert(source_copy->num_readers() > 0);
           if constexpr (is_aggregator) {
-            using aggregator_t = typename std::tuple_element_t<i, input_edges_type>::value_type;
-            aggregator_t *agg = reinterpret_cast<aggregator_t *>(target_copy->get_ptr());
+            edge_value_t *agg = reinterpret_cast<edge_value_t *>(target_copy->get_ptr());
             agg->add_value(*reinterpret_cast<std::decay_t<value_t> *>(source_copy->get_ptr()), source_copy);
             /* ownership of source_copy transfers into the aggregator; released when the
              * aggregator itself is released (see complete_task_and_release) */
@@ -2214,6 +2251,20 @@ namespace ttg_parsec {
         // there is only one task working on this stream, so no need to be atomic here
         size = ++parent_task->streams[i].size;
         //std::cout << "static_reducer_op size " << size << " of " << parent_task->streams[i].goal << std::endl;
+        if constexpr (is_aggregator) {
+          /* capped-batch aggregator: fork off every full chunk as soon as it completes, so the consumer
+           * fires repeatedly instead of only once at the end (the final, possibly partial, chunk is
+           * handled after the loop below, once we know no further values are pending) */
+          std::size_t goal = parent_task->streams[i].goal;
+          std::size_t chunk_size = obj->aggregator_chunk_sizes[i];
+          bool chunked = (chunk_size != edge_value_t::undef_target) && (chunk_size < goal);
+          if (chunked && size < goal && (size % chunk_size) == 0) {
+            std::size_t next_cap = std::min(chunk_size, goal - size);
+            obj->template fork_aggregator_chunk<i>(parent_task, false, next_cap);
+            /* parent_task->copies[i] now points at a freshly created aggregator; refresh our cached pointer */
+            target_copy = parent_task->copies[i];
+          }
+        }
       } while ((c = (parent_task->streams[i].reduce_count.fetch_sub(1, std::memory_order_acq_rel)-1)) > 0);
       //} while ((c = (--task->streams[i].reduce_count)) > 0);
 
@@ -2227,21 +2278,42 @@ namespace ttg_parsec {
         ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : ", parent_task->key, ": size ", size, " of ", parent_task->streams[i].goal, " complete ", complete, " c ", c);
       else
         ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : size ", size, " of ", parent_task->streams[i].goal, " complete ", complete, " c ", c);
+      // capture whatever is needed for tracing below *before* a final chunked fork may free parent_task
+      bool tracing = obj->tracing();
+      [[maybe_unused]] std::conditional_t<!ttg::meta::is_void_v<keyT>, keyT, int> saved_key{};
+      if (tracing) {
+        if constexpr (!ttg::meta::is_void_v<keyT>) saved_key = parent_task->key;
+      }
+
       if (complete && c == 0) {
-        if constexpr(input_is_const) {
-          /* make the consumer task a reader if its input is const */
-          target_copy->reset_readers();
+        bool did_final_fork = false;
+        if constexpr (is_aggregator) {
+          std::size_t chunk_size = obj->aggregator_chunk_sizes[i];
+          bool chunked = (chunk_size != edge_value_t::undef_target) && (chunk_size < parent_task->streams[i].goal);
+          if (chunked) {
+            /* fork the final (possibly partial) chunk and tear down the parent -- no more values are
+             * coming for this key, so this is safe without holding any lock. parent_task's memory may be
+             * freed by this call; do not touch parent_task again afterwards. */
+            obj->template fork_aggregator_chunk<i>(parent_task, true, 0);
+            did_final_fork = true;
+          }
         }
-        /* task may not be runnable yet because other inputs are missing, have release_task decide */
-        parent_task->remove_from_hash = true;
-        parent_task->release_task(parent_task);
+        if (!did_final_fork) {
+          if constexpr(input_is_const) {
+            /* make the consumer task a reader if its input is const */
+            target_copy->reset_readers();
+          }
+          /* task may not be runnable yet because other inputs are missing, have release_task decide */
+          parent_task->remove_from_hash = true;
+          parent_task->release_task(parent_task);
+        }
       }
 
       detail::parsec_ttg_caller = NULL;
 
-      if (obj->tracing()) {
+      if (tracing) {
         if constexpr (!ttg::meta::is_void_v<keyT>)
-          ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : ", parent_task->key, ": done executing");
+          ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : ", saved_key, ": done executing");
         else
           ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : done executing");
       }
@@ -2747,6 +2819,54 @@ namespace ttg_parsec {
       return newtask;
     }
 
+    /* Detaches the just-completed chunk of an aggregator input from parent_task and hands it to a freshly
+     * scheduled fork task_t, which runs the TT's op() body against exactly that chunk (with
+     * Aggregator::is_final() reflecting whether it's the last one). If !is_final, parent_task gets a fresh
+     * (empty) Aggregator to keep accumulating the next chunk; if is_final, parent_task is removed from the
+     * hash table and its memory is returned to the mempool (mirroring the "dummy task" pattern used
+     * elsewhere for tasks that never go through the normal PaRSEC schedule/execute/complete pipeline).
+     *
+     * Precondition: numins == 1 (enforced by a static_assert above), so there are no other ("shared")
+     * inputs to worry about sharing across forks -- the aggregator is the task's only input. A TT that
+     * needs to combine per-chunk results should send each chunk's partial result (using is_final() to know
+     * when it's the last one) to a separate, ordinary reducer instead; see tests/unit/aggregator.cc.
+     */
+    template <std::size_t i>
+    void fork_aggregator_chunk(task_t *parent_task, bool is_final, std::size_t next_chunk_cap) {
+      using aggregator_t = typename std::tuple_element_t<i, input_edges_type>::value_type;
+
+      auto atomic_copy_ref = std::atomic_ref<detail::ttg_data_copy_t*>(parent_task->copies[i]);
+      detail::ttg_data_copy_t *new_copy = nullptr;
+      if (!is_final) {
+        /* fresh aggregator for the next chunk; only used as a value collector, so a bare constructor
+         * with the (bounded) capacity hint is enough -- no need to re-derive the per-key target */
+        aggregator_t fresh_agg(next_chunk_cap);
+        new_copy = detail::create_new_datacopy(std::move(fresh_agg));
+        new_copy->mark_mutable();
+      }
+      detail::ttg_data_copy_t *chunk_copy = atomic_copy_ref.exchange(new_copy, std::memory_order_release);
+      assert(chunk_copy != nullptr);
+      reinterpret_cast<aggregator_t *>(chunk_copy->get_ptr())->set_final(is_final);
+
+      auto &world_impl = world.impl();
+      task_t *fork_task = create_new_task(parent_task->key);
+      world_impl.increment_created();
+      fork_task->copies[i] = chunk_copy;
+      /* this task never goes through the hash table; it's already fully "ready" */
+      fork_task->remove_from_hash = false;
+      release_task(fork_task);
+
+      if (is_final) {
+        parsec_execution_stream_t *es = world_impl.execution_stream();
+        parsec_hash_table_remove(&tasks_table, parent_task->pkey());
+        complete_task_and_release(es, &parent_task->parsec_task);
+        parsec_thread_mempool_free(get_task_mempool(), &parent_task->parsec_task);
+        /* parent_task was counted as "created" when first set up (the same code path used for any
+         * multi-input task), but -- unlike a normal task -- it never runs through the scheduler, so it
+         * never decrements that count on its own; balance it out here now that it's truly done. */
+        world_impl.decrement_created();
+      }
+    }
 
     // Used to set the i'th argument
     template <std::size_t i, typename Key, typename Value>
@@ -2884,7 +3004,7 @@ namespace ttg_parsec {
             std::lock_guard<std::mutex> lock(task->streams[i].reduce_copies_lock);
             task->streams[i].reduce_copies.push_back(val_copy);
           }
-          std::size_t c = task->streams[i].reduce_count.fetch_add(1, std::memory_order_acquire);
+          std::size_t c = task->streams[i].reduce_count.fetch_add(1, std::memory_order_release);
           if (0 == c) {
             /* we are responsible for creating the drain task */
             detail::reducer_task_t *agg_task = create_new_reducer_task<i>(task, false);
@@ -2896,7 +3016,7 @@ namespace ttg_parsec {
       } else if (reducer && 1 != task->streams[i].goal) {  // is this a streaming input? reduce the received value
         auto submit_reducer_task = [&](auto *parent_task){
           /* check if we need to create a task */
-          std::size_t c = parent_task->streams[i].reduce_count.fetch_add(1, std::memory_order_acquire);
+          std::size_t c = parent_task->streams[i].reduce_count.fetch_add(1, std::memory_order_release);
           //std::cout << "submit_reducer_task " << key << " c " << c << std::endl;
           if (0 == c) {
             /* we are responsible for creating the reduction task */
@@ -4342,6 +4462,7 @@ namespace ttg_parsec {
           c(task->key);
         }
       }
+
       return PARSEC_HOOK_RETURN_DONE;
     }
 
@@ -4358,7 +4479,8 @@ namespace ttg_parsec {
                      ? decltype(keymap)(ttg::detail::default_keymap<keyT>(world))
                      : decltype(keymap)(std::forward<keymapT>(keymap_)))
         , priomap(decltype(keymap)(std::forward<priomapT>(priomap_)))
-        , aggregator_factories(ttg::meta::make_aggregator_factory_tuple(inedges)) {
+        , aggregator_factories(ttg::meta::make_aggregator_factory_tuple(inedges))
+        , aggregator_chunk_sizes(ttg::meta::make_aggregator_chunk_size_array(inedges)) {
       // Cannot call these in base constructor since terminals not yet constructed
       if (innames.size() != numinedges) throw std::logic_error("ttg_parsec::TT: #input names != #input terminals");
       if (outnames.size() != numouts) throw std::logic_error("ttg_parsec::TT: #output names != #output terminals");

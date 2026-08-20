@@ -1036,6 +1036,27 @@ namespace ttg {
       return detail::make_aggregator_factory_tuple(edges, std::make_index_sequence<sizeof...(EdgesT)>());
     }
 
+    namespace detail {
+      template <typename EdgeT>
+      std::size_t make_aggregator_chunk_size(const EdgeT &edge) {
+        if constexpr (edge_has_aggregator_factory_v<EdgeT>) {
+          return edge.chunk_size();
+        } else {
+          return 0;
+        }
+      }
+
+      template <typename... EdgesT, std::size_t... Is>
+      auto make_aggregator_chunk_size_array(const std::tuple<EdgesT...> &edges, std::index_sequence<Is...>) {
+        return std::array<std::size_t, sizeof...(EdgesT)>{make_aggregator_chunk_size(std::get<Is>(edges))...};
+      }
+    }  // namespace detail
+
+    template <typename... EdgesT>
+    auto make_aggregator_chunk_size_array(const std::tuple<EdgesT...> &edges) {
+      return detail::make_aggregator_chunk_size_array(edges, std::make_index_sequence<sizeof...(EdgesT)>());
+    }
+
   }  // namespace meta
 }  // namespace ttg
 

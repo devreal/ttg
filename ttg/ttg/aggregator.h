@@ -160,12 +160,21 @@ namespace ttg {
     const_iterator end() const { return const_iterator(get_ptr() + m_size); }
     const_iterator cend() const { return const_iterator(get_ptr() + m_size); }
 
+    /// true if this is the last batch of values for its key (for a chunked aggregator, the
+    /// firing that reaches the per-key target; for an unchunked one, always true, since every
+    /// firing is by definition its only/last one).
+    bool is_final() const { return m_is_final; }
+
    private:
+    /// Marks whether this batch is the last one for its key; called by the runtime only.
+    void set_final(bool is_final) { m_is_final = is_final; }
+
     vector_t m_vec;
     vector_element_t m_arr[short_vector_size];
     size_type m_size = 0;
     size_type m_target = undef_target;
     bool m_is_dynamic = true;
+    bool m_is_final = true;
   };
 
   namespace detail {
@@ -225,13 +234,20 @@ namespace ttg {
         : m_edge(edge), m_aggregator_factory([](const KeyT &) { return aggregator_type(); }) {}
 
     template <typename AggregatorFactory>
-    Edge(edge_type &edge, AggregatorFactory &&aggregator_factory)
-        : m_edge(edge), m_aggregator_factory([=](const KeyT &key) { return aggregator_factory(key); }) {}
+    Edge(edge_type &edge, AggregatorFactory &&aggregator_factory,
+         std::size_t chunk_size = aggregator_type::undef_target)
+        : m_edge(edge)
+        , m_aggregator_factory([=](const KeyT &key) { return aggregator_factory(key); })
+        , m_chunk_size(chunk_size) {}
 
     /// Return reference to the underlying edge
     edge_type &edge() const { return m_edge; }
 
     auto aggregator_factory() const { return m_aggregator_factory; }
+
+    /// the maximum number of values passed to the task per firing; ttg::Aggregator<T>::undef_target
+    /// (the default) means the task fires exactly once, when the full target size has been reached.
+    std::size_t chunk_size() const { return m_chunk_size; }
 
     /// probes if this is already has at least one input; calls the underlying edge.live()
     bool live() const { return m_edge.live(); }
@@ -251,6 +267,7 @@ namespace ttg {
    private:
     edge_type &m_edge;
     aggregator_factory_type m_aggregator_factory;
+    std::size_t m_chunk_size = aggregator_type::undef_target;
   };
 
   /// overload for remove_wrapper to expose the underlying value type
@@ -271,17 +288,33 @@ namespace ttg {
   /// @param targetfn maps a key to the total number of values expected for that key.
   template <typename EdgeT, typename TargetFn,
             typename = std::enable_if_t<std::is_invocable_v<TargetFn, const typename std::decay_t<EdgeT>::key_type>>>
-  auto make_aggregator(EdgeT &&inedge, TargetFn &&targetfn) {
+  auto make_aggregator(EdgeT &&inedge, TargetFn &&targetfn,
+                       std::size_t chunk_size = Aggregator<typename std::decay_t<EdgeT>::value_type>::undef_target) {
     using value_type = typename std::decay_t<EdgeT>::value_type;
     using key_type = typename std::decay_t<EdgeT>::key_type;
-    using fact = typename detail::AggregatorFactory<key_type, Aggregator<value_type>, TargetFn>;
-    return Edge<key_type, Aggregator<value_type>>(inedge, fact(std::forward<TargetFn>(targetfn)));
+    // TargetFn must be decayed here, exactly like EdgeT is above: TargetFn is
+    // deduced as an lvalue-reference type (e.g. `Lambda&`) whenever a caller
+    // passes a named target-function variable (the overwhelmingly common
+    // case) rather than a temporary. Without decaying, AggregatorFactory's
+    // own TargetFn template parameter becomes that same reference type, so
+    // its m_targetfn member is a *reference* into the caller's stack frame
+    // instead of an owned copy - a dangling reference the moment the caller
+    // (typically a small factory function building a TTG graph) returns,
+    // well before the aggregator is actually invoked. Any captured state in
+    // the target function (anything beyond a literally-empty closure) then
+    // triggers undefined behavior - corrupted reads, or a crash - on first
+    // use, since the referent memory has long since been reused.
+    using fact = typename detail::AggregatorFactory<key_type, Aggregator<value_type>, std::decay_t<TargetFn>>;
+    return Edge<key_type, Aggregator<value_type>>(inedge, fact(std::forward<TargetFn>(targetfn)), chunk_size);
   }
 
   /// @brief Turns an Edge<K,V> into an aggregating input with a fixed value count.
+  /// @param chunk_size if given and less than target, the task fires repeatedly, once per
+  ///        chunk_size values (the last firing getting the remainder), instead of once at target.
   template <typename EdgeT>
-  auto make_aggregator(EdgeT &&inedge, size_t target) {
-    return make_aggregator(inedge, typename detail::AggregatorTargetProvider(target));
+  auto make_aggregator(EdgeT &&inedge, size_t target,
+                       std::size_t chunk_size = Aggregator<typename std::decay_t<EdgeT>::value_type>::undef_target) {
+    return make_aggregator(inedge, typename detail::AggregatorTargetProvider(target), chunk_size);
   }
 
   /// @brief Turns an Edge<K,V> into an aggregating input with an unbounded value count
