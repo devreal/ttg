@@ -1738,6 +1738,41 @@ namespace ttg_parsec {
           }
           cur = (parsec_gpu_task_t *)cur->list_item.list_next;
         } while (cur != ring_head);
+
+#if defined(TTG_HAVE_PARSEC_DEV_BATCH)
+        /* Flush pass: every ring member that reached ttg::device::wait() above
+         * (during the registration pass, if it never called coop(), or the
+         * delivery pass otherwise) queued its device->host copies onto the
+         * ring head's device_ptr_t instead of submitting them immediately
+         * (see mark_device_out in ttg/parsec/devicefunc.h). Coalesce them all
+         * into a single gpu->memcpy_multi_async() call here, on the same
+         * shared stream the kernel(s) above were submitted to, so the
+         * completion pass below still only has to wait on one stream event. */
+        {
+          task_t *head_task = (task_t *)ring_head->ec;
+          auto &pending = head_task->dev_ptr->pending_out;
+          if (!pending.empty()) {
+            std::vector<void *> dsts;
+            std::vector<void *> srcs;
+            std::vector<size_t> sizes;
+            std::vector<parsec_device_transfer_direction_t> directions;
+            dsts.reserve(pending.size());
+            srcs.reserve(pending.size());
+            sizes.reserve(pending.size());
+            directions.reserve(pending.size());
+            for (auto &copy : pending) {
+              dsts.push_back(copy.dst);
+              srcs.push_back(copy.src);
+              sizes.push_back(copy.size);
+              directions.push_back(copy.direction);
+            }
+            int ret = gpu_device->memcpy_multi_async(gpu_device, gpu_stream, dsts.data(), srcs.data(), sizes.data(),
+                                                      directions.data(), static_cast<int>(pending.size()));
+            if (ret != PARSEC_SUCCESS) throw std::runtime_error("Failed to batch-copy data from device to host!");
+            pending.clear();
+          }
+        }
+#endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
       } else {
         /* Completion pass: the shared stream event fired, so the kernel and
          * every member's D2H copies (enqueued during the delivery pass above,

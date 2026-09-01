@@ -210,21 +210,37 @@ namespace ttg_parsec {
 
       /* get_parsec_data is overloaded for buffer and devicescratch */
       parsec_data_t* data = detail::get_parsec_data(view);
-      parsec_gpu_exec_stream_t *stream = detail::parsec_ttg_caller->dev_ptr->stream;
 
       /* enqueue the transfer into the compute stream to come back once the compute and transfer are complete */
       if (nullptr != data && data->owner_device != 0) {
-        parsec_device_gpu_module_t *device_module = detail::parsec_ttg_caller->dev_ptr->device;
         if (nullptr == data->device_copies[0]->device_private) {
           assert(nullptr != data->device_copies[0]->alloc_cb);
           data->device_copies[0]->alloc_cb(data->device_copies[0], 0);
         }
 
+#if defined(TTG_HAVE_PARSEC_DEV_BATCH)
+        /* Defer: coalesced with every other pending copy of this task -- and
+         * of every other task in the same batch ring, if any -- into a
+         * single gpu->memcpy_multi_async() call by the flush step at the end
+         * of device_static_submit's delivery pass (see ttg/parsec/ttg.h).
+         * Always queued on the ring head's own device_ptr_t (a ring of one
+         * when no batching occurred) so all pending copies end up in the
+         * same place regardless of which member queued them. */
+        parsec_gpu_task_t *ring_head = detail::parsec_ttg_caller->dev_ptr->batch_ring_head;
+        auto *head_base = reinterpret_cast<detail::parsec_ttg_task_base_t *>(ring_head->ec);
+        head_base->dev_ptr->pending_out.push_back(
+            detail::pending_device_copy_t{data->device_copies[0]->device_private,
+                                          data->device_copies[data->owner_device]->device_private,
+                                          data->nb_elts, parsec_device_gpu_transfer_direction_d2h});
+#else
+        parsec_device_gpu_module_t *device_module = detail::parsec_ttg_caller->dev_ptr->device;
+        parsec_gpu_exec_stream_t *stream = detail::parsec_ttg_caller->dev_ptr->stream;
         int ret = device_module->memcpy_async(device_module, stream,
                                               data->device_copies[0]->device_private,
                                               data->device_copies[data->owner_device]->device_private,
                                               data->nb_elts, parsec_device_gpu_transfer_direction_d2h);
         if (ret != PARSEC_SUCCESS) throw std::runtime_error("Failed to copy data from device to host!");
+#endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
       }
       if constexpr (sizeof...(Is) > 0) {
         // recursion

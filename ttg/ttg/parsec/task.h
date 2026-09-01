@@ -7,9 +7,27 @@
 #include <parsec/parsec_internal.h>
 #include <parsec/mca/device/device_gpu.h>
 
+#include <vector>
+
 namespace ttg_parsec {
 
   namespace detail {
+
+#if defined(TTG_HAVE_PARSEC_DEV_BATCH)
+    /* One deferred device->host copy, queued by mark_device_out() (see
+     * ttg/parsec/devicefunc.h) and later coalesced with every other pending
+     * copy belonging to the same batch ring -- including copies queued by
+     * other ring members -- into a single gpu->memcpy_multi_async() call by
+     * device_static_submit (see ttg/parsec/ttg.h). The layout mirrors
+     * parsec_device_memcpy_multi_async_fn_t's dsts/srcs/sizes/directions
+     * arrays so the collected copies can be handed to it directly. */
+    struct pending_device_copy_t {
+      void* dst;
+      void* src;
+      size_t size;
+      parsec_device_transfer_direction_t direction;
+    };
+#endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
 
     struct device_ptr_t {
       parsec_gpu_task_t* gpu_task = nullptr;
@@ -21,6 +39,12 @@ namespace ttg_parsec {
        * TT::set_batch_matcher); always set to this task's own gpu_task when
        * no batching occurred, so it is safe to dereference unconditionally. */
       parsec_gpu_task_t* batch_ring_head = nullptr;
+#if defined(TTG_HAVE_PARSEC_DEV_BATCH)
+      /* copies deferred by mark_device_out(); only ever populated on the
+       * ring head's own device_ptr_t (see mark_device_out and the flush
+       * step at the end of device_static_submit's delivery pass) */
+      std::vector<pending_device_copy_t> pending_out;
+#endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
     };
 
     template<bool SupportDevice>
