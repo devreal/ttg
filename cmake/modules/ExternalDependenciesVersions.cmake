@@ -4,11 +4,11 @@
 
 set(TTG_TRACKED_VG_CMAKE_KIT_TAG 256d9462bb765787f5acb69be154b26d6efba8b6)  # provides FindOrFetchLinalgPP and "real" FindOrFetchBoost
 set(TTG_TRACKED_CATCH2_VERSION 3.5.0)
-set(TTG_TRACKED_MADNESS_TAG 214f7c3461a33a45944849164361c04e1a6ffd8a)
+set(TTG_TRACKED_MADNESS_TAG 846301f4786a5f19a7a6c237306dc86c493fd590)
 set(TTG_TRACKED_PARSEC_TAG parsec-for-ttg)
 set(TTG_TRACKED_UMPIRE_CXX_ALLOCATOR_TAG 1ba7f5f0aa99438826dd1c6bc1cd396080b9d608)
 set(TTG_TRACKED_BTAS_TAG 74ee8a27386c746b36f0455cd5a0e3c33bd5f4d2)
-set(TTG_TRACKED_TILEDARRAY_TAG 5fae6ec2f89d7b75e35caf27588aac769494b340)
+set(TTG_TRACKED_TILEDARRAY_TAG 58acda635a6cedca73e6c4e260b73c8729c89c44)
 
 # need Boost.CallableTraits (header only, part of Boost 1.66 released in Dec 2017) for wrap.h to work
 # BUT if will be building examples, inherit the oldest version from the pickiest Boost consumer (TA and/or BSPMM)
