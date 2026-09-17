@@ -107,6 +107,15 @@ namespace ttg {
           ->getActualHighwaterMark();
     }
 
+    std::size_t pinned_allocator_getCurrentSize() {
+      assert(dynamic_cast<::umpire::strategy::QuickPool*>(
+                    pinned_allocator_.getAllocationStrategy()) != nullptr);
+      return dynamic_cast<::umpire::strategy::QuickPool*>(
+                 pinned_allocator_.getAllocationStrategy())
+          ->getCurrentSize();
+    }
+
+
    protected:
     Env(::umpire::Allocator pinned_alloc)
         : pinned_allocator_(pinned_alloc) {}
