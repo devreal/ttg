@@ -104,8 +104,11 @@
 
 #if defined(TTG_HAVE_PARSEC_DEV_BATCH)
 /* OR'd into a device incarnation's type to mark it as eligible for
- * parsec_gpu_task_collect_batch(); harmless unless a TT actually calls
- * TT::set_batch_matcher (see device_static_submit). */
+ * parsec_gpu_task_collect_batch(). PaRSEC forms task rings for any chore
+ * with this bit set, independent of whether a matcher was ever installed
+ * (parsec_gpu_task_selected_chore_allows_batch only inspects this static
+ * bit) -- so it is NOT set at incarnation-registration time; TT::set_batch_matcher
+ * ORs it in only for TTs that actually opt into batching (see below). */
 #define TTG_PARSEC_BATCH_CHORE_BIT PARSEC_DEV_CHORE_ALLOW_BATCH
 #else
 #define TTG_PARSEC_BATCH_CHORE_BIT 0u
@@ -4348,7 +4351,7 @@ namespace ttg_parsec {
 //#if 0
       if constexpr (derived_has_cuda_op()) {
         self.incarnations = (__parsec_chore_t *)malloc(3 * sizeof(__parsec_chore_t));
-        ((__parsec_chore_t *)self.incarnations)[0].type = PARSEC_DEV_CUDA | TTG_PARSEC_BATCH_CHORE_BIT;
+        ((__parsec_chore_t *)self.incarnations)[0].type = PARSEC_DEV_CUDA;
         ((__parsec_chore_t *)self.incarnations)[0].evaluate = &detail::evaluate_cuda<TT>;
         ((__parsec_chore_t *)self.incarnations)[0].hook = &detail::hook_cuda<TT>;
         ((__parsec_chore_t *)self.incarnations)[1].type = PARSEC_DEV_NONE;
@@ -4356,7 +4359,7 @@ namespace ttg_parsec {
         ((__parsec_chore_t *)self.incarnations)[1].hook = NULL;
       } else if constexpr (derived_has_hip_op()) {
         self.incarnations = (__parsec_chore_t *)malloc(3 * sizeof(__parsec_chore_t));
-        ((__parsec_chore_t *)self.incarnations)[0].type = PARSEC_DEV_HIP | TTG_PARSEC_BATCH_CHORE_BIT;
+        ((__parsec_chore_t *)self.incarnations)[0].type = PARSEC_DEV_HIP;
         ((__parsec_chore_t *)self.incarnations)[0].evaluate = &detail::evaluate_hip<TT>;
         ((__parsec_chore_t *)self.incarnations)[0].hook = &detail::hook_hip<TT>;
 
@@ -4366,7 +4369,7 @@ namespace ttg_parsec {
 #if defined(PARSEC_HAVE_DEV_LEVEL_ZERO_SUPPORT)
       } else if constexpr (derived_has_level_zero_op()) {
         self.incarnations = (__parsec_chore_t *)malloc(3 * sizeof(__parsec_chore_t));
-        ((__parsec_chore_t *)self.incarnations)[0].type = PARSEC_DEV_LEVEL_ZERO | TTG_PARSEC_BATCH_CHORE_BIT;
+        ((__parsec_chore_t *)self.incarnations)[0].type = PARSEC_DEV_LEVEL_ZERO;
         ((__parsec_chore_t *)self.incarnations)[0].evaluate = &detail::evaluate_level_zero<TT>;
         ((__parsec_chore_t *)self.incarnations)[0].hook = &detail::hook_level_zero<TT>;
 
@@ -4821,6 +4824,11 @@ namespace ttg_parsec {
       static_assert(!ttg::meta::is_void_v<keyT>, "Batching requires a non-void key type!");
       m_batch_matcher = std::forward<Matcher>(matcher);
       m_max_batch_size = std::max(std::size_t{1}, max_batch_size);
+      /* Only now, with a matcher actually installed, mark the device incarnation
+       * eligible for parsec_gpu_task_collect_batch(); see TTG_PARSEC_BATCH_CHORE_BIT. */
+      if (nullptr != self.incarnations) {
+        ((__parsec_chore_t *)self.incarnations)[0].type |= TTG_PARSEC_BATCH_CHORE_BIT;
+      }
     }
 
     /// @return true if \sa set_batch_matcher was called with a matcher
