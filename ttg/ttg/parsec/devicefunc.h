@@ -211,8 +211,12 @@ namespace ttg_parsec {
       /* get_parsec_data is overloaded for buffer and devicescratch */
       parsec_data_t* data = detail::get_parsec_data(view);
 
-      /* enqueue the transfer into the compute stream to come back once the compute and transfer are complete */
-      if (nullptr != data && data->owner_device != 0) {
+      /* enqueue the transfer into the compute stream to come back once the compute and transfer are complete.
+       * owner_device is a signed device index: -1 means "never staged onto any device" (e.g. an
+       * empty/default-constructed placeholder buffer), which must NOT reach the device_copies[owner_device]
+       * indexing below -- that would read one element before the array. Only a genuine non-host device
+       * owner (> 0) needs writing back. */
+      if (nullptr != data && data->owner_device > 0) {
         if (nullptr == data->device_copies[0]->device_private) {
           assert(nullptr != data->device_copies[0]->alloc_cb);
           data->device_copies[0]->alloc_cb(data->device_copies[0], 0);
