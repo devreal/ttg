@@ -119,7 +119,27 @@ namespace ttg::device {
       TTG_DEVICE_CORO_WAIT_BATCH,
       TTG_DEVICE_CORO_WAIT_KERNEL,
       TTG_DEVICE_CORO_SENDOUT,
-      TTG_DEVICE_CORO_COMPLETE
+      TTG_DEVICE_CORO_COMPLETE,
+      /* suspended inside ttg::device::suspend(); the runtime will resume the
+       * task at a later time, after which the task continues in the state
+       * it had before the suspension. */
+      TTG_DEVICE_CORO_SUSPENDED
+    };
+
+    struct suspend_t { };
+
+    /* the awaiter behind ttg::device::suspend(): always suspends and restores
+     * the state the coroutine was in before suspending once it is resumed */
+    struct suspend_awaiter {
+      ttg_device_coro_state& state;
+      ttg_device_coro_state resume_state;
+
+      constexpr bool await_ready() const noexcept { return false; }
+
+      template <typename Promise>
+      constexpr void await_suspend(ttg::coroutine_handle<Promise>) const noexcept {}
+
+      void await_resume() noexcept { state = resume_state; }
     };
 
     template <typename... Ts>
@@ -180,6 +200,19 @@ namespace ttg::device {
          ...),
         "Only ttg::Buffer and ttg::devicescratch can be waited on!");
     return detail::wait_kernel_t<std::remove_reference_t<Buffers>...>{std::tie(std::forward<Buffers>(args)...)};
+  }
+
+  /**
+   * Yield control back to the runtime, which will resume the task at a later
+   * time. Can be used before \sa ttg::device::select (e.g., to wait for a
+   * condition that is required to pick the task's inputs) and between
+   * \sa ttg::device::select and the final send/broadcast (e.g., to wait for
+   * a condition before submitting a kernel). Any kernels and transfers
+   * submitted before suspending remain enqueued on the current stream.
+   */
+  [[nodiscard]]
+  inline auto suspend() {
+    return detail::suspend_t{};
   }
 
   /******************************
@@ -714,6 +747,12 @@ namespace ttg::device {
         m_sends.push_back(std::forward<device::detail::send_t>(v));
         m_state = ttg::device::detail::TTG_DEVICE_CORO_SENDOUT;
         return {};
+      }
+
+      detail::suspend_awaiter await_transform(detail::suspend_t&&) {
+        auto resume_state = m_state;
+        m_state = ttg::device::detail::TTG_DEVICE_CORO_SUSPENDED;
+        return detail::suspend_awaiter{m_state, resume_state};
       }
 
       template <typename Key, typename... Args>

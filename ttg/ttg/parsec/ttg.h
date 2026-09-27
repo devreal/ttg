@@ -836,33 +836,9 @@ namespace ttg_parsec {
 
 
     template<typename TT>
-    inline parsec_hook_return_t evaluate_cuda(const parsec_task_t *parsec_task) {
-      if constexpr(TT::derived_has_cuda_op()) {
-        parsec_ttg_task_t<TT> *me = (parsec_ttg_task_t<TT> *)parsec_task;
-        return me->template invoke_evaluate<ttg::ExecutionSpace::CUDA>();
-      } else {
-        return PARSEC_HOOK_RETURN_NEXT;
-      }
-    }
-
-    template<typename TT>
-    inline parsec_hook_return_t evaluate_hip(const parsec_task_t *parsec_task) {
-      if constexpr(TT::derived_has_hip_op()) {
-        parsec_ttg_task_t<TT> *me = (parsec_ttg_task_t<TT> *)parsec_task;
-        return me->template invoke_evaluate<ttg::ExecutionSpace::HIP>();
-      } else {
-        return PARSEC_HOOK_RETURN_NEXT;
-      }
-    }
-
-    template<typename TT>
-    inline parsec_hook_return_t evaluate_level_zero(const parsec_task_t *parsec_task) {
-      if constexpr(TT::derived_has_level_zero_op()) {
-        parsec_ttg_task_t<TT> *me = (parsec_ttg_task_t<TT> *)parsec_task;
-        return me->template invoke_evaluate<ttg::ExecutionSpace::L0>();
-      } else {
-        return PARSEC_HOOK_RETURN_NEXT;
-      }
+    inline parsec_hook_return_t prepare_input(struct parsec_execution_stream_s *es, parsec_task_t *parsec_task) {
+      parsec_ttg_task_t<TT> *me = (parsec_ttg_task_t<TT> *)parsec_task;
+      return me->invoke_prepare_input();
     }
 
 
@@ -1551,7 +1527,7 @@ namespace ttg_parsec {
      * signal "batch is full", not an error), 0 accepts the candidate, >0
      * leaves it pending and continues scanning.
      *
-     * NB: we cannot compare task_class *pointers* here. device_static_evaluate
+     * NB: we cannot compare task_class *pointers* here. device_static_prepare_input
      * gives every task instance its own private copy of the task_class struct
      * (task->dev_ptr->task_class = *task->parsec_task.task_class;), so two
      * tasks belonging to the very same TT always have distinct task_class
@@ -1631,9 +1607,12 @@ namespace ttg_parsec {
         return PARSEC_HOOK_RETURN_DONE;
       }
 
-      /* we're waiting for the initial transfers or for the kernel to complete */
+      /* we're waiting for the initial transfers, for the kernel to complete,
+       * for the rest of the batch to register, or for a suspended task to resume */
       assert(dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER ||
+             dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_BATCH ||
              dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL ||
+             dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_SUSPENDED ||
              dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT);
 
       /* Never batch a task re-entering purely to resolve a pending kernel wait;
@@ -1716,85 +1695,104 @@ namespace ttg_parsec {
         return h.promise().state();
       };
 
-      if (is_first_entry) {
-        /* Registration pass: resume every ring member once. A task using
-         * ttg::device::coop() suspends at WAIT_BATCH having registered its
-         * batch arguments; an ordinary (non-batching) device task runs
-         * straight through its inline kernel-launch code to WAIT_KERNEL, just
-         * as it always has -- for a singleton ring this loop degenerates to
-         * exactly the single static_op() call this replaced. */
+      using ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER;
+      using ttg::device::detail::TTG_DEVICE_CORO_WAIT_BATCH;
+      using ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL;
+      using ttg::device::detail::TTG_DEVICE_CORO_SUSPENDED;
+
+      task_t *head_task = (task_t *)ring_head->ec;
+
+      /* Progress pass: resume every ring member that can make progress, each
+       * at most once per entry:
+       *  - on the first entry, every member is fresh off its select()
+       *    (WAIT_TRANSFER). A task using ttg::device::coop() suspends at
+       *    WAIT_BATCH having registered its batch arguments; an ordinary
+       *    (non-batching) device task runs straight through its inline
+       *    kernel-launch code to WAIT_KERNEL -- for a singleton ring this
+       *    degenerates to a single static_op() call.
+       *  - on later entries, the shared stream event fired, so the kernels
+       *    and every member's D2H copies submitted before the previous return
+       *    (on the same stream, hence ordered) have completed. Members at
+       *    WAIT_KERNEL run their post-wait code and reach SENDOUT.
+       *  - members parked in ttg::device::suspend() (SUSPENDED) are resumed
+       *    on every later entry and continue where they left off.
+       * Members parked at WAIT_BATCH are left alone until the delivery pass. */
+      {
         parsec_gpu_task_t *cur = ring_head;
         do {
-          resume_member(cur);
-          cur = (parsec_gpu_task_t *)cur->list_item.list_next;
-        } while (cur != ring_head);
-
-        /* Delivery pass: resume every member still parked at WAIT_BATCH a
-         * second time, now that the whole ring has registered; this is what
-         * hands each of them the completed ttg::device::batch_view. Members
-         * that never called coop() are already past WAIT_BATCH and are left
-         * alone here. */
-        cur = ring_head;
-        do {
-          if (member_state(cur) == ttg::device::detail::TTG_DEVICE_CORO_WAIT_BATCH) {
+          auto state = member_state(cur);
+          if ((is_first_entry && state == TTG_DEVICE_CORO_WAIT_TRANSFER) ||
+              (!is_first_entry && (state == TTG_DEVICE_CORO_WAIT_KERNEL || state == TTG_DEVICE_CORO_SUSPENDED))) {
             resume_member(cur);
-          }
-          cur = (parsec_gpu_task_t *)cur->list_item.list_next;
-        } while (cur != ring_head);
-
-#if defined(TTG_HAVE_PARSEC_DEV_BATCH)
-        /* Flush pass: every ring member that reached ttg::device::wait() above
-         * (during the registration pass, if it never called coop(), or the
-         * delivery pass otherwise) queued its device->host copies onto the
-         * ring head's device_ptr_t instead of submitting them immediately
-         * (see mark_device_out in ttg/parsec/devicefunc.h). Coalesce them all
-         * into a single gpu->memcpy_multi_async() call here, on the same
-         * shared stream the kernel(s) above were submitted to, so the
-         * completion pass below still only has to wait on one stream event. */
-        {
-          task_t *head_task = (task_t *)ring_head->ec;
-          auto &pending = head_task->dev_ptr->pending_out;
-          if (!pending.empty()) {
-            std::vector<void *> dsts;
-            std::vector<void *> srcs;
-            std::vector<size_t> sizes;
-            std::vector<parsec_device_transfer_direction_t> directions;
-            dsts.reserve(pending.size());
-            srcs.reserve(pending.size());
-            sizes.reserve(pending.size());
-            directions.reserve(pending.size());
-            for (auto &copy : pending) {
-              dsts.push_back(copy.dst);
-              srcs.push_back(copy.src);
-              sizes.push_back(copy.size);
-              directions.push_back(copy.direction);
-            }
-            int ret = gpu_device->memcpy_multi_async(gpu_device, gpu_stream, dsts.data(), srcs.data(), sizes.data(),
-                                                      directions.data(), static_cast<int>(pending.size()));
-            if (ret != PARSEC_SUCCESS) throw std::runtime_error("Failed to batch-copy data from device to host!");
-            pending.clear();
-          }
-        }
-#endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
-      } else {
-        /* Completion pass: the shared stream event fired, so the kernel and
-         * every member's D2H copies (enqueued during the delivery pass above,
-         * on the same stream, hence ordered after the kernel) have completed.
-         * Resume every member still at WAIT_KERNEL to run its post-wait code
-         * and reach SENDOUT. */
-        parsec_gpu_task_t *cur = ring_head;
-        do {
-          if (member_state(cur) == ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL) {
-            resume_member(cur);
-            if (member_state(cur) == ttg::device::detail::TTG_DEVICE_CORO_WAIT_BATCH) {
+            if (head_task->dev_ptr->batch_delivered && member_state(cur) == TTG_DEVICE_CORO_WAIT_BATCH) {
               throw std::runtime_error("Repeated coop() calls are not allowed.");
             }
-            assert(member_state(cur) == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT ||
-                   member_state(cur) == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE);
           }
           cur = (parsec_gpu_task_t *)cur->list_item.list_next;
         } while (cur != ring_head);
       }
+
+      /* Delivery pass: resume every member parked at WAIT_BATCH a second
+       * time, once the whole ring has registered; this is what hands each
+       * of them the completed ttg::device::batch_view. Members that never
+       * called coop() are already past WAIT_BATCH and are left alone here.
+       * If a member suspended (ttg::device::suspend()) before reaching its
+       * coop() call, delivery is deferred to a later entry. */
+      if (!head_task->dev_ptr->batch_delivered) {
+        bool any_waiting = false, all_registered = true;
+        parsec_gpu_task_t *cur = ring_head;
+        do {
+          auto state = member_state(cur);
+          any_waiting    |= (state == TTG_DEVICE_CORO_WAIT_BATCH);
+          all_registered &= (state != TTG_DEVICE_CORO_SUSPENDED);
+          cur = (parsec_gpu_task_t *)cur->list_item.list_next;
+        } while (cur != ring_head);
+
+        if (any_waiting && all_registered) {
+          head_task->dev_ptr->batch_delivered = true;
+          cur = ring_head;
+          do {
+            if (member_state(cur) == TTG_DEVICE_CORO_WAIT_BATCH) {
+              resume_member(cur);
+            }
+            cur = (parsec_gpu_task_t *)cur->list_item.list_next;
+          } while (cur != ring_head);
+        }
+      }
+
+#if defined(TTG_HAVE_PARSEC_DEV_BATCH)
+      /* Flush pass: every ring member that reached ttg::device::wait() above
+       * (during the progress pass, if it never called coop(), or the
+       * delivery pass otherwise) queued its device->host copies onto the
+       * ring head's device_ptr_t instead of submitting them immediately
+       * (see mark_device_out in ttg/parsec/devicefunc.h). Coalesce them all
+       * into a single gpu->memcpy_multi_async() call here, on the same
+       * shared stream the kernel(s) above were submitted to, so the
+       * next entry still only has to wait on one stream event. */
+      {
+        auto &pending = head_task->dev_ptr->pending_out;
+        if (!pending.empty()) {
+          std::vector<void *> dsts;
+          std::vector<void *> srcs;
+          std::vector<size_t> sizes;
+          std::vector<parsec_device_transfer_direction_t> directions;
+          dsts.reserve(pending.size());
+          srcs.reserve(pending.size());
+          sizes.reserve(pending.size());
+          directions.reserve(pending.size());
+          for (auto &copy : pending) {
+            dsts.push_back(copy.dst);
+            srcs.push_back(copy.src);
+            sizes.push_back(copy.size);
+            directions.push_back(copy.direction);
+          }
+          int ret = gpu_device->memcpy_multi_async(gpu_device, gpu_stream, dsts.data(), srcs.data(), sizes.data(),
+                                                    directions.data(), static_cast<int>(pending.size()));
+          if (ret != PARSEC_SUCCESS) throw std::runtime_error("Failed to batch-copy data from device to host!");
+          pending.clear();
+        }
+      }
+#endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
 
       ttg::device::detail::reset_current();
 
@@ -1809,7 +1807,8 @@ namespace ttg_parsec {
       };
 
       /* We will come back into this function once the kernel and transfers
-       * are done, unless every member of the ring has already fully completed
+       * are done (or, for members parked in ttg::device::suspend(), once the stream caught up),
+       * unless every member of the ring has already fully completed
        * (reached SENDOUT/COMPLETE, or returned immediately without
        * suspending at all). For a singleton ring this is exactly the
        * single-task check this replaced. */
@@ -1833,13 +1832,28 @@ namespace ttg_parsec {
       return any_pending ? PARSEC_HOOK_RETURN_AGAIN : PARSEC_HOOK_RETURN_DONE;
     }
 
-    static parsec_hook_return_t device_static_evaluate(parsec_task_t* parsec_task) {
+    /* @return true if the task's coroutine is suspended in ttg::device::suspend() */
+    static bool device_task_is_suspended(task_t *task) {
+      if (nullptr == task->suspended_task_address) return false;
+      auto dev_task = ttg::device::detail::device_task_handle_type::from_address(task->suspended_task_address);
+      return dev_task.promise().state() == ttg::device::detail::TTG_DEVICE_CORO_SUSPENDED;
+    }
+
+    /**
+     * Prepare-input callback called by PaRSEC before selecting a device.
+     * Runs the task's coroutine until it has collected its inputs in
+     * ttg::device::select() and sets up the flows accordingly.
+     * Returns PARSEC_HOOK_RETURN_AGAIN if the task suspended in
+     * ttg::device::suspend() before selecting its inputs, in which case
+     * PaRSEC reschedules the task and we resume it on the next invocation.
+     */
+    static parsec_hook_return_t device_static_prepare_input(parsec_task_t* parsec_task) {
 
       task_t *task = (task_t*)parsec_task;
-      if (task->dev_ptr->gpu_task == nullptr) {
+      parsec_gpu_task_t *gpu_task = task->dev_ptr->gpu_task;
+      if (gpu_task == nullptr) {
 
         /* set up a device task */
-        parsec_gpu_task_t *gpu_task;
         /* PaRSEC wants to free the gpu_task, because F***K ownerships */
         gpu_task = static_cast<parsec_gpu_task_t*>(std::calloc(1, sizeof(*gpu_task)));
         PARSEC_OBJ_CONSTRUCT(gpu_task, parsec_list_item_t);
@@ -1877,53 +1891,60 @@ namespace ttg_parsec {
 
         // first invocation of the coroutine to get the coroutine handle
         static_op(parsec_task);
+      } else if (device_task_is_suspended(task)) {
+        /* the task suspended in ttg::device::suspend() before selecting its inputs */
+        static_op(parsec_task);
+      } else {
+        ttg::print_error(task->tt->get_name(), " : prepare_input called on task with assigned GPU task!");
+        return PARSEC_HOOK_RETURN_ERROR;
+      }
 
-        /* when we come back here, the flows in gpu_task are set (see register_device_memory) */
+      if (device_task_is_suspended(task)) {
+        /* come back later */
+        return PARSEC_HOOK_RETURN_AGAIN;
+      }
 
-        parsec_task_class_t& tc = task->dev_ptr->task_class;
+      /* when we come back here, the flows in gpu_task are set (see register_device_memory) */
 
-        // input flows are set up during register_device_memory as part of the first invocation above
-        for (int i = 0; i < MAX_PARAM_COUNT; ++i) {
-          tc.in[i]  = gpu_task->flow[i];
-          tc.out[i] = gpu_task->flow[i];
+      parsec_task_class_t& tc = task->dev_ptr->task_class;
+
+      // input flows are set up during register_device_memory as part of the first invocation above
+      for (int i = 0; i < MAX_PARAM_COUNT; ++i) {
+        tc.in[i]  = gpu_task->flow[i];
+        tc.out[i] = gpu_task->flow[i];
+      }
+      tc.nb_flows = MAX_PARAM_COUNT;
+
+      /* set the device hint on the data */
+      TT *tt = task->tt;
+      if (tt->devicemap) {
+        int parsec_dev;
+        if constexpr (std::is_void_v<keyT>) {
+          parsec_dev = detail::ttg_device_to_parsec_device(tt->devicemap());
+        } else {
+          parsec_dev = detail::ttg_device_to_parsec_device(tt->devicemap(task->key));
         }
-        tc.nb_flows = MAX_PARAM_COUNT;
-
-        /* set the device hint on the data */
-        TT *tt = task->tt;
-        if (tt->devicemap) {
-          int parsec_dev;
-          if constexpr (std::is_void_v<keyT>) {
-            parsec_dev = detail::ttg_device_to_parsec_device(tt->devicemap());
-          } else {
-            parsec_dev = detail::ttg_device_to_parsec_device(tt->devicemap(task->key));
-          }
-          for (int i = 0; i < MAX_PARAM_COUNT; ++i) {
-            /* only set on mutable data since we have exclusive access */
-            if (tc.in[i] != nullptr && (tc.in[i]->flow_flags & PARSEC_FLOW_ACCESS_WRITE)) {
-              parsec_data_t *data = parsec_task->data[i].data_in->original;
-              /* only set the preferred device if the host has the latest copy
-               * as otherwise we may end up with the wrong data if there is a newer
-               * version on a different device. Also, keep fingers crossed. */
-              if (data->owner_device == 0) {
-                parsec_advise_data_on_device(data, parsec_dev, PARSEC_DEV_DATA_ADVICE_PREFERRED_DEVICE);
-              }
+        for (int i = 0; i < MAX_PARAM_COUNT; ++i) {
+          /* only set on mutable data since we have exclusive access */
+          if (tc.in[i] != nullptr && (tc.in[i]->flow_flags & PARSEC_FLOW_ACCESS_WRITE)) {
+            parsec_data_t *data = parsec_task->data[i].data_in->original;
+            /* only set the preferred device if the host has the latest copy
+             * as otherwise we may end up with the wrong data if there is a newer
+             * version on a different device. Also, keep fingers crossed. */
+            if (data->owner_device == 0) {
+              parsec_advise_data_on_device(data, parsec_dev, PARSEC_DEV_DATA_ADVICE_PREFERRED_DEVICE);
             }
           }
         }
-
-        /* set the new task class that contains the flows */
-        task->parsec_task.task_class = &task->dev_ptr->task_class;
-
-        /* select this one */
-        return PARSEC_HOOK_RETURN_DONE;
       }
 
-      std::cerr << "EVALUATE called on task with assigned GPU task!" << std::endl;
+      /* set the new task class that contains the flows */
+      task->parsec_task.task_class = &task->dev_ptr->task_class;
 
-      /* not sure if this might happen*/
-      return PARSEC_HOOK_RETURN_ERROR;
+      /* inputs are prepared, make sure PaRSEC does not call us again if the task is rescheduled */
+      task->parsec_task.status = PARSEC_TASK_STATUS_HOOK;
 
+      return PARSEC_HOOK_RETURN_DONE;
     }
 
     static parsec_hook_return_t device_static_op(parsec_task_t* parsec_task) {
@@ -4352,7 +4373,7 @@ namespace ttg_parsec {
       if constexpr (derived_has_cuda_op()) {
         self.incarnations = (__parsec_chore_t *)malloc(3 * sizeof(__parsec_chore_t));
         ((__parsec_chore_t *)self.incarnations)[0].type = PARSEC_DEV_CUDA;
-        ((__parsec_chore_t *)self.incarnations)[0].evaluate = &detail::evaluate_cuda<TT>;
+        ((__parsec_chore_t *)self.incarnations)[0].evaluate = NULL;
         ((__parsec_chore_t *)self.incarnations)[0].hook = &detail::hook_cuda<TT>;
         ((__parsec_chore_t *)self.incarnations)[1].type = PARSEC_DEV_NONE;
         ((__parsec_chore_t *)self.incarnations)[1].evaluate = NULL;
@@ -4360,7 +4381,7 @@ namespace ttg_parsec {
       } else if constexpr (derived_has_hip_op()) {
         self.incarnations = (__parsec_chore_t *)malloc(3 * sizeof(__parsec_chore_t));
         ((__parsec_chore_t *)self.incarnations)[0].type = PARSEC_DEV_HIP;
-        ((__parsec_chore_t *)self.incarnations)[0].evaluate = &detail::evaluate_hip<TT>;
+        ((__parsec_chore_t *)self.incarnations)[0].evaluate = NULL;
         ((__parsec_chore_t *)self.incarnations)[0].hook = &detail::hook_hip<TT>;
 
         ((__parsec_chore_t *)self.incarnations)[1].type = PARSEC_DEV_NONE;
@@ -4370,7 +4391,7 @@ namespace ttg_parsec {
       } else if constexpr (derived_has_level_zero_op()) {
         self.incarnations = (__parsec_chore_t *)malloc(3 * sizeof(__parsec_chore_t));
         ((__parsec_chore_t *)self.incarnations)[0].type = PARSEC_DEV_LEVEL_ZERO;
-        ((__parsec_chore_t *)self.incarnations)[0].evaluate = &detail::evaluate_level_zero<TT>;
+        ((__parsec_chore_t *)self.incarnations)[0].evaluate = NULL;
         ((__parsec_chore_t *)self.incarnations)[0].hook = &detail::hook_level_zero<TT>;
 
         ((__parsec_chore_t *)self.incarnations)[1].type = PARSEC_DEV_NONE;
@@ -4388,6 +4409,9 @@ namespace ttg_parsec {
       }
 //#endif // 0
 
+      /* device tasks collect their inputs and select a device here (host tasks
+       * start in PARSEC_TASK_STATUS_HOOK and skip it, see parsec_ttg_task_t) */
+      self.prepare_input = &detail::prepare_input<TT>;
       self.release_task = &parsec_release_task_to_mempool_update_nbtasks;
       self.complete_execution = complete_task_and_release;
 

@@ -39,6 +39,9 @@ namespace ttg_parsec {
        * TT::set_batch_matcher); always set to this task's own gpu_task when
        * no batching occurred, so it is safe to dereference unconditionally. */
       parsec_gpu_task_t* batch_ring_head = nullptr;
+      /* set on the ring head once the ring's members parked in ttg::device::coop()
+       * have been handed their batch_view (see device_static_submit) */
+      bool batch_delivered = false;
 #if defined(TTG_HAVE_PARSEC_DEV_BATCH)
       /* copies deferred by mark_device_out(); only ever populated on the
        * ring head's own device_ptr_t (see mark_device_out and the flush
@@ -275,6 +278,10 @@ namespace ttg_parsec {
         *(uintptr_t*)&(parsec_task.locals[2]) = reinterpret_cast<uintptr_t>(&this->key);
 
         init_stream_info(tt, streams);
+        if constexpr (TT::derived_has_device_op()) {
+          /* device tasks collect their inputs in prepare_input (see TT::device_static_prepare_input) */
+          parsec_task.status = PARSEC_TASK_STATUS_PREPARE_INPUT;
+        }
       }
 
       static void release_task(parsec_ttg_task_base_t* task_base) {
@@ -292,12 +299,11 @@ namespace ttg_parsec {
         }
       }
 
-      template<ttg::ExecutionSpace Space>
-      parsec_hook_return_t invoke_evaluate() {
-        if constexpr (Space == ttg::ExecutionSpace::Host) {
-          return PARSEC_HOOK_RETURN_DONE;
+      parsec_hook_return_t invoke_prepare_input() {
+        if constexpr (TT::derived_has_device_op()) {
+          return TT::device_static_prepare_input(&this->parsec_task);
         } else {
-          return TT::device_static_evaluate(&this->parsec_task);
+          return PARSEC_HOOK_RETURN_DONE;
         }
       }
 
@@ -329,6 +335,10 @@ namespace ttg_parsec {
         tt_ht_item.key = pkey();
         this->dev_ptr = this->dev_state.dev_ptr();
         init_stream_info(tt, streams);
+        if constexpr (TT::derived_has_device_op()) {
+          /* device tasks collect their inputs in prepare_input (see TT::device_static_prepare_input) */
+          parsec_task.status = PARSEC_TASK_STATUS_PREPARE_INPUT;
+        }
       }
 
       static void release_task(parsec_ttg_task_base_t* task_base) {
@@ -346,12 +356,11 @@ namespace ttg_parsec {
         }
       }
 
-      template<ttg::ExecutionSpace Space>
-      parsec_hook_return_t invoke_evaluate() {
-        if constexpr (Space == ttg::ExecutionSpace::Host) {
-          return PARSEC_HOOK_RETURN_DONE;
+      parsec_hook_return_t invoke_prepare_input() {
+        if constexpr (TT::derived_has_device_op()) {
+          return TT::device_static_prepare_input(&this->parsec_task);
         } else {
-          return TT::device_static_evaluate(&this->parsec_task);
+          return PARSEC_HOOK_RETURN_DONE;
         }
       }
 
