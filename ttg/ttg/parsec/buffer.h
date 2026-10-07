@@ -358,10 +358,10 @@ public:
     int parsec_id = detail::ttg_device_to_parsec_device(dev);
     uint32_t max_version = 0;
     for (int i = 0; i < parsec_nb_devices; ++i) {
-      if (nullptr == m_data->device_copies[i]) continue;
+      if (nullptr == m_data->device_copies[i] || m_data->device_copies[i]->device_private == nullptr) continue;
       max_version = std::max(max_version, m_data->device_copies[i]->version);
     }
-    return (m_data->device_copies[parsec_id] &&
+    return (m_data->device_copies[parsec_id] && m_data->device_copies[parsec_id]->device_private != nullptr &&
             m_data->device_copies[parsec_id]->version == max_version);
   }
 
