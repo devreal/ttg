@@ -309,10 +309,29 @@ namespace ttg::device {
       t.send();
     };
 
+    template <typename Fn>
+    inline send_coro_state on_complete_coro(Fn fn) {
+      co_await ttg::Void{};  // we'll come back once the task is done
+      fn();
+    };
+
     struct send_t {
       send_coro_state coro;
     };
   }  // namespace detail
+
+  /**
+   * Invoke \c fn once the device task has completed, i.e., after the runtime
+   * has released the task's device data, at the same point where the task's
+   * sends and broadcasts are executed. Add the returned object to the sends
+   * passed to the task's final \c co_await (e.g., via \sa ttg::device::forward).
+   * Useful for publishing data written by the task to other tasks, which must
+   * not access it on the device while the writing task is still active.
+   */
+  template <typename Fn>
+  inline detail::send_t on_complete(Fn&& fn) {
+    return detail::send_t{detail::on_complete_coro(std::decay_t<Fn>(std::forward<Fn>(fn)))};
+  }
 
   template <size_t i, typename keyT, typename valueT, typename... out_keysT, typename... out_valuesT,
             ttg::Runtime Runtime = ttg::ttg_runtime>
