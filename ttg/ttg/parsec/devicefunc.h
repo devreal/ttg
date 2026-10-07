@@ -122,6 +122,14 @@ namespace ttg_parsec {
     parsec_gpu_task_t *gpu_task = caller->dev_ptr->gpu_task;
     parsec_flow_t *flows = caller->dev_ptr->flows;
 
+    if (span.size() > MAX_PARAM_COUNT) {
+      throw std::runtime_error(std::string("register_device_memory: task ")
+                               + detail::parsec_ttg_caller->parsec_task.task_class->name + " selects "
+                               + std::to_string(span.size()) + " buffers but PaRSEC supports only "
+                               + std::to_string(MAX_PARAM_COUNT) + " device inputs/outputs "
+                               "(MAX_PARAM_COUNT). Increase MAX_PARAM_COUNT and recompile PaRSEC/TTG.");
+    }
+
     bool is_current = false;
     for (i = 0; i < span.size(); ++i) {
       parsec_data_t* data = span[i].impl_data;
