@@ -4,6 +4,7 @@
 
 #include <array>
 #include <type_traits>
+#include <stdexcept>
 #include <span>
 
 
@@ -712,6 +713,7 @@ namespace ttg::device {
 
       template<typename... Ts>
       ttg::suspend_always await_transform(detail::to_device_t<Ts...>&& a) {
+        check_first_select();
         auto arr = detail::extract_buffer_data(a, std::make_index_sequence<sizeof...(Ts)>{});
         bool need_transfer = !(TTG_IMPL_NS::register_device_memory(ttg::span(arr)));
         /* TODO: are we allowed to not suspend here and launch the kernel directly? */
@@ -720,6 +722,7 @@ namespace ttg::device {
       }
 
       ttg::suspend_always await_transform(detail::to_device_t<Input>&& a) {
+        check_first_select();
         bool need_transfer = !(TTG_IMPL_NS::register_device_memory(a.input.span()));
         /* TODO: are we allowed to not suspend here and launch the kernel directly? */
         m_state = ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER;
@@ -803,9 +806,21 @@ namespace ttg::device {
       }
 
     private:
+      /* The backend stages exactly the buffers passed to the first select();
+       * buffers passed to any later select() would silently never be made
+       * available on the device, so reject it outright. */
+      void check_first_select() {
+        if (m_selected) {
+          throw std::runtime_error("Repeated ttg::device::select() calls are not allowed: "
+                                   "a device task may select its buffers only once.");
+        }
+        m_selected = true;
+      }
+
       std::vector<device::detail::send_t> m_sends;
       ttg_device_coro_state m_state = ttg::device::detail::TTG_DEVICE_CORO_STATE_NONE;
       void* m_batch_args_erased = nullptr;
+      bool m_selected = false;
 
     };
 
