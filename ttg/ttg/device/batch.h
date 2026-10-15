@@ -3,6 +3,7 @@
 #define TTG_DEVICE_BATCH_H
 
 #include <cstddef>
+#include <memory>
 #include <tuple>
 #include <type_traits>
 #include <vector>
@@ -51,6 +52,13 @@ namespace ttg::device {
    * leader and followers alike, proceed identically afterwards (typically
    * `co_await ttg::device::wait(...)`).
    *
+   * The member list is built once per batch, by the leader (which the
+   * runtime resumes first, while every member is still suspended in its
+   * \c coop() call), and shared by the views handed to all other members.
+   * A member's arguments live in its coroutine frame, so they are only
+   * guaranteed to be valid for the leader: followers must not access other
+   * members' arguments, since those members may have completed already.
+   *
    * If no siblings were collected (batching disabled or unsupported by the
    * runtime, or no compatible candidates were ready), the batch has
    * `size() == 1` and `is_leader() == true`, so the same application code
@@ -61,8 +69,10 @@ namespace ttg::device {
    public:
     using member_type = batch_member<Key, Args...>;
 
+    using members_type = std::vector<member_type>;
+
     batch_view() = default;
-    batch_view(std::vector<member_type> members, bool is_leader)
+    batch_view(std::shared_ptr<const members_type> members, bool is_leader)
         : m_members(std::move(members)), m_is_leader(is_leader) {}
 
     /// @return true if this task is responsible for submitting the (possibly
@@ -70,15 +80,15 @@ namespace ttg::device {
     bool is_leader() const { return m_is_leader; }
 
     /// @return the number of tasks collected into this batch (always >= 1)
-    std::size_t size() const { return m_members.size(); }
+    std::size_t size() const { return m_members ? m_members->size() : 0; }
 
-    auto begin() const { return m_members.begin(); }
-    auto end() const { return m_members.end(); }
+    auto begin() const { return m_members->begin(); }
+    auto end() const { return m_members->end(); }
 
-    const member_type& operator[](std::size_t i) const { return m_members[i]; }
+    const member_type& operator[](std::size_t i) const { return (*m_members)[i]; }
 
    private:
-    std::vector<member_type> m_members;
+    std::shared_ptr<const members_type> m_members;
     bool m_is_leader = false;
   };
 
