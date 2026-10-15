@@ -7,6 +7,7 @@
 #include <parsec/parsec_internal.h>
 #include <parsec/mca/device/device_gpu.h>
 
+#include <memory>
 #include <vector>
 
 namespace ttg_parsec {
@@ -42,6 +43,11 @@ namespace ttg_parsec {
       /* set on the ring head once the ring's members parked in ttg::device::coop()
        * have been handed their batch_view (see device_static_submit) */
       bool batch_delivered = false;
+      /* set on the ring head: the type-erased member list of the ring's
+       * ttg::device::batch_view, built once by the first make_batch_view()
+       * call (the leader's) and shared with every other member; released at
+       * the end of device_static_submit's delivery pass */
+      std::shared_ptr<const void> batch_members;
 #if defined(TTG_HAVE_PARSEC_DEV_BATCH)
       /* copies deferred by mark_device_out(); only ever populated on the
        * ring head's own device_ptr_t (see mark_device_out and the flush
