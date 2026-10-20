@@ -153,6 +153,7 @@ namespace ttg_parsec {
         parsec_atomic_lock_t reduce_copies_lock;
         std::vector<ttg_data_copy_t*> reduce_copies;
         std::atomic<std::size_t> reduce_count;
+        std::atomic<bool> released;  //< set by whoever releases the task once the goal is reached
       };
 
     protected:
@@ -165,6 +166,7 @@ namespace ttg_parsec {
             parsec_atomic_lock_init(&streams[i].reduce_copies_lock);
             streams[i].reduce_copies.clear();
             streams[i].reduce_count.store(0, std::memory_order_relaxed);
+            streams[i].released.store(false, std::memory_order_relaxed);
           }
           /* recursion */
           if constexpr((i + 1) < TT::numins) {
