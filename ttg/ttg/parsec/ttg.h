@@ -2234,24 +2234,25 @@ namespace ttg_parsec {
       std::size_t c = 0;
       std::size_t size = 0;
       assert(parent_task->streams[i].reduce_count > 0);
+      bool first_empty = false;
       if (rtask->is_first) {
         if (0 == (parent_task->streams[i].reduce_count.fetch_sub(1, std::memory_order_acq_rel)-1)) {
-          /* we were the first and there is nothing to be done */
+          /* we were the first and there is nothing to reduce, but the goal may have been
+           * lowered to the first value (finalize_argstream) in the meantime */
           //if (obj->tracing()) {
             if constexpr (!ttg::meta::is_void_v<keyT>)
               ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : ", parent_task->key, ": first reducer empty");
             else
               ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : first reducer empty");
           //}
-
-          return PARSEC_HOOK_RETURN_DONE;
+          first_empty = true;
         }
       }
 
       assert(detail::parsec_ttg_caller == NULL);
       detail::parsec_ttg_caller = rtask->parent_task;
 
-      do {
+      if (!first_empty) do {
         if constexpr(!val_is_void) {
           /* the copies to reduce out of */
           detail::ttg_data_copy_t *source_copy;
@@ -2282,8 +2283,16 @@ namespace ttg_parsec {
       } while ((c = (parent_task->streams[i].reduce_count.fetch_sub(1, std::memory_order_acq_rel)-1)) > 0);
       //} while ((c = (--task->streams[i].reduce_count)) > 0);
 
-      /* finalize_argstream sets goal to 1, so size may be larger than goal */
-      bool complete = (size >= parent_task->streams[i].goal);
+      /* finalize_argstream sets goal to 1, so size may be larger than goal.
+       * Read the goal under the lock under which set_argstream_size changes it, once no
+       * further values are pending (c == 0): either we see the new goal, or set_argstream_size
+       * sees that we are done and releases the task itself. */
+      bool complete = false;
+      if (c == 0) {
+        std::lock_guard<std::mutex> lock(parent_task->streams[i].reduce_copies_lock);
+        if (first_empty) size = parent_task->streams[i].size;
+        complete = (size >= parent_task->streams[i].goal);
+      }
 
       //std::cout << "static_reducer_op size " << size
       //          << " of " << parent_task->streams[i].goal << " complete " << complete
@@ -2292,7 +2301,7 @@ namespace ttg_parsec {
         ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : ", parent_task->key, ": size ", size, " of ", parent_task->streams[i].goal, " complete ", complete, " c ", c);
       else
         ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : size ", size, " of ", parent_task->streams[i].goal, " complete ", complete, " c ", c);
-      if (complete && c == 0) {
+      if (complete && !parent_task->streams[i].released.exchange(true, std::memory_order_acq_rel)) {
         if constexpr(input_is_const) {
           /* make the consumer task a reader if its input is const */
           target_copy->reset_readers();
@@ -2925,9 +2934,12 @@ namespace ttg_parsec {
             detail::reducer_task_t *reduce_task;
             reduce_task = create_new_reducer_task<i>(task, true);
 
-            /* protected by the bucket lock */
-            task->streams[i].size = 1;
-            task->streams[i].reduce_count.store(1, std::memory_order_relaxed);
+            /* protected by the bucket lock, and by the stream lock against set_argstream_size */
+            {
+              std::lock_guard<std::mutex> lock(task->streams[i].reduce_copies_lock);
+              task->streams[i].size = 1;
+              task->streams[i].reduce_count.store(1, std::memory_order_relaxed);
+            }
 
             /* get the copy to use as input for this task */
             detail::ttg_data_copy_t *copy = get_copy_fn(reduce_task, std::forward<Value>(value), false);
@@ -3709,15 +3721,19 @@ namespace ttg_parsec {
         // TODO: Unfriendly implementation, cannot check if stream is already bounded
         // TODO: Unfriendly implementation, cannot check if stream has been finalized already
 
-        // commit changes
-        // 1) "lock" the stream by incrementing the reduce_count
-        // 2) set the goal
-        // 3) "unlock" the stream
-        // only one thread will see the reduce_count be zero and the goal match the size
-        task->streams[i].reduce_count.fetch_add(1, std::memory_order_acquire);
-        task->streams[i].goal = size;
-        auto c = task->streams[i].reduce_count.fetch_sub(1, std::memory_order_release);
-        if (1 == c && (task->streams[i].size >= size)) {
+        // commit changes: set the goal under the lock that guards the stream's queue of values,
+        // which the reducer also holds when it checks for completion. If no reducer is active
+        // and the goal is already reached, release the task here. reduce_count is not used as a
+        // lock: an increment without a queued value lets a running reducer leave early while
+        // values arriving meanwhile assume that it still runs, and nobody reduces them.
+        bool complete;
+        {
+          std::lock_guard<std::mutex> lock(task->streams[i].reduce_copies_lock);
+          task->streams[i].goal = size;
+          complete = (0 == task->streams[i].reduce_count.load(std::memory_order_acquire))
+                     && (task->streams[i].size >= size);
+        }
+        if (complete && !task->streams[i].released.exchange(true, std::memory_order_acq_rel)) {
           release_task(task);
         }
       }
@@ -3768,15 +3784,19 @@ namespace ttg_parsec {
         // TODO: Unfriendly implementation, cannot check if stream is already bounded
         // TODO: Unfriendly implementation, cannot check if stream has been finalized already
 
-        // commit changes
-        // 1) "lock" the stream by incrementing the reduce_count
-        // 2) set the goal
-        // 3) "unlock" the stream
-        // only one thread will see the reduce_count be zero and the goal match the size
-        task->streams[i].reduce_count.fetch_add(1, std::memory_order_acquire);
-        task->streams[i].goal = size;
-        auto c = task->streams[i].reduce_count.fetch_sub(1, std::memory_order_release);
-        if (1 == c && (task->streams[i].size >= size)) {
+        // commit changes: set the goal under the lock that guards the stream's queue of values,
+        // which the reducer also holds when it checks for completion. If no reducer is active
+        // and the goal is already reached, release the task here. reduce_count is not used as a
+        // lock: an increment without a queued value lets a running reducer leave early while
+        // values arriving meanwhile assume that it still runs, and nobody reduces them.
+        bool complete;
+        {
+          std::lock_guard<std::mutex> lock(task->streams[i].reduce_copies_lock);
+          task->streams[i].goal = size;
+          complete = (0 == task->streams[i].reduce_count.load(std::memory_order_acquire))
+                     && (task->streams[i].size >= size);
+        }
+        if (complete && !task->streams[i].released.exchange(true, std::memory_order_acq_rel)) {
           release_task(task);
         }
       }
@@ -3820,15 +3840,15 @@ namespace ttg_parsec {
         // TODO: Unfriendly implementation, cannot check if stream is already bounded
         // TODO: Unfriendly implementation, cannot check if stream has been finalized already
 
-        // commit changes
-        // 1) "lock" the stream by incrementing the reduce_count
-        // 2) set the goal
-        // 3) "unlock" the stream
-        // only one thread will see the reduce_count be zero and the goal match the size
-        task->streams[i].reduce_count.fetch_add(1, std::memory_order_acquire);
-        task->streams[i].goal = 1;
-        auto c = task->streams[i].reduce_count.fetch_sub(1, std::memory_order_release);
-        if (1 == c && (task->streams[i].size >= 1)) {
+        // commit changes, as in set_argstream_size
+        bool complete;
+        {
+          std::lock_guard<std::mutex> lock(task->streams[i].reduce_copies_lock);
+          task->streams[i].goal = 1;
+          complete = (0 == task->streams[i].reduce_count.load(std::memory_order_acquire))
+                     && (task->streams[i].size >= 1);
+        }
+        if (complete && !task->streams[i].released.exchange(true, std::memory_order_acq_rel)) {
           release_task(task);
         }
       }
@@ -3869,15 +3889,15 @@ namespace ttg_parsec {
         // TODO: Unfriendly implementation, cannot check if stream is already bounded
         // TODO: Unfriendly implementation, cannot check if stream has been finalized already
 
-        // commit changes
-        // 1) "lock" the stream by incrementing the reduce_count
-        // 2) set the goal
-        // 3) "unlock" the stream
-        // only one thread will see the reduce_count be zero and the goal match the size
-        task->streams[i].reduce_count.fetch_add(1, std::memory_order_acquire);
-        task->streams[i].goal = 1;
-        auto c = task->streams[i].reduce_count.fetch_sub(1, std::memory_order_release);
-        if (1 == c && (task->streams[i].size >= 1)) {
+        // commit changes, as in set_argstream_size
+        bool complete;
+        {
+          std::lock_guard<std::mutex> lock(task->streams[i].reduce_copies_lock);
+          task->streams[i].goal = 1;
+          complete = (0 == task->streams[i].reduce_count.load(std::memory_order_acquire))
+                     && (task->streams[i].size >= 1);
+        }
+        if (complete && !task->streams[i].released.exchange(true, std::memory_order_acq_rel)) {
           release_task(task);
         }
       }
