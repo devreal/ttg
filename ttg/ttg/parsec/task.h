@@ -51,7 +51,8 @@ namespace ttg_parsec {
 #if defined(TTG_HAVE_PARSEC_DEV_BATCH)
       /* copies deferred by mark_device_out(); only ever populated on the
        * ring head's own device_ptr_t (see mark_device_out and the flush
-       * step at the end of device_static_submit's delivery pass) */
+       * step at the end of device_static_submit's delivery pass), which
+       * frees the buffer since tasks are never destroyed (see task mempool) */
       std::vector<pending_device_copy_t> pending_out;
 #endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
     };
