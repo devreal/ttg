@@ -1826,7 +1826,9 @@ namespace ttg_parsec {
           int ret = gpu_device->memcpy_multi_async(gpu_device, gpu_stream, dsts.data(), srcs.data(), sizes.data(),
                                                     directions.data(), static_cast<int>(pending.size()));
           if (ret != PARSEC_SUCCESS) throw std::runtime_error("Failed to batch-copy data from device to host!");
-          pending.clear();
+          /* free the buffer rather than clear(): the task is placement-new'd into
+           * mempool memory and never destroyed, so a retained buffer would leak */
+          std::vector<detail::pending_device_copy_t>().swap(pending);
         }
       }
 #endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
