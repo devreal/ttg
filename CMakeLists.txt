@@ -241,10 +241,22 @@ if (TARGET PaRSEC::parsec AND TTG_HAVE_DEVICE)
   # here (harmless/idempotent if found again later by the full MPI section).
   find_package(MPI QUIET COMPONENTS CXX)
   cmake_push_check_state()
-  set(CMAKE_REQUIRED_INCLUDES
-      ${PARSEC_SOURCE_DIR} ${PARSEC_SOURCE_DIR}/parsec/include
-      ${PARSEC_BINARY_DIR} ${PARSEC_BINARY_DIR}/parsec/include
-      ${MPI_CXX_INCLUDE_DIRS})
+  if (DEFINED PARSEC_SOURCE_DIR)
+    # PaRSEC was fetched and is built as part of this project
+    set(_ttg_parsec_probe_includes
+        ${PARSEC_SOURCE_DIR} ${PARSEC_SOURCE_DIR}/parsec/include
+        ${PARSEC_BINARY_DIR} ${PARSEC_BINARY_DIR}/parsec/include)
+  else()
+    # an installed PaRSEC found via find_package: its imported target's include
+    # directories point into the install tree; drop any generator expressions
+    get_target_property(_ttg_parsec_probe_includes PaRSEC::parsec INTERFACE_INCLUDE_DIRECTORIES)
+    if (_ttg_parsec_probe_includes)
+      list(FILTER _ttg_parsec_probe_includes EXCLUDE REGEX "\\$<|>")
+    else()
+      set(_ttg_parsec_probe_includes)
+    endif()
+  endif()
+  set(CMAKE_REQUIRED_INCLUDES ${_ttg_parsec_probe_includes} ${MPI_CXX_INCLUDE_DIRS})
   # Skip OpenMPI's deprecated C++ bindings (<mpi.h> pulls them in by default,
   # requiring extra libraries to link a trivial try_compile executable); we
   # never call any MPI function here, we just need the headers to parse.
@@ -262,6 +274,13 @@ if (TARGET PaRSEC::parsec AND TTG_HAVE_DEVICE)
     }
   " TTG_HAVE_PARSEC_DEV_BATCH)
   cmake_pop_check_state()
+  if (NOT TTG_HAVE_PARSEC_DEV_BATCH)
+    message(STATUS "PaRSEC lacks the device task batching API: kernel batching (TT::set_batch_matcher) is disabled")
+    # do not cache a negative result, or switching to a batching-capable PaRSEC
+    # would keep batching disabled without the probe ever running again
+    unset(TTG_HAVE_PARSEC_DEV_BATCH CACHE)
+    set(TTG_HAVE_PARSEC_DEV_BATCH FALSE)
+  endif()
 else()
   set(TTG_HAVE_PARSEC_DEV_BATCH FALSE)
 endif()
