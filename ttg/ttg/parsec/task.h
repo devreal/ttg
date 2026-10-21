@@ -4,6 +4,7 @@
 
 #include "ttg/parsec/ttg_data_copy.h"
 
+#include <cassert>
 #include <memory>
 #include <vector>
 
@@ -138,6 +139,31 @@ namespace ttg_parsec {
       parsec_atomic_lock_t &m_lock;
     };
 
+    /// RAII guard for a PaRSEC spinlock that can be released and reacquired, like std::unique_lock
+    struct atomic_unique_lock {
+      explicit atomic_unique_lock(parsec_atomic_lock_t &lock) : m_lock(lock) { this->lock(); }
+      ~atomic_unique_lock() {
+        if (m_owns) parsec_atomic_unlock(&m_lock);
+      }
+      atomic_unique_lock(const atomic_unique_lock &) = delete;
+      atomic_unique_lock &operator=(const atomic_unique_lock &) = delete;
+
+      void lock() {
+        assert(!m_owns);
+        parsec_atomic_lock(&m_lock);
+        m_owns = true;
+      }
+      void unlock() {
+        assert(m_owns);
+        m_owns = false;
+        parsec_atomic_unlock(&m_lock);
+      }
+
+     private:
+      parsec_atomic_lock_t &m_lock;
+      bool m_owns = false;
+    };
+
     struct parsec_ttg_task_base_t {
       parsec_task_t parsec_task;
       int32_t in_data_count = 0;   //< number of satisfied inputs
@@ -147,13 +173,13 @@ namespace ttg_parsec {
 
       struct stream_info_t {
         stream_info_t() { parsec_atomic_lock_init(&reduce_copies_lock); }
-        std::size_t goal;
-        std::size_t size;
+        std::atomic<std::size_t> goal;  //< changed under reduce_copies_lock, read without it by set_arg
+        std::size_t size;               //< protected by reduce_copies_lock
         /* a spinlock rather than std::mutex: every task carries one per input */
         parsec_atomic_lock_t reduce_copies_lock;
         std::vector<ttg_data_copy_t*> reduce_copies;
         std::atomic<std::size_t> reduce_count;
-        std::atomic<bool> released;  //< set by whoever releases the task once the goal is reached
+        bool released;  //< set under reduce_copies_lock by whoever releases the task once the goal is reached
       };
 
     protected:
@@ -166,7 +192,7 @@ namespace ttg_parsec {
             parsec_atomic_lock_init(&streams[i].reduce_copies_lock);
             streams[i].reduce_copies.clear();
             streams[i].reduce_count.store(0, std::memory_order_relaxed);
-            streams[i].released.store(false, std::memory_order_relaxed);
+            streams[i].released = false;
           }
           /* recursion */
           if constexpr((i + 1) < TT::numins) {
