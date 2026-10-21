@@ -1610,15 +1610,23 @@ namespace ttg_parsec {
                                     parsec_gpu_exec_stream_t    *gpu_stream) {
 
       task_t *task = (task_t*)gpu_task->ec;
-      // get the device task from the coroutine handle
-      ttg::device::Task dev_task = ttg::device::detail::device_task_handle_type::from_address(task->suspended_task_address);
 
       task->dev_ptr->stream = gpu_stream;
 
       //std::cout << "device_static_submit task " << task << std::endl;
 
-      // get the promise which contains the views
-      auto dev_data = dev_task.promise();
+      /* the coroutine state of a ring member; a member whose coroutine has
+       * completed has no frame left (suspended_task_address is null) */
+      auto member_state = [](parsec_gpu_task_t *member_gpu_task) {
+        task_t *mtask = (task_t *)member_gpu_task->ec;
+        if (nullptr == mtask->suspended_task_address) return ttg::device::detail::TTG_DEVICE_CORO_COMPLETE;
+        auto h = ttg::device::detail::device_task_handle_type::from_address(mtask->suspended_task_address);
+        return h.promise().state();
+      };
+
+      /* gpu_task is the ring head; on a later entry it may already have
+       * completed while other members of its ring are still pending */
+      const auto head_state = member_state(gpu_task);
 
 
       auto is_singleton = [](parsec_gpu_task_t *task)
@@ -1633,23 +1641,25 @@ namespace ttg_parsec {
        *       is not the leader of a ring. If it is, we have to make sure we account
        *       for all other tasks in the ring.
        */
-      if (dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT && is_singleton(gpu_task)) {
+      if (head_state == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT && is_singleton(gpu_task)) {
         /* The device task is sending out already but we go through the device scheduler
          * for a pushout. We just report this task done, no callbacks to invoke. */
         return PARSEC_HOOK_RETURN_DONE;
       }
 
       /* we're waiting for the initial transfers, for the kernel to complete,
-       * for the rest of the batch to register, or for a suspended task to resume */
-      assert(dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER ||
-             dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_BATCH ||
-             dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL ||
-             dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_SUSPENDED ||
-             dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT);
+       * for the rest of the batch to register, or for a suspended task to resume;
+       * the head may also be done already while the rest of its ring is not */
+      assert(head_state == ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER ||
+             head_state == ttg::device::detail::TTG_DEVICE_CORO_WAIT_BATCH ||
+             head_state == ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL ||
+             head_state == ttg::device::detail::TTG_DEVICE_CORO_SUSPENDED ||
+             head_state == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT ||
+             (head_state == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE && !is_singleton(gpu_task)));
 
       /* Never batch a task re-entering purely to resolve a pending kernel wait;
        * only tasks fresh off their select() (WAIT_TRANSFER) can become a batch head. */
-      bool is_first_entry = (dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER);
+      bool is_first_entry = (head_state == ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER);
 
 #if defined(PARSEC_HAVE_DEV_CUDA_SUPPORT) && defined(TTG_HAVE_CUDA)
       {
@@ -1718,13 +1728,6 @@ namespace ttg_parsec {
       auto resume_member = [](parsec_gpu_task_t *member_gpu_task) {
         task_t *mtask = (task_t *)member_gpu_task->ec;
         static_op(&mtask->parsec_task);
-      };
-
-      auto member_state = [](parsec_gpu_task_t *member_gpu_task) {
-        task_t *mtask = (task_t *)member_gpu_task->ec;
-        if (nullptr == mtask->suspended_task_address) return ttg::device::detail::TTG_DEVICE_CORO_COMPLETE;
-        auto h = ttg::device::detail::device_task_handle_type::from_address(mtask->suspended_task_address);
-        return h.promise().state();
       };
 
       using ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER;
