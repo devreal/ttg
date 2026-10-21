@@ -132,12 +132,12 @@ namespace ttg_parsec {
       parsec_hash_table_item_t tt_ht_item = {};
 
       struct stream_info_t {
-        std::size_t goal;
-        std::size_t size;
+        std::atomic<std::size_t> goal;  //< changed under reduce_copies_lock, read without it by set_arg
+        std::size_t size;               //< protected by reduce_copies_lock
         std::mutex reduce_copies_lock;
         std::vector<ttg_data_copy_t*> reduce_copies;
         std::atomic<std::size_t> reduce_count;
-        std::atomic<bool> released;  //< set by whoever releases the task once the goal is reached
+        bool released;  //< set under reduce_copies_lock by whoever releases the task once the goal is reached
       };
 
     protected:
@@ -149,7 +149,7 @@ namespace ttg_parsec {
             streams[i].size = 0;
             streams[i].reduce_copies.clear();
             streams[i].reduce_count.store(0, std::memory_order_relaxed);
-            streams[i].released.store(false, std::memory_order_relaxed);
+            streams[i].released = false;
           }
           /* recursion */
           if constexpr((i + 1) < TT::numins) {

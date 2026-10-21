@@ -2209,7 +2209,6 @@ namespace ttg_parsec {
       using rtask_t = detail::reducer_task_t;
       using value_t = std::tuple_element_t<i, actual_input_tuple_type>;
       constexpr const bool val_is_void = ttg::meta::is_void_v<value_t>;
-      constexpr const bool input_is_const = std::is_const_v<value_t>;
       rtask_t *rtask = (rtask_t*)parsec_task;
       task_t *parent_task = static_cast<task_t*>(rtask->parent_task);
       ttT *baseobj = parent_task->tt;
@@ -2230,101 +2229,106 @@ namespace ttg_parsec {
       detail::ttg_data_copy_t *target_copy;
       target_copy = parent_task->copies[i];
       assert(val_is_void || nullptr != target_copy);
-      /* once we hit 0 we have to stop since another thread might enqueue a new reduction task */
-      std::size_t c = 0;
-      std::size_t size = 0;
-      assert(parent_task->streams[i].reduce_count > 0);
-      bool first_empty = false;
-      if (rtask->is_first) {
-        if (0 == (parent_task->streams[i].reduce_count.fetch_sub(1, std::memory_order_acq_rel)-1)) {
-          /* we were the first and there is nothing to reduce, but the goal may have been
-           * lowered to the first value (finalize_argstream) in the meantime */
-          //if (obj->tracing()) {
-            if constexpr (!ttg::meta::is_void_v<keyT>)
-              ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : ", parent_task->key, ": first reducer empty");
-            else
-              ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : first reducer empty");
-          //}
-          first_empty = true;
-        }
-      }
+      auto &stream = parent_task->streams[i];
+      assert(stream.reduce_count > 0);
 
       assert(detail::parsec_ttg_caller == NULL);
       detail::parsec_ttg_caller = rtask->parent_task;
 
-      if (!first_empty) do {
-        if constexpr(!val_is_void) {
-          /* the copies to reduce out of */
-          detail::ttg_data_copy_t *source_copy;
-          detail::ttg_data_copy_t *item = nullptr;
-          {
-            std::lock_guard<std::mutex> lock(parent_task->streams[i].reduce_copies_lock);
-            if (!parent_task->streams[i].reduce_copies.empty()) {
-              item = parent_task->streams[i].reduce_copies.back();
-              parent_task->streams[i].reduce_copies.pop_back();
+      /* reduce_count is decremented and the goal is checked under the stream lock, under which
+       * set_argstream_size and finalize_argstream change the goal: they cannot see a count of 0
+       * while we still use the parent task, and exactly one of us releases it. Once the count hits 0
+       * another thread may enqueue a new reducer task, and unless we release the parent task it may
+       * be released elsewhere and freed, so we must not touch it after dropping the lock.
+       * The first reducer has nothing to reduce: the first value was set directly. */
+      bool reduce_next = !rtask->is_first;
+      bool release;
+      {
+        std::unique_lock<std::mutex> lock(stream.reduce_copies_lock);
+        while (true) {
+          if (reduce_next) {
+            if constexpr (!val_is_void) {
+              /* values are enqueued before reduce_count is incremented, so there is one for each count */
+              assert(!stream.reduce_copies.empty());
+              detail::ttg_data_copy_t *source_copy = stream.reduce_copies.back();
+              stream.reduce_copies.pop_back();
+              lock.unlock();
+              assert(target_copy->num_readers() == target_copy->mutable_tag);
+              assert(source_copy->num_readers() > 0);
+              reducer(*reinterpret_cast<std::decay_t<value_t> *>(target_copy->get_ptr()),
+                      *reinterpret_cast<std::decay_t<value_t> *>(source_copy->get_ptr()));
+              detail::release_data_copy(source_copy);
+              lock.lock();
+            } else {
+              lock.unlock();
+              reducer();  // invoke control reducer
+              lock.lock();
             }
+            ++stream.size;
           }
-          if (nullptr == item) {
-            // maybe someone is changing the goal right now
-            break;
-          }
-          source_copy = item;
-          assert(target_copy->num_readers() == target_copy->mutable_tag);
-          assert(source_copy->num_readers() > 0);
-          reducer(*reinterpret_cast<std::decay_t<value_t> *>(target_copy->get_ptr()),
-                  *reinterpret_cast<std::decay_t<value_t> *>(source_copy->get_ptr()));
-          detail::release_data_copy(source_copy);
-        } else if constexpr(val_is_void) {
-          reducer(); // invoke control reducer
+          reduce_next = true;
+          if (1 == stream.reduce_count.fetch_sub(1, std::memory_order_acq_rel)) break;
         }
-        // there is only one task working on this stream, so no need to be atomic here
-        size = ++parent_task->streams[i].size;
-        //std::cout << "static_reducer_op size " << size << " of " << parent_task->streams[i].goal << std::endl;
-      } while ((c = (parent_task->streams[i].reduce_count.fetch_sub(1, std::memory_order_acq_rel)-1)) > 0);
-      //} while ((c = (--task->streams[i].reduce_count)) > 0);
 
-      /* finalize_argstream sets goal to 1, so size may be larger than goal.
-       * Read the goal under the lock under which set_argstream_size changes it, once no
-       * further values are pending (c == 0): either we see the new goal, or set_argstream_size
-       * sees that we are done and releases the task itself. */
-      bool complete = false;
-      if (c == 0) {
-        std::lock_guard<std::mutex> lock(parent_task->streams[i].reduce_copies_lock);
-        if (first_empty) size = parent_task->streams[i].size;
-        complete = (size >= parent_task->streams[i].goal);
+        /* finalize_argstream sets goal to 1, so size may be larger than goal */
+        const std::size_t goal = stream.goal.load(std::memory_order_relaxed);
+        release = !stream.released && stream.size >= goal;
+        stream.released |= release;
+
+        if (obj->tracing()) {
+          if constexpr (!ttg::meta::is_void_v<keyT>)
+            ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : ", parent_task->key, ": size ",
+                       stream.size, " of ", goal, " release ", release, ": done executing");
+          else
+            ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : size ", stream.size, " of ", goal,
+                       " release ", release, ": done executing");
+        }
       }
 
-      //std::cout << "static_reducer_op size " << size
-      //          << " of " << parent_task->streams[i].goal << " complete " << complete
-      //          << " c " << c << std::endl;
-      if constexpr (!ttg::meta::is_void_v<keyT>)
-        ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : ", parent_task->key, ": size ", size, " of ", parent_task->streams[i].goal, " complete ", complete, " c ", c);
-      else
-        ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : size ", size, " of ", parent_task->streams[i].goal, " complete ", complete, " c ", c);
-      if (complete && !parent_task->streams[i].released.exchange(true, std::memory_order_acq_rel)) {
-        if constexpr(input_is_const) {
-          /* make the consumer task a reader if its input is const */
-          target_copy->reset_readers();
-        }
-        /* task may not be runnable yet because other inputs are missing, have release_task decide */
-        parent_task->remove_from_hash = true;
-        parent_task->release_task(parent_task);
+      if (release) {
+        baseobj->template release_stream_task<i>(parent_task);
       }
 
       detail::parsec_ttg_caller = NULL;
-
-      if (obj->tracing()) {
-        if constexpr (!ttg::meta::is_void_v<keyT>)
-          ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : ", parent_task->key, ": done executing");
-        else
-          ttg::trace(obj->get_world().rank(), ":", obj->get_name(), " : done executing");
-      }
 
       return PARSEC_HOOK_RETURN_DONE;
     }
 
 
    protected:
+    /// releases \c task once stream \c i has reached its goal; the caller has set the stream's \c released flag
+    template <std::size_t i>
+    void release_stream_task(task_t *task) {
+      using value_t = std::tuple_element_t<i, actual_input_tuple_type>;
+      if constexpr (!ttg::meta::is_void_v<value_t> && std::is_const_v<value_t>) {
+        /* make the consumer task a reader if its input is const */
+        task->copies[i]->reset_readers();
+      }
+      /* task may not be runnable yet because other inputs are missing, have release_task decide */
+      task->remove_from_hash = true;
+      release_task(task);
+    }
+
+    /// sets the goal of stream \c i of \c task, releasing the task if no reducer is active and the goal is reached
+    template <std::size_t i>
+    void set_stream_goal(task_t *task, std::size_t goal) {
+      // The goal is changed under the stream lock, under which the reducer also decrements reduce_count
+      // and checks for completion: either the reducer sees the new goal, or we see that no reducer is
+      // active. reduce_count is not used as a lock: an increment without a queued value lets a running
+      // reducer leave early while values arriving meanwhile assume that it still runs.
+      auto &stream = task->streams[i];
+      bool release;
+      {
+        std::lock_guard<std::mutex> lock(stream.reduce_copies_lock);
+        stream.goal.store(goal, std::memory_order_relaxed);
+        release = !stream.released && 0 == stream.reduce_count.load(std::memory_order_acquire) && stream.size >= goal;
+        stream.released |= release;
+      }
+      if (release) {
+        release_stream_task<i>(task);
+      }
+    }
+
     template <typename T>
     uint64_t unpack(T &obj, void *_bytes, uint64_t pos) {
       using dd_t = ttg::default_data_descriptor<ttg::meta::remove_cvr_t<T>>;
@@ -2910,7 +2914,8 @@ namespace ttg_parsec {
         return copy;
       };
 
-      if (reducer && 1 != task->streams[i].goal) {  // is this a streaming input? reduce the received value
+      // is this a streaming input? reduce the received value
+      if (reducer && 1 != task->streams[i].goal.load(std::memory_order_relaxed)) {
         auto submit_reducer_task = [&](auto *parent_task){
           /* check if we need to create a task */
           std::size_t c = parent_task->streams[i].reduce_count.fetch_add(1, std::memory_order_acquire);
@@ -3721,21 +3726,8 @@ namespace ttg_parsec {
         // TODO: Unfriendly implementation, cannot check if stream is already bounded
         // TODO: Unfriendly implementation, cannot check if stream has been finalized already
 
-        // commit changes: set the goal under the lock that guards the stream's queue of values,
-        // which the reducer also holds when it checks for completion. If no reducer is active
-        // and the goal is already reached, release the task here. reduce_count is not used as a
-        // lock: an increment without a queued value lets a running reducer leave early while
-        // values arriving meanwhile assume that it still runs, and nobody reduces them.
-        bool complete;
-        {
-          std::lock_guard<std::mutex> lock(task->streams[i].reduce_copies_lock);
-          task->streams[i].goal = size;
-          complete = (0 == task->streams[i].reduce_count.load(std::memory_order_acquire))
-                     && (task->streams[i].size >= size);
-        }
-        if (complete && !task->streams[i].released.exchange(true, std::memory_order_acq_rel)) {
-          release_task(task);
-        }
+        // commit changes
+        set_stream_goal<i>(task, size);
       }
     }
 
@@ -3784,21 +3776,8 @@ namespace ttg_parsec {
         // TODO: Unfriendly implementation, cannot check if stream is already bounded
         // TODO: Unfriendly implementation, cannot check if stream has been finalized already
 
-        // commit changes: set the goal under the lock that guards the stream's queue of values,
-        // which the reducer also holds when it checks for completion. If no reducer is active
-        // and the goal is already reached, release the task here. reduce_count is not used as a
-        // lock: an increment without a queued value lets a running reducer leave early while
-        // values arriving meanwhile assume that it still runs, and nobody reduces them.
-        bool complete;
-        {
-          std::lock_guard<std::mutex> lock(task->streams[i].reduce_copies_lock);
-          task->streams[i].goal = size;
-          complete = (0 == task->streams[i].reduce_count.load(std::memory_order_acquire))
-                     && (task->streams[i].size >= size);
-        }
-        if (complete && !task->streams[i].released.exchange(true, std::memory_order_acq_rel)) {
-          release_task(task);
-        }
+        // commit changes
+        set_stream_goal<i>(task, size);
       }
     }
 
@@ -3840,17 +3819,8 @@ namespace ttg_parsec {
         // TODO: Unfriendly implementation, cannot check if stream is already bounded
         // TODO: Unfriendly implementation, cannot check if stream has been finalized already
 
-        // commit changes, as in set_argstream_size
-        bool complete;
-        {
-          std::lock_guard<std::mutex> lock(task->streams[i].reduce_copies_lock);
-          task->streams[i].goal = 1;
-          complete = (0 == task->streams[i].reduce_count.load(std::memory_order_acquire))
-                     && (task->streams[i].size >= 1);
-        }
-        if (complete && !task->streams[i].released.exchange(true, std::memory_order_acq_rel)) {
-          release_task(task);
-        }
+        // commit changes
+        set_stream_goal<i>(task, 1);
       }
     }
 
@@ -3889,17 +3859,8 @@ namespace ttg_parsec {
         // TODO: Unfriendly implementation, cannot check if stream is already bounded
         // TODO: Unfriendly implementation, cannot check if stream has been finalized already
 
-        // commit changes, as in set_argstream_size
-        bool complete;
-        {
-          std::lock_guard<std::mutex> lock(task->streams[i].reduce_copies_lock);
-          task->streams[i].goal = 1;
-          complete = (0 == task->streams[i].reduce_count.load(std::memory_order_acquire))
-                     && (task->streams[i].size >= 1);
-        }
-        if (complete && !task->streams[i].released.exchange(true, std::memory_order_acq_rel)) {
-          release_task(task);
-        }
+        // commit changes
+        set_stream_goal<i>(task, 1);
       }
     }
 
