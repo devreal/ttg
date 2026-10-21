@@ -1532,13 +1532,14 @@ namespace ttg_parsec {
      * batch matcher (see TT::set_batch_matcher). PaRSEC's collector filters
      * candidates only by batch-capable incarnation and matching selected
      * device (see docs/doxygen/task-batching.md); it does NOT filter by task
-     * class. Every device-enabled TT's incarnation is marked batch-capable
-     * unconditionally (see the incarnation wiring below), and TTs sharing a
-     * device share that device's stream/fifo_pending, so a candidate here may
-     * belong to an entirely different TT (different key type, different
-     * task_t layout) -- exactly the failure mode the doc's own example
-     * callback guards against by checking task_class itself. We must do the
-     * same before ever reinterpreting candidate->ec as this TT's task_t.
+     * class. Only TTs that called set_batch_matcher mark their incarnation
+     * batch-capable, but every taskpool sharing a device (other TTs, and
+     * other DSLs such as PTG) shares that device's stream/fifo_pending, so a
+     * candidate here may belong to an entirely different task class (different
+     * key type, different task_t layout) -- exactly the failure mode the doc's
+     * own example callback guards against by checking task_class itself. We
+     * must do the same before ever reinterpreting candidate->ec as this TT's
+     * task_t.
      *
      * Per parsec_gpu_task_batch_cb_t's contract: <0 stops the scan entirely
      * (tasks already spliced into the ring remain attached; this is how we
@@ -1553,9 +1554,17 @@ namespace ttg_parsec {
      * task_class_id instead: it is assigned once per TT object (see
      * get_instance_id() at TT construction) and copied by value into that
      * per-task struct, so it is stable and identical across all tasks of the
-     * same TT while still distinguishing different TTs. */
+     * same TT while still distinguishing different TTs. task_class_id is only
+     * unique within a taskpool, so compare the taskpool first: a task of a
+     * PTG/DPLASMA taskpool on the same device may carry the same id.
+     *
+     * Only candidates fresh off their select() (WAIT_TRANSFER) may join a
+     * batch: a task of this TT re-routed through the device scheduler for a
+     * pushout (SENDOUT) is also queued in fifo_pending, but its coroutine is
+     * past the point where it could take part in a batch. */
     static int batch_match_cb(parsec_gpu_task_t *candidate, parsec_gpu_task_t *batch_head, void *cb_data) {
-      if (candidate->ec->task_class->task_class_id != batch_head->ec->task_class->task_class_id ||
+      if (candidate->ec->taskpool != batch_head->ec->taskpool ||
+          candidate->ec->task_class->task_class_id != batch_head->ec->task_class->task_class_id ||
           candidate->ec->selected_chore != batch_head->ec->selected_chore) {
         return 1;  // a different TT (or incarnation): not compatible, keep scanning
       }
@@ -1567,6 +1576,11 @@ namespace ttg_parsec {
           return -1;  // batch already at capacity (including the head): stop scanning
         }
         auto *ctask = (task_t *)candidate->ec;
+        if (nullptr == ctask->suspended_task_address ||
+            ttg::device::detail::device_task_handle_type::from_address(ctask->suspended_task_address)
+                    .promise().state() != ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER) {
+          return 1;  // not fresh off its select() (e.g., queued for a pushout): keep scanning
+        }
         bool ok;
         try {
           ok = ctx->tt->m_batch_matcher(*ctx->head_key, ctask->key);
