@@ -74,14 +74,14 @@ namespace ttg_parsec {
        * TT::set_batch_matcher); always set to this task's own gpu_task when
        * no batching occurred, so it is safe to dereference unconditionally. */
       parsec_gpu_task_t* batch_ring_head = nullptr;
-      /* set on the ring head once the ring's members parked in ttg::device::coop()
-       * have been handed their batch_view (see device_static_submit) */
-      bool batch_delivered = false;
-      /* set on the ring head: the type-erased member list of the ring's
-       * ttg::device::batch_view, built once by the first make_batch_view()
-       * call (the leader's) and shared with every other member; released at
-       * the end of device_static_submit's delivery pass */
+      /* set on the ring head: the type-erased member list of the batch_view
+       * of the group of members currently being delivered, built once by the
+       * first make_batch_view() call (the leader's) and shared with every
+       * other member of the group; released by device_static_submit's
+       * delivery pass once the group has been delivered */
       std::shared_ptr<const void> batch_members;
+      /* the coop() instantiation of batch_members (see ttg::device::detail::coop_type_tag) */
+      const void* batch_members_type = nullptr;
     };
 
     template<bool SupportDevice>

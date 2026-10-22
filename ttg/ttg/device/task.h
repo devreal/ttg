@@ -179,7 +179,7 @@ namespace ttg::device {
 
       template <typename Promise>
       void await_suspend(ttg::coroutine_handle<Promise> h) noexcept {
-        h.promise().set_batch_args(static_cast<void*>(&args));
+        h.promise().set_batch_args(static_cast<void*>(&args), &coop_type_tag<Key, Args...>);
       }
 
       ttg::device::batch_view<Key, Args...> await_resume() {
@@ -779,14 +779,23 @@ namespace ttg::device {
 
       template <typename Key, typename... Args>
       auto await_transform(detail::coop_t<Key, Args...>&& a) {
+        if (nullptr != m_batch_args_erased) {
+          throw std::runtime_error("Repeated ttg::device::coop() calls are not allowed: "
+                                   "a device task may join a batch only once.");
+        }
         return detail::coop_awaiter<Key, Args...>{a.args};
       }
 
       /* invoked by coop_awaiter::await_suspend; not for direct use */
-      void set_batch_args(void* erased_args_tuple) {
+      void set_batch_args(void* erased_args_tuple, const void* type_tag) {
         m_batch_args_erased = erased_args_tuple;
+        m_batch_args_type = type_tag;
         m_state = ttg::device::detail::TTG_DEVICE_CORO_WAIT_BATCH;
       }
+
+      /* @return the tag identifying the coop<Key, Args...>() instantiation this task
+       * called (see coop_type_tag), or nullptr if it never called coop() */
+      const void* batch_args_type() const { return m_batch_args_type; }
 
       /* @return the (type-erased) tuple of references this task passed to
        * ttg::device::coop(), or nullptr if it never called coop(). Only
@@ -839,6 +848,7 @@ namespace ttg::device {
       std::vector<device::detail::send_t> m_sends;
       ttg_device_coro_state m_state = ttg::device::detail::TTG_DEVICE_CORO_STATE_NONE;
       void* m_batch_args_erased = nullptr;
+      const void* m_batch_args_type = nullptr;
       bool m_selected = false;
 
     };

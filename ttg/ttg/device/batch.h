@@ -19,6 +19,11 @@ namespace ttg::device {
     struct coop_t {
       std::tuple<Args&...> args;
     };
+
+    /* identifies a coop<Key, Args...>() instantiation by the address of its tag, so that
+     * only tasks whose arguments have the same type are batched together */
+    template <typename Key, typename... Args>
+    inline constexpr char coop_type_tag = 0;
   }  // namespace detail
 
   /**
@@ -94,8 +99,13 @@ namespace ttg::device {
 
   /**
    * Collect the batch of sibling tasks the runtime formed together with this
-   * task (\sa TT::set_batch_matcher). Must be awaited immediately after
-   * \sa ttg::device::select has resumed. The provided \c args are exposed to
+   * task (\sa TT::set_batch_matcher). Should be awaited immediately after
+   * \sa ttg::device::select has resumed: the batch consists of the tasks
+   * collected together with this one that are waiting in \c coop(), with
+   * arguments of the same types, when the runtime delivers it. A task that
+   * calls \c coop() later (e.g., after ttg::device::suspend()) is batched with
+   * the tasks waiting at that later time, possibly alone. \c coop() may be
+   * called at most once per task. The provided \c args are exposed to
    * every member of the returned batch (including this task itself) via
    * \sa batch_member::args / batch_member::get -- this is how data that is
    * not exposed through \c select (e.g., per-task scalars) can be shared

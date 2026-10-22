@@ -1216,22 +1216,23 @@ namespace ttg_parsec {
      * TT::set_batch_matcher and device_static_submit) registered via its own
      * coop() call.
      *
-     * The member list is built only once per ring, by the first member
-     * resumed in device_static_submit's delivery pass -- the first member of
-     * the ring, starting at the ring head, that registered via coop(); it is
-     * the leader -- and cached on the ring head's device_ptr_t, so every
-     * other member just shares it. Building it requires every registered
-     * member of the ring to still be suspended at TTG_DEVICE_CORO_WAIT_BATCH,
-     * which holds only for the first member resumed: any member resumed
-     * before may run to completion (e.g., the leader, right after submitting
-     * the batched kernel), destroying its coroutine frame. Rebuilding the
-     * list for every member would thus not only be quadratic in the batch
-     * size, it would also walk into completed members.
+     * device_static_submit's delivery pass resumes the members waiting in
+     * coop() one group at a time, a group being the members that called the
+     * same coop<Key, Args...>() instantiation (only their arguments can be
+     * read as a std::tuple<Args&...>). The member list of a group is built
+     * only once, by its first member resumed -- the leader -- and cached on
+     * the ring head's device_ptr_t, so every other member of the group just
+     * shares it. Building it requires every member of the group to still be
+     * suspended at TTG_DEVICE_CORO_WAIT_BATCH, which holds only for the first
+     * member resumed: any member resumed before may run to completion (e.g.,
+     * the leader, right after submitting the batched kernel), destroying its
+     * coroutine frame. Rebuilding the list for every member would thus not
+     * only be quadratic in the batch size, it would also walk into completed
+     * members.
      *
      * Members that never call coop() (e.g., a task of the same TT that only
      * forwards its inputs, without selecting) may still be collected into the
-     * ring; the progress pass runs them past WAIT_BATCH, and they are left
-     * out of the batch here. */
+     * ring; they are left out of the batch here. */
     template <typename Key, typename... Args>
     ttg::device::batch_view<Key, Args...> make_batch_view() {
       parsec_ttg_task_base_t *caller = detail::parsec_ttg_caller;
@@ -1244,44 +1245,50 @@ namespace ttg_parsec {
       using member_t = typename batch_view_t::member_type;
       using members_t = typename batch_view_t::members_type;
       using args_t = std::tuple<Args &...>;
+      const void *type_tag = &ttg::device::detail::coop_type_tag<Key, Args...>;
 
       /* the caller is suspended in its own coop() call, so its arguments are registered */
-      auto caller_handle = ttg::device::detail::device_task_handle_type::from_address(caller->suspended_task_address);
-      auto *caller_args = static_cast<args_t *>(caller_handle.promise().batch_args_erased());
-      assert(nullptr != caller_args);
+      [[maybe_unused]] auto caller_handle =
+          ttg::device::detail::device_task_handle_type::from_address(caller->suspended_task_address);
+      assert(caller_handle.promise().batch_args_type() == type_tag);
 
-      /* every member of the ring belongs to the same TT (see batch_match_cb),
-       * so the cached list always has the type we expect here */
+      /* the list was built by the leader of the caller's group, see device_static_submit;
+       * do not look at its members, which may have completed */
       if (head_base->dev_ptr->batch_members) {
+        assert(head_base->dev_ptr->batch_members_type == type_tag);
         auto members = std::static_pointer_cast<const members_t>(head_base->dev_ptr->batch_members);
-        const bool is_leader = (&(*members)[0].args() == caller_args);
-        return batch_view_t(std::move(members), is_leader);
+        return batch_view_t(std::move(members), false);
       }
 
       auto members = std::make_shared<members_t>();
       parsec_gpu_task_t *cur = ring_head;
       do {
         auto *mtask = reinterpret_cast<parsec_ttg_task_base_t *>(cur->ec);
-        /* skip members that completed or are suspended elsewhere without having called coop() */
+        bool is_member = false;
         if (nullptr != mtask->suspended_task_address) {
           auto handle = ttg::device::detail::device_task_handle_type::from_address(mtask->suspended_task_address);
-          if (handle.promise().state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_BATCH) {
-            auto *args_ptr = static_cast<args_t *>(handle.promise().batch_args_erased());
-            if (nullptr == args_ptr) {
-              throw std::runtime_error(
-                  std::string("ttg::device::coop(): a batched task of ") + mtask->parsec_task.task_class->name +
-                  " is waiting for its batch but never registered its coop() arguments");
-            }
-            members->emplace_back(*args_ptr);
+          auto &promise = handle.promise();
+          if (promise.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_BATCH &&
+              promise.batch_args_type() == type_tag) {
+            /* the arguments are registered together with entering WAIT_BATCH */
+            assert(nullptr != promise.batch_args_erased());
+            members->emplace_back(*static_cast<args_t *>(promise.batch_args_erased()));
+            is_member = true;
           }
+        }
+        if (!is_member) {
+          /* completed, past or not yet at its coop() call, or waiting in a different coop() */
+          ttg::trace("ttg::device::coop(): task of ", mtask->parsec_task.task_class->name,
+                     " in the ring is not waiting in this batch's coop() and is left out of it");
         }
         cur = (parsec_gpu_task_t *)cur->list_item.list_next;
       } while (cur != ring_head);
-      /* the caller is the first registered member resumed, see device_static_submit */
-      assert(!members->empty() && &(*members)[0].args() == caller_args);
+      /* the caller is the first member of its group resumed, see device_static_submit */
+      assert(!members->empty() && &(*members)[0].args() == caller_handle.promise().batch_args_erased());
 
       std::shared_ptr<const members_t> shared = std::move(members);
       head_base->dev_ptr->batch_members = shared;
+      head_base->dev_ptr->batch_members_type = type_tag;
       return batch_view_t(std::move(shared), true);
     }
 #endif  // TTG_HAVE_COROUTINE
@@ -1795,44 +1802,55 @@ namespace ttg_parsec {
           if ((is_first_entry && state == TTG_DEVICE_CORO_WAIT_TRANSFER) ||
               (!is_first_entry && (state == TTG_DEVICE_CORO_WAIT_KERNEL || state == TTG_DEVICE_CORO_SUSPENDED))) {
             resume_member(cur);
-            if (head_task->dev_ptr->batch_delivered && member_state(cur) == TTG_DEVICE_CORO_WAIT_BATCH) {
-              throw std::runtime_error("Repeated coop() calls are not allowed.");
-            }
           }
           cur = (parsec_gpu_task_t *)cur->list_item.list_next;
         } while (cur != ring_head);
       }
 
       /* Delivery pass: resume every member parked at WAIT_BATCH a second
-       * time, once the whole ring has registered; this is what hands each
-       * of them the completed ttg::device::batch_view. Members that never
-       * called coop() are already past WAIT_BATCH and are left alone here.
-       * If a member suspended (ttg::device::suspend()) before reaching its
-       * coop() call, delivery is deferred to a later entry. */
-      if (!head_task->dev_ptr->batch_delivered) {
-        bool any_waiting = false, all_registered = true;
-        parsec_gpu_task_t *cur = ring_head;
-        do {
-          auto state = member_state(cur);
-          any_waiting    |= (state == TTG_DEVICE_CORO_WAIT_BATCH);
-          all_registered &= (state != TTG_DEVICE_CORO_SUSPENDED);
-          cur = (parsec_gpu_task_t *)cur->list_item.list_next;
-        } while (cur != ring_head);
-
-        if (any_waiting && all_registered) {
-          head_task->dev_ptr->batch_delivered = true;
-          /* resume in ring order from the head: the first member resumed is
-           * the leader, it builds the batch's member list in make_batch_view
-           * while every member is still suspended, all others reuse it */
-          cur = ring_head;
+       * time; this is what hands each of them the completed
+       * ttg::device::batch_view. Members are delivered in groups of those
+       * that called the same coop<Key, Args...>() instantiation, since only
+       * their arguments can be batched together (see make_batch_view).
+       * Members that are not (yet) waiting in coop() are not waited for: a
+       * member may never call coop(), and one suspended in
+       * ttg::device::suspend() may wait for a member of the batch, so
+       * holding the batch back for them could stall the ring. A member that
+       * calls coop() later is delivered on a later entry, together with the
+       * members waiting in coop() then. */
+      {
+        auto member_batch_type = [](parsec_gpu_task_t *member_gpu_task) -> const void * {
+          task_t *mtask = (task_t *)member_gpu_task->ec;
+          auto h = ttg::device::detail::device_task_handle_type::from_address(mtask->suspended_task_address);
+          return h.promise().batch_args_type();
+        };
+        while (true) {
+          /* the group of the first member, from the ring head, still waiting in coop() */
+          const void *group_type = nullptr;
+          parsec_gpu_task_t *cur = ring_head;
           do {
             if (member_state(cur) == TTG_DEVICE_CORO_WAIT_BATCH) {
+              group_type = member_batch_type(cur);
+              break;
+            }
+            cur = (parsec_gpu_task_t *)cur->list_item.list_next;
+          } while (cur != ring_head);
+          if (nullptr == group_type) break;
+
+          /* resume the group in ring order: the first member resumed is the
+           * leader, it builds the batch's member list in make_batch_view
+           * while every member of the group is still suspended, all others
+           * reuse it. Resumed members leave WAIT_BATCH for good, since
+           * coop() may only be called once per task. */
+          do {
+            if (member_state(cur) == TTG_DEVICE_CORO_WAIT_BATCH && member_batch_type(cur) == group_type) {
               resume_member(cur);
             }
             cur = (parsec_gpu_task_t *)cur->list_item.list_next;
           } while (cur != ring_head);
           /* every member holds its own reference to the list it got */
           head_task->dev_ptr->batch_members.reset();
+          head_task->dev_ptr->batch_members_type = nullptr;
         }
       }
 
