@@ -9,7 +9,6 @@
 #ifdef TTG_EXECUTABLE
 #include <ttg.h>
 #include <ttg/util/bug.h>
-#include <ttg/env.h>
 #endif
 
 int main(int argc, char** argv) {
