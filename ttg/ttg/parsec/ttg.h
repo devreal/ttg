@@ -1560,13 +1560,16 @@ namespace ttg_parsec {
      * gives every task instance its own private copy of the task_class struct
      * (task->dev_ptr->task_class = *task->parsec_task.task_class;), so two
      * tasks belonging to the very same TT always have distinct task_class
-     * pointers -- comparing pointers would reject every candidate. Compare
-     * task_class_id instead: it is assigned once per TT object (see
-     * get_instance_id() at TT construction) and copied by value into that
-     * per-task struct, so it is stable and identical across all tasks of the
-     * same TT while still distinguishing different TTs. task_class_id is only
-     * unique within a taskpool, so compare the taskpool first: a task of a
-     * PTG/DPLASMA taskpool on the same device may carry the same id.
+     * pointers -- comparing pointers would reject every candidate. Nor can we
+     * compare task_class_id: PaRSEC stores it in 8 bits, while TTG fills it from
+     * the process-wide TT instance counter (get_instance_id()), so TTs whose
+     * instance ids differ by a multiple of 256 share a task_class_id, also within
+     * one taskpool. Compare the incarnations array instead: it is allocated once
+     * per TT object (see the TT constructor) and its pointer is copied by value
+     * into every per-task struct, so it is identical across all tasks of the same
+     * TT and distinct between live TTs. Compare the taskpool first, which is
+     * cheaper and also rules out tasks of other DSLs (e.g., PTG/DPLASMA) on the
+     * same device.
      *
      * Only candidates fresh off their select() (WAIT_TRANSFER) may join a
      * batch: a task of this TT re-routed through the device scheduler for a
@@ -1574,7 +1577,7 @@ namespace ttg_parsec {
      * past the point where it could take part in a batch. */
     static int batch_match_cb(parsec_gpu_task_t *candidate, parsec_gpu_task_t *batch_head, void *cb_data) {
       if (candidate->ec->taskpool != batch_head->ec->taskpool ||
-          candidate->ec->task_class->task_class_id != batch_head->ec->task_class->task_class_id ||
+          candidate->ec->task_class->incarnations != batch_head->ec->task_class->incarnations ||
           candidate->ec->selected_chore != batch_head->ec->selected_chore) {
         return 1;  // a different TT (or incarnation): not compatible, keep scanning
       }
