@@ -15,19 +15,38 @@ namespace ttg_parsec {
   namespace detail {
 
 #if defined(TTG_HAVE_PARSEC_DEV_BATCH)
-    /* One deferred device->host copy, queued by mark_device_out() (see
-     * ttg/parsec/devicefunc.h) and later coalesced with every other pending
-     * copy belonging to the same batch ring -- including copies queued by
-     * other ring members -- into a single gpu->memcpy_multi_async() call by
-     * device_static_submit (see ttg/parsec/ttg.h). The layout mirrors
-     * parsec_device_memcpy_multi_async_fn_t's dsts/srcs/sizes/directions
-     * arrays so the collected copies can be handed to it directly. */
-    struct pending_device_copy_t {
-      void* dst;
-      void* src;
-      size_t size;
-      parsec_device_transfer_direction_t direction;
+    /* Device->host copies deferred by mark_device_out() (see
+     * ttg/parsec/devicefunc.h) while device_static_submit progresses a ring
+     * of device tasks on this thread, coalesced -- across every member of
+     * the ring -- into a single gpu->memcpy_multi_async() call before it
+     * returns (see ttg/parsec/ttg.h). Kept per thread, as arrays matching
+     * parsec_device_memcpy_multi_async_fn_t's dsts/srcs/sizes/directions,
+     * so the buffers are handed to it directly and reused across calls. */
+    struct pending_device_copies_t {
+      bool active = false;  // set while device_static_submit progresses a ring on this thread
+      std::vector<void*> dsts;
+      std::vector<void*> srcs;
+      std::vector<size_t> sizes;
+      std::vector<parsec_device_transfer_direction_t> directions;
+
+      void push(void* dst, void* src, size_t size, parsec_device_transfer_direction_t direction) {
+        dsts.push_back(dst);
+        srcs.push_back(src);
+        sizes.push_back(size);
+        directions.push_back(direction);
+      }
+
+      std::size_t size() const { return dsts.size(); }
+
+      void clear() {
+        dsts.clear();
+        srcs.clear();
+        sizes.clear();
+        directions.clear();
+      }
     };
+
+    inline thread_local pending_device_copies_t pending_device_copies;
 #endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
 
     struct device_ptr_t {
@@ -48,13 +67,6 @@ namespace ttg_parsec {
        * call (the leader's) and shared with every other member; released at
        * the end of device_static_submit's delivery pass */
       std::shared_ptr<const void> batch_members;
-#if defined(TTG_HAVE_PARSEC_DEV_BATCH)
-      /* copies deferred by mark_device_out(); only ever populated on the
-       * ring head's own device_ptr_t (see mark_device_out and the flush
-       * step at the end of device_static_submit's delivery pass), which
-       * frees the buffer since tasks are never destroyed (see task mempool) */
-      std::vector<pending_device_copy_t> pending_out;
-#endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
     };
 
     template<bool SupportDevice>
