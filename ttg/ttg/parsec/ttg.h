@@ -1217,15 +1217,21 @@ namespace ttg_parsec {
      * coop() call.
      *
      * The member list is built only once per ring, by the first member
-     * resumed in device_static_submit's delivery pass -- always the ring head,
-     * i.e., the leader -- and cached on the ring head's device_ptr_t, so every
-     * other member just shares it. Building it requires every member of the
-     * ring to still be suspended at TTG_DEVICE_CORO_WAIT_BATCH, which holds
-     * only for the first member resumed: any member resumed before may run
-     * to completion (e.g., the leader, right after submitting the batched
-     * kernel), destroying its coroutine frame. Rebuilding the list for every
-     * member would thus not only be quadratic in the batch size, it would
-     * also walk into completed members. */
+     * resumed in device_static_submit's delivery pass -- the first member of
+     * the ring, starting at the ring head, that registered via coop(); it is
+     * the leader -- and cached on the ring head's device_ptr_t, so every
+     * other member just shares it. Building it requires every registered
+     * member of the ring to still be suspended at TTG_DEVICE_CORO_WAIT_BATCH,
+     * which holds only for the first member resumed: any member resumed
+     * before may run to completion (e.g., the leader, right after submitting
+     * the batched kernel), destroying its coroutine frame. Rebuilding the
+     * list for every member would thus not only be quadratic in the batch
+     * size, it would also walk into completed members.
+     *
+     * Members that never call coop() (e.g., a task of the same TT that only
+     * forwards its inputs, without selecting) may still be collected into the
+     * ring; the progress pass runs them past WAIT_BATCH, and they are left
+     * out of the batch here. */
     template <typename Key, typename... Args>
     ttg::device::batch_view<Key, Args...> make_batch_view() {
       parsec_ttg_task_base_t *caller = detail::parsec_ttg_caller;
@@ -1237,44 +1243,46 @@ namespace ttg_parsec {
       using batch_view_t = ttg::device::batch_view<Key, Args...>;
       using member_t = typename batch_view_t::member_type;
       using members_t = typename batch_view_t::members_type;
+      using args_t = std::tuple<Args &...>;
 
-      bool is_leader = (caller->dev_ptr->gpu_task == ring_head);
+      /* the caller is suspended in its own coop() call, so its arguments are registered */
+      auto caller_handle = ttg::device::detail::device_task_handle_type::from_address(caller->suspended_task_address);
+      auto *caller_args = static_cast<args_t *>(caller_handle.promise().batch_args_erased());
+      assert(nullptr != caller_args);
 
       /* every member of the ring belongs to the same TT (see batch_match_cb),
        * so the cached list always has the type we expect here */
       if (head_base->dev_ptr->batch_members) {
-        return batch_view_t(std::static_pointer_cast<const members_t>(head_base->dev_ptr->batch_members), is_leader);
+        auto members = std::static_pointer_cast<const members_t>(head_base->dev_ptr->batch_members);
+        const bool is_leader = (&(*members)[0].args() == caller_args);
+        return batch_view_t(std::move(members), is_leader);
       }
 
       auto members = std::make_shared<members_t>();
       parsec_gpu_task_t *cur = ring_head;
       do {
         auto *mtask = reinterpret_cast<parsec_ttg_task_base_t *>(cur->ec);
-        /* A member reaches here only if it is suspended at (or past) its own
-         * coop() call; nothing upstream (batch_match_cb, the matcher predicate)
-         * knows or enforces whether a matched candidate's coroutine body will
-         * actually reach coop() before completing. Check for real instead of
-         * asserting, since an assert compiles out under NDEBUG and this would
-         * otherwise be a silent null-dereference in release builds. */
-        if (nullptr == mtask->suspended_task_address) {
-          throw std::runtime_error(
-              "ttg::device::coop(): a task participating in a batch (see TT::set_batch_matcher) completed "
-              "without ever reaching its co_await ttg::device::coop() call; every task matched into a batch "
-              "must call coop() unconditionally");
+        /* skip members that completed or are suspended elsewhere without having called coop() */
+        if (nullptr != mtask->suspended_task_address) {
+          auto handle = ttg::device::detail::device_task_handle_type::from_address(mtask->suspended_task_address);
+          if (handle.promise().state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_BATCH) {
+            auto *args_ptr = static_cast<args_t *>(handle.promise().batch_args_erased());
+            if (nullptr == args_ptr) {
+              throw std::runtime_error(
+                  std::string("ttg::device::coop(): a batched task of ") + mtask->parsec_task.task_class->name +
+                  " is waiting for its batch but never registered its coop() arguments");
+            }
+            members->emplace_back(*args_ptr);
+          }
         }
-        auto handle = ttg::device::detail::device_task_handle_type::from_address(mtask->suspended_task_address);
-        auto *args_ptr = static_cast<std::tuple<Args &...> *>(handle.promise().batch_args_erased());
-        if (nullptr == args_ptr) {
-          throw std::runtime_error(
-              "ttg::device::coop(): a batched task is suspended but never registered its coop() arguments");
-        }
-        members->emplace_back(*args_ptr);
         cur = (parsec_gpu_task_t *)cur->list_item.list_next;
       } while (cur != ring_head);
+      /* the caller is the first registered member resumed, see device_static_submit */
+      assert(!members->empty() && &(*members)[0].args() == caller_args);
 
       std::shared_ptr<const members_t> shared = std::move(members);
       head_base->dev_ptr->batch_members = shared;
-      return batch_view_t(std::move(shared), is_leader);
+      return batch_view_t(std::move(shared), true);
     }
 #endif  // TTG_HAVE_COROUTINE
 
@@ -1810,9 +1818,9 @@ namespace ttg_parsec {
 
         if (any_waiting && all_registered) {
           head_task->dev_ptr->batch_delivered = true;
-          /* resume the ring head (the leader) first: it builds the batch's
-           * member list in make_batch_view while every member is still
-           * suspended, all others reuse it */
+          /* resume in ring order from the head: the first member resumed is
+           * the leader, it builds the batch's member list in make_batch_view
+           * while every member is still suspended, all others reuse it */
           cur = ring_head;
           do {
             if (member_state(cur) == TTG_DEVICE_CORO_WAIT_BATCH) {
