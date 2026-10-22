@@ -1913,6 +1913,9 @@ namespace ttg_parsec {
         gpu_task->last_data_check_epoch = std::numeric_limits<uint64_t>::max(); // used internally
         gpu_task->pushout = 0;
         gpu_task->submit = &TT::device_static_submit;
+        /* PaRSEC frees the gpu_task once it is done with it, if the task is handed to
+         * its device scheduler; otherwise device_static_op frees it (see there) */
+        gpu_task->release_device_task = [](void *ptr) { std::free(ptr); };
         parsec_flow_t *flows = task->dev_ptr->flows;
         /* set up flow information so it is available for pushout */
         for (uint8_t i = 0; i < MAX_PARAM_COUNT; ++i) {
@@ -2005,8 +2008,16 @@ namespace ttg_parsec {
 
       task_t *task = (task_t*)parsec_task;
 
+      /* the gpu_task is only released by PaRSEC (see release_device_task) if handed
+       * to parsec_device_kernel_scheduler below, so release it if we return before */
+      auto release_gpu_task = [task]() {
+        std::free(task->dev_ptr->gpu_task);
+        task->dev_ptr->gpu_task = nullptr;
+      };
+
       if (nullptr == task->suspended_task_address) {
         /* short-cut in case the task returned immediately */
+        release_gpu_task();
         return PARSEC_HOOK_RETURN_DONE;
       }
 
@@ -2022,12 +2033,14 @@ namespace ttg_parsec {
         /* check if any of the copies needs to be pushed out
          * if so, we need to push the task into the scheduler where the pushout can happen */
         if (gpu_task->pushout == 0) {
+          release_gpu_task();
           return PARSEC_HOOK_RETURN_DONE;
         }
       }
 
       if (dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE) {
         /* the task returned immediately so we're done */
+        release_gpu_task();
         return PARSEC_HOOK_RETURN_DONE;
       }
 
