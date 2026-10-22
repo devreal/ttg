@@ -3990,6 +3990,11 @@ namespace ttg_parsec {
 
       detail::parsec_ttg_task_base_t *caller = detail::parsec_ttg_caller;
       bool need_pushout = false;
+      /* A datum that receives both readers and a writer is copied for the writer
+       * (from the host copy, hence the pushout) -- unless it cannot be copied, in which
+       * case the writer is deferred until the readers are done (see register_data_copy)
+       * and the data can stay on the device. */
+      constexpr const bool copyable = std::is_copy_constructible_v<std::decay_t<Value>>;
 
       if (caller->data_flags & detail::ttg_parsec_data_flags::MARKED_PUSHOUT) {
         /* already marked pushout, skip the rest */
@@ -4022,7 +4027,7 @@ namespace ttg_parsec {
           caller->data_flags |= detail::ttg_parsec_data_flags::MULTIPLE_READER;
         }
 
-        if (caller->data_flags & detail::ttg_parsec_data_flags::SINGLE_WRITER) {
+        if (copyable && (caller->data_flags & detail::ttg_parsec_data_flags::SINGLE_WRITER)) {
           /* there is a writer already, we will need to create a copy */
           need_pushout = true;
         }
@@ -4031,9 +4036,9 @@ namespace ttg_parsec {
       } else {
         if (caller->data_flags & detail::ttg_parsec_data_flags::SINGLE_WRITER) {
           caller->data_flags |= detail::ttg_parsec_data_flags::MULTIPLE_WRITER;
-          need_pushout = true;
+          need_pushout = copyable;
         } else {
-          if (caller->data_flags & detail::ttg_parsec_data_flags::SINGLE_READER) {
+          if (copyable && (caller->data_flags & detail::ttg_parsec_data_flags::SINGLE_READER)) {
             /* there are readers, we will need to create a copy */
             need_pushout = true;
           }
