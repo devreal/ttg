@@ -1604,10 +1604,27 @@ namespace ttg_parsec {
 
     /**
      * Submit callback called by PaRSEC once all input transfers have completed.
+     * PaRSEC's device manager is C code that exceptions must not unwind through,
+     * so errors raised while progressing the ring (by the runtime, e.g. a misuse
+     * of ttg::device::coop(), or by the task bodies themselves) abort here.
      */
     static int device_static_submit(parsec_device_gpu_module_t  *gpu_device,
                                     parsec_gpu_task_t           *gpu_task,
                                     parsec_gpu_exec_stream_t    *gpu_stream) {
+      try {
+        return device_static_submit_impl(gpu_device, gpu_task, gpu_stream);
+      } catch (const std::exception &e) {
+        ttg::print_error(((task_t *)gpu_task->ec)->tt->get_name(), " : device task failed: ", e.what());
+      } catch (...) {
+        ttg::print_error(((task_t *)gpu_task->ec)->tt->get_name(), " : device task failed with an unknown exception");
+      }
+      ttg::abort();
+      return PARSEC_HOOK_RETURN_ERROR;
+    }
+
+    static int device_static_submit_impl(parsec_device_gpu_module_t  *gpu_device,
+                                         parsec_gpu_task_t           *gpu_task,
+                                         parsec_gpu_exec_stream_t    *gpu_stream) {
 
       task_t *task = (task_t*)gpu_task->ec;
 
