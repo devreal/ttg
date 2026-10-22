@@ -5,6 +5,7 @@
 #include "ttg/parsec/ttg_data_copy.h"
 
 #include <parsec/parsec_internal.h>
+#include <parsec/mempool.h>
 #include <parsec/mca/device/device_gpu.h>
 
 #include <memory>
@@ -48,6 +49,20 @@ namespace ttg_parsec {
 
     inline thread_local pending_device_copies_t pending_device_copies;
 #endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
+
+    /* A device task as allocated from a TT's gpu_task_mempools. The gpu_task
+     * comes first: mempool elements must start with a parsec_list_item_t, and
+     * PaRSEC hands the gpu_task back to release_device_gpu_task. */
+    struct device_gpu_task_t {
+      parsec_gpu_task_t gpu_task;
+      parsec_thread_mempool_t* mempool_owner;  //< the thread mempool the element is returned to
+    };
+
+    /* parsec_release_device_task_function_t returning a gpu_task to its mempool */
+    inline void release_device_gpu_task(void* ptr) {
+      auto* elt = static_cast<device_gpu_task_t*>(ptr);
+      parsec_thread_mempool_free(elt->mempool_owner, elt);
+    }
 
     struct device_ptr_t {
       parsec_gpu_task_t* gpu_task = nullptr;
