@@ -2,6 +2,9 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
+#include <memory>
+#include <map>
 #include <ttg.h>
 #include <ttg/config.h>
 #include "lapack.hh"
@@ -90,67 +93,63 @@ namespace potrf {
 
 #if defined(ENABLE_DEVICE_KERNEL)
   /**
-   * Small round-robin pool of pinned host / device pointer-array triples used
-   * to build a single cublasDgemmBatched/hipblasDgemmBatched call from the
+   * Per-device pool of pinned host / device pointer-array triples used to
+   * build a single cublasDgemmBatched/hipblasDgemmBatched call from the
    * ttg::device::batch collected via ttg::device::coop (see make_gemm_batched
-   * below). A larger `num_slots` reduces contention (how often acquire()
-   * blocks, see below), but correctness does not depend on sizing it to
-   * exceed the number of concurrent in-flight batches: acquire()/release()
-   * use a per-slot event to block a new leader until the previous occupant's
-   * batched kernel/copies have actually completed, so a slot is never reused
-   * while still in flight. This is illustrative example code, not a
-   * general-purpose device allocator.
+   * below). Slots are allocated on, and only handed out for, the device that
+   * is current on the calling thread (set by PaRSEC's GPU manager), so the
+   * pointer arrays and the event fencing them live on the device running the
+   * batched kernel. acquire() never blocks: a slot is reused once its previous
+   * occupant's copies and kernel have completed (its event has fired), and a
+   * new slot is allocated if all slots of the device are still in flight. The
+   * pool thus grows to the number of batches in flight per device. Slots are
+   * guarded by a mutex since several threads may manage devices concurrently.
+   * This is illustrative example code, not a general-purpose device allocator.
    * Works (as a degenerate size-1 batch) even if the linked PaRSEC lacks
    * kernel-batching support; no TTG_HAVE_PARSEC_DEV_BATCH guard is needed.
    */
   template <typename T>
   struct GemmBatchPointerPool {
-    explicit GemmBatchPointerPool(std::size_t max_batch_size, std::size_t num_slots = 8)
-        : max_batch_size(max_batch_size), slots(num_slots) {
-      for (auto &s : slots) {
-        s.hostA.resize(max_batch_size);
-        s.hostB.resize(max_batch_size);
-        s.hostC.resize(max_batch_size);
-#if defined(TTG_ENABLE_CUDA)
-        cudaHostRegister(s.hostA.data(), max_batch_size * sizeof(const T *), cudaHostRegisterDefault);
-        cudaHostRegister(s.hostB.data(), max_batch_size * sizeof(const T *), cudaHostRegisterDefault);
-        cudaHostRegister(s.hostC.data(), max_batch_size * sizeof(T *), cudaHostRegisterDefault);
-        cudaMalloc(&s.devA, max_batch_size * sizeof(const T *));
-        cudaMalloc(&s.devB, max_batch_size * sizeof(const T *));
-        cudaMalloc(&s.devC, max_batch_size * sizeof(T *));
-        cudaEventCreateWithFlags(&s.ready, cudaEventDisableTiming);
-#elif defined(TTG_ENABLE_HIP)
-        hipHostRegister(s.hostA.data(), max_batch_size * sizeof(const T *), hipHostRegisterDefault);
-        hipHostRegister(s.hostB.data(), max_batch_size * sizeof(const T *), hipHostRegisterDefault);
-        hipHostRegister(s.hostC.data(), max_batch_size * sizeof(T *), hipHostRegisterDefault);
-        hipMalloc(&s.devA, max_batch_size * sizeof(const T *));
-        hipMalloc(&s.devB, max_batch_size * sizeof(const T *));
-        hipMalloc(&s.devC, max_batch_size * sizeof(T *));
-        hipEventCreateWithFlags(&s.ready, hipEventDisableTiming);
-#endif
-      }
-    }
+    explicit GemmBatchPointerPool(std::size_t max_batch_size) : max_batch_size(max_batch_size) {}
 
     ~GemmBatchPointerPool() {
-      for (auto &s : slots) {
+      int current = 0;
 #if defined(TTG_ENABLE_CUDA)
-        cudaHostUnregister(s.hostA.data());
-        cudaHostUnregister(s.hostB.data());
-        cudaHostUnregister(s.hostC.data());
-        cudaFree(s.devA);
-        cudaFree(s.devB);
-        cudaFree(s.devC);
-        cudaEventDestroy(s.ready);
+      cudaGetDevice(&current);
 #elif defined(TTG_ENABLE_HIP)
-        hipHostUnregister(s.hostA.data());
-        hipHostUnregister(s.hostB.data());
-        hipHostUnregister(s.hostC.data());
-        hipFree(s.devA);
-        hipFree(s.devB);
-        hipFree(s.devC);
-        hipEventDestroy(s.ready);
+      hipGetDevice(&current);
 #endif
+      for (auto &[device, device_slots] : slots) {
+#if defined(TTG_ENABLE_CUDA)
+        cudaSetDevice(device);
+#elif defined(TTG_ENABLE_HIP)
+        hipSetDevice(device);
+#endif
+        for (auto &s : device_slots) {
+#if defined(TTG_ENABLE_CUDA)
+          cudaHostUnregister(s->hostA.data());
+          cudaHostUnregister(s->hostB.data());
+          cudaHostUnregister(s->hostC.data());
+          cudaFree(s->devA);
+          cudaFree(s->devB);
+          cudaFree(s->devC);
+          cudaEventDestroy(s->ready);
+#elif defined(TTG_ENABLE_HIP)
+          hipHostUnregister(s->hostA.data());
+          hipHostUnregister(s->hostB.data());
+          hipHostUnregister(s->hostC.data());
+          hipFree(s->devA);
+          hipFree(s->devB);
+          hipFree(s->devC);
+          hipEventDestroy(s->ready);
+#endif
+        }
       }
+#if defined(TTG_ENABLE_CUDA)
+      cudaSetDevice(current);
+#elif defined(TTG_ENABLE_HIP)
+      hipSetDevice(current);
+#endif
     }
 
     struct slot_t {
@@ -164,55 +163,85 @@ namespace potrf {
 #elif defined(TTG_ENABLE_HIP)
       hipEvent_t ready = nullptr;
 #endif
-      // whether `ready` was ever recorded (i.e. this slot has a prior
-      // occupant to wait for); false only before this slot's first release().
-      bool ready_pending = false;
+      // held by a leader between acquire() and release()
+      bool in_use = false;
     };
 
-    /* acquire the next slot (round-robin). Blocks (host-side) until the
-     * previous occupant's batched kernel/copies -- which read this exact
-     * slot's host/device pointer buffers -- have completed, so the caller
-     * can safely overwrite hostA/hostB/hostC without racing an in-flight
-     * H2D copy of the old contents. This host-side wait, not just device-
-     * stream ordering, is required because the race is the CPU overwriting
-     * pinned host memory while the GPU DMA engine may still be reading it;
-     * ordering only the *device*-side work (e.g. cudaStreamWaitEvent) would
-     * not protect the CPU write. The caller fills hostA/hostB/hostC (up to
-     * `count` entries) with this batch's device pointers, copies them to
-     * devA/devB/devC (e.g. via cudaMemcpyAsync/hipMemcpyAsync on the current
-     * stream), launches the batched kernel, and must call release() with
-     * that same stream so the next acquire() of this slot knows what to
-     * wait for. */
+    /* acquire a slot of the current device whose previous occupant's batched
+     * kernel/copies -- which read this slot's host/device pointer buffers --
+     * have completed, so the caller can safely overwrite hostA/hostB/hostC
+     * without racing an in-flight H2D copy of the old contents. The caller
+     * fills hostA/hostB/hostC (up to `count` entries) with this batch's device
+     * pointers, copies them to devA/devB/devC (e.g. via cudaMemcpyAsync/
+     * hipMemcpyAsync on the current stream), launches the batched kernel, and
+     * must call release() with that same stream so a later acquire() knows
+     * when the slot can be reused. */
     slot_t &acquire() {
-      std::size_t idx = next.fetch_add(1, std::memory_order_relaxed) % slots.size();
-      auto &slot = slots[idx];
-      if (slot.ready_pending) {
+      int device = 0;
 #if defined(TTG_ENABLE_CUDA)
-        cudaEventSynchronize(slot.ready);
+      cudaGetDevice(&device);
 #elif defined(TTG_ENABLE_HIP)
-        hipEventSynchronize(slot.ready);
+      hipGetDevice(&device);
 #endif
+      std::lock_guard<std::mutex> lock(mtx);
+      auto &device_slots = slots[device];
+      for (auto &s : device_slots) {
+        // an event that was never recorded counts as completed
+#if defined(TTG_ENABLE_CUDA)
+        if (!s->in_use && cudaEventQuery(s->ready) == cudaSuccess) {
+#elif defined(TTG_ENABLE_HIP)
+        if (!s->in_use && hipEventQuery(s->ready) == hipSuccess) {
+#endif
+          s->in_use = true;
+          return *s;
+        }
       }
-      return slot;
+      /* every slot is in flight: allocate another one rather than block the
+       * GPU manager thread, which progresses all streams of this device */
+      auto &s = device_slots.emplace_back(std::make_unique<slot_t>());
+      s->hostA.resize(max_batch_size);
+      s->hostB.resize(max_batch_size);
+      s->hostC.resize(max_batch_size);
+#if defined(TTG_ENABLE_CUDA)
+      cudaHostRegister(s->hostA.data(), max_batch_size * sizeof(const T *), cudaHostRegisterDefault);
+      cudaHostRegister(s->hostB.data(), max_batch_size * sizeof(const T *), cudaHostRegisterDefault);
+      cudaHostRegister(s->hostC.data(), max_batch_size * sizeof(T *), cudaHostRegisterDefault);
+      cudaMalloc(&s->devA, max_batch_size * sizeof(const T *));
+      cudaMalloc(&s->devB, max_batch_size * sizeof(const T *));
+      cudaMalloc(&s->devC, max_batch_size * sizeof(T *));
+      cudaEventCreateWithFlags(&s->ready, cudaEventDisableTiming);
+#elif defined(TTG_ENABLE_HIP)
+      hipHostRegister(s->hostA.data(), max_batch_size * sizeof(const T *), hipHostRegisterDefault);
+      hipHostRegister(s->hostB.data(), max_batch_size * sizeof(const T *), hipHostRegisterDefault);
+      hipHostRegister(s->hostC.data(), max_batch_size * sizeof(T *), hipHostRegisterDefault);
+      hipMalloc(&s->devA, max_batch_size * sizeof(const T *));
+      hipMalloc(&s->devB, max_batch_size * sizeof(const T *));
+      hipMalloc(&s->devC, max_batch_size * sizeof(T *));
+      hipEventCreateWithFlags(&s->ready, hipEventDisableTiming);
+#endif
+      s->in_use = true;
+      return *s;
     }
 
     /* mark `slot` as in-use until every operation enqueued on `stream` so far
      * (in particular, the H2D copies and the batched kernel reading it) has
      * completed; must be called by the leader right after those are
-     * enqueued, before the slot can be safely acquire()'d again. */
+     * enqueued, on the device the slot was acquired on. */
     template <typename Stream>
     void release(slot_t &slot, Stream stream) {
+      std::lock_guard<std::mutex> lock(mtx);
 #if defined(TTG_ENABLE_CUDA)
       cudaEventRecord(slot.ready, stream);
 #elif defined(TTG_ENABLE_HIP)
       hipEventRecord(slot.ready, stream);
 #endif
-      slot.ready_pending = true;
+      slot.in_use = false;
     }
 
     std::size_t max_batch_size;
-    std::vector<slot_t> slots;
-    std::atomic<std::size_t> next{0};
+    std::mutex mtx;
+    // slots by CUDA/HIP device ordinal; unique_ptr keeps slots in place while the vector grows
+    std::map<int, std::vector<std::unique_ptr<slot_t>>> slots;
   };
 #endif  // defined(ENABLE_DEVICE_KERNEL)
 #endif // ENABLE_DEVICE_KERNEL
