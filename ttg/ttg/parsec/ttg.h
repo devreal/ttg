@@ -4442,9 +4442,12 @@ namespace ttg_parsec {
       }
 #endif // TTG_HAVE_COROUTINE
 
-      /* release the contents of any aggregator inputs before releasing the aggregators themselves below */
+      /* release the contents of any aggregator inputs before releasing the aggregators themselves below;
+       * a dummy task (set_arg_from_msg_keylist) holds the received value itself in copies[0], not an aggregator */
       if constexpr (numinedges > 0) {
-        release_aggregator_contents(task, std::make_index_sequence<numinedges>{});
+        if (!task->is_dummy()) {
+          release_aggregator_contents(task, std::make_index_sequence<numinedges>{});
+        }
       }
 
       /* release our data copies */

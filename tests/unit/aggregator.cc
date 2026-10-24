@@ -3,6 +3,22 @@
 
 #include "ttg.h"
 
+namespace {
+  // Results are recorded on the rank that runs a key's task, so with several ranks each rank
+  // checks only the keys it owns.
+  template <typename TTPtr>
+  std::size_t owned_keys(const TTPtr &tt, std::size_t num_keys) {
+    const auto rank = ttg::default_execution_context().rank();
+    std::size_t n = 0;
+    for (std::size_t k = 0; k < num_keys; ++k) n += (tt->get_keymap()(static_cast<int>(k)) == rank);
+    return n;
+  }
+  template <typename TTPtr>
+  bool owns(const TTPtr &tt, std::size_t k) {
+    return tt->get_keymap()(static_cast<int>(k)) == ttg::default_execution_context().rank();
+  }
+}  // namespace
+
 TEST_CASE("aggregator", "[aggregator][core]") {
   SECTION("fixed-target") {
     ttg::Edge<int, void> I2O;
@@ -41,7 +57,7 @@ TEST_CASE("aggregator", "[aggregator][core]") {
       }
     }
     ttg::ttg_fence(ttg::default_execution_context());
-    CHECK(fired == N / M / nranks);
+    CHECK(fired == owned_keys(sink_op, N / M));
   }
 
   SECTION("per-key-target") {
@@ -84,7 +100,7 @@ TEST_CASE("aggregator", "[aggregator][core]") {
       }
     }
     ttg::ttg_fence(ttg::default_execution_context());
-    CHECK(fired == K / nranks);
+    CHECK(fired == owned_keys(sink_op, K));
   }
 
   SECTION("chunked-even") {
@@ -133,6 +149,7 @@ TEST_CASE("aggregator", "[aggregator][core]") {
     ttg::ttg_fence(ttg::default_execution_context());
 
     for (std::size_t k = 0; k < K; ++k) {
+      if (!owns(sink_op, k)) continue;
       CHECK(received[k] == T);
       CHECK(fires[k] == (T + C - 1) / C);
     }
@@ -180,6 +197,7 @@ TEST_CASE("aggregator", "[aggregator][core]") {
     ttg::ttg_fence(ttg::default_execution_context());
 
     for (std::size_t k = 0; k < K; ++k) {
+      if (!owns(sink_op, k)) continue;
       CHECK(received[k] == T);
       CHECK(fires[k] == (T + C - 1) / C);  // ceil(10/4) == 3: two full chunks of 4, one remainder of 2
     }
@@ -224,6 +242,7 @@ TEST_CASE("aggregator", "[aggregator][core]") {
     ttg::ttg_fence(ttg::default_execution_context());
 
     for (std::size_t k = 0; k < K; ++k) {
+      if (!owns(sink_op, k)) continue;
       CHECK(fires[k] == 1);
     }
   }
@@ -274,6 +293,7 @@ TEST_CASE("aggregator", "[aggregator][core]") {
     ttg::ttg_fence(ttg::default_execution_context());
 
     for (std::size_t k = 0; k < K; ++k) {
+      if (!owns(sink_op, k)) continue;
       CHECK(fires[k] == (T + C - 1) / C);
       CHECK(final_fires[k] == 1);  // exactly one final firing per key
     }
@@ -348,13 +368,61 @@ TEST_CASE("aggregator", "[aggregator][core]") {
     }
     ttg::ttg_fence(ttg::default_execution_context());
 
-    CHECK(combined == K / nranks);
+    CHECK(combined == owned_keys(combiner_op, K));
     for (std::size_t k = 0; k < K; ++k) {
+      if (!owns(combiner_op, k)) continue;
       long expected = 0;
       std::size_t base = 0;
       for (std::size_t kk = 0; kk < k; ++kk) base += (kk + 1);
       for (std::size_t n = base; n < base + (k + 1); ++n) expected += static_cast<long>(n);
       CHECK(final_sum[k] == expected);
     }
+  }
+
+  SECTION("remote-inputs") {
+    // Every aggregator receives values from every rank, so with more than one rank most of its
+    // inputs arrive in messages (set_arg_from_msg), whose dummy task must not be mistaken for a
+    // task holding an aggregator when it is released.
+    ttg::Edge<int, void> I2O;
+    ttg::Edge<int, int> O2S;
+    const int nranks = ttg::default_execution_context().size();
+    const int rank = ttg::default_execution_context().rank();
+
+    constexpr int K = 16;  // keys
+    constexpr int M = 3;   // values per key from each rank
+    const int N = K * M * nranks;
+    const std::size_t target = static_cast<std::size_t>(M * nranks);
+    std::atomic<std::size_t> fired = 0;
+
+    // value n goes to key n % K and is produced on rank (n / K) % nranks, so each key receives
+    // M values from every rank
+    auto op = ttg::make_tt([&](const int &n, std::tuple<ttg::Out<int, int>> &outs) { ttg::send<0>(n % K, n, outs); },
+                           ttg::edges(I2O), ttg::edges(O2S));
+
+    auto sink_op = ttg::make_tt(
+        [&](const int &key, const ttg::Aggregator<int> &agg, std::tuple<> &) {
+          CHECK(agg.size() == target);
+          long sum = 0;
+          for (auto &&v : agg) sum += v;
+          long expected_sum = 0;
+          for (int n = key; n < N; n += K) expected_sum += n;
+          CHECK(sum == expected_sum);
+          fired++;
+        },
+        ttg::edges(ttg::make_aggregator(O2S, target)), ttg::edges());
+
+    op->set_keymap([=](const int &n) { return (n / K) % nranks; });
+    sink_op->set_keymap([=](const int &key) { return key % nranks; });
+    make_graph_executable(op);
+    ttg::execute(ttg::default_execution_context());
+    if (rank == 0) {
+      for (int n = 0; n < N; ++n) {
+        op->invoke(n);
+      }
+    }
+    ttg::ttg_fence(ttg::default_execution_context());
+    std::size_t expected_fired = 0;
+    for (int k = 0; k < K; ++k) expected_fired += (k % nranks == rank);
+    CHECK(fired == expected_fired);
   }
 }  // TEST_CASE("aggregator")
