@@ -4,8 +4,11 @@
 
 #include <cstddef>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <tuple>
 #include <type_traits>
+#include <typeinfo>
 #include <vector>
 
 #ifdef TTG_HAVE_COROUTINE
@@ -118,6 +121,41 @@ namespace ttg::device {
   [[nodiscard]] inline auto coop(Args&&... args) {
     return detail::coop_t<Key, std::remove_reference_t<Args>...>{std::tie(std::forward<Args>(args)...)};
   }
+
+  /**
+   * A handle shared between TT instances whose device tasks may be collected
+   * into the same batch (\sa TT::set_batch_group). Without a group, only
+   * tasks of the same TT instance are batched together. All TTs joining a
+   * group must be of the same C++ type (e.g., several instances created by
+   * the same factory function), since the runtime handles every member of a
+   * batch as a task of the head's TT type. Copies refer to the same group.
+   */
+  class batch_group {
+   public:
+    batch_group() : m_state(std::make_shared<state_t>()) {}
+
+    /// @return an identifier that is equal for all copies of this group and distinct between groups
+    const void* id() const { return m_state.get(); }
+
+    /// Registers a TT of type @c TT with this group.
+    /// @throw std::logic_error if a TT of a different type joined the group before
+    template <typename TT>
+    void join() const {
+      std::lock_guard<std::mutex> lock(m_state->mtx);
+      if (nullptr == m_state->type) {
+        m_state->type = &typeid(TT);
+      } else if (*m_state->type != typeid(TT)) {
+        throw std::logic_error("ttg::device::batch_group: all TTs of a batch group must have the same type");
+      }
+    }
+
+   private:
+    struct state_t {
+      std::mutex mtx;
+      const std::type_info* type = nullptr;
+    };
+    std::shared_ptr<state_t> m_state;
+  };
 
 }  // namespace ttg::device
 
