@@ -82,6 +82,10 @@ namespace ttg_parsec {
       std::shared_ptr<const void> batch_members;
       /* the coop() instantiation of batch_members (see ttg::device::detail::coop_type_tag) */
       const void* batch_members_type = nullptr;
+      /* identifies the TTs whose tasks may be batched together with this one: the
+       * TT's ttg::device::batch_group, if any, or else the TT itself (see
+       * TT::set_batch_group); tasks with equal batch_class have the same TT type */
+      const void* batch_class = nullptr;
     };
 
     template<bool SupportDevice>

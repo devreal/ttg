@@ -123,6 +123,7 @@
 #endif
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
 #if defined(TTG_PARSEC_DEBUG_TRACK_DATA_COPIES)
 #include <unordered_set>
@@ -1457,6 +1458,9 @@ namespace ttg_parsec {
     using batch_matcher_t = typename detail::batch_matcher_type<keyT>::type;
     batch_matcher_t m_batch_matcher;
     std::size_t m_max_batch_size = 1;
+    // the group of TTs whose tasks may be batched together with this TT's (see set_batch_group);
+    // without a group, only tasks of this TT are batched together
+    std::optional<ttg::device::batch_group> m_batch_group;
 #endif  // TTG_HAVE_COROUTINE
     // For now use same type for unary/streaming input terminals, and stream reducers assigned at runtime
     ttg::meta::detail::input_reducers_t<actual_input_tuple_type>
@@ -1571,12 +1575,16 @@ namespace ttg_parsec {
      * compare task_class_id: PaRSEC stores it in 8 bits, while TTG fills it from
      * the process-wide TT instance counter (get_instance_id()), so TTs whose
      * instance ids differ by a multiple of 256 share a task_class_id, also within
-     * one taskpool. Compare the incarnations array instead: it is allocated once
-     * per TT object (see the TT constructor) and its pointer is copied by value
-     * into every per-task struct, so it is identical across all tasks of the same
-     * TT and distinct between live TTs. Compare the taskpool first, which is
-     * cheaper and also rules out tasks of other DSLs (e.g., PTG/DPLASMA) on the
-     * same device.
+     * one taskpool. Compare the batch class instead (see TT::batch_class), stamped
+     * into every task's device_ptr_t: it is the TT's batch_group if it joined one
+     * and the TT's incarnations array otherwise, which is allocated once per TT
+     * object (see the TT constructor) and so distinct between live TTs. A
+     * batch_group only admits TTs of a single type, so a candidate of the head's
+     * batch class is always a task_t of this TT type -- though possibly of a
+     * different TT instance: the head's matcher and max_batch_size apply to the
+     * whole batch. Compare the taskpool first, which is cheaper and also rules
+     * out tasks of other DSLs (e.g., PTG/DPLASMA) on the same device, whose
+     * tasks have no device_ptr_t to inspect.
      *
      * Only candidates fresh off their select() (WAIT_TRANSFER) may join a
      * batch: a task of this TT re-routed through the device scheduler for a
@@ -1584,9 +1592,15 @@ namespace ttg_parsec {
      * past the point where it could take part in a batch. */
     static int batch_match_cb(parsec_gpu_task_t *candidate, parsec_gpu_task_t *batch_head, void *cb_data) {
       if (candidate->ec->taskpool != batch_head->ec->taskpool ||
-          candidate->ec->task_class->incarnations != batch_head->ec->task_class->incarnations ||
           candidate->ec->selected_chore != batch_head->ec->selected_chore) {
-        return 1;  // a different TT (or incarnation): not compatible, keep scanning
+        return 1;  // a different DSL (or incarnation): not compatible, keep scanning
+      }
+      /* only TTG tasks pass the taskpool check, so the base is safe to inspect */
+      auto *candidate_base = reinterpret_cast<detail::parsec_ttg_task_base_t *>(candidate->ec);
+      auto *head_base = reinterpret_cast<detail::parsec_ttg_task_base_t *>(batch_head->ec);
+      if (nullptr == candidate_base->dev_ptr ||
+          candidate_base->dev_ptr->batch_class != head_base->dev_ptr->batch_class) {
+        return 1;  // a TT outside the head's batch class: not compatible, keep scanning
       }
       if constexpr (ttg::meta::is_void_v<keyT>) {
         return -1;  // batching is not supported for void-keyed TTs (see set_batch_matcher)
@@ -1975,6 +1989,9 @@ namespace ttg_parsec {
 
         /* copy over the task class, because that's what we need */
         task->dev_ptr->task_class = *task->parsec_task.task_class;
+#ifdef TTG_HAVE_COROUTINE
+        task->dev_ptr->batch_class = task->tt->batch_class();
+#endif  // TTG_HAVE_COROUTINE
 
         // first invocation of the coroutine to get the coroutine handle
         static_op(parsec_task);
@@ -4951,6 +4968,27 @@ namespace ttg_parsec {
       if (nullptr != self.incarnations) {
         ((__parsec_chore_t *)self.incarnations)[0].type |= TTG_PARSEC_BATCH_CHORE_BIT;
       }
+    }
+
+    /// Allow the device tasks of this TT to be batched together with those of
+    /// every other TT that joined the same \c group (by default, only tasks of
+    /// the same TT are batched together). All TTs of a group must have the
+    /// same type, typically several instances created by the same factory
+    /// function. A batch is formed using the matcher and maximum batch size of
+    /// the TT of its first task (\sa set_batch_matcher), so the TTs of a group
+    /// should use equivalent ones. Must be called before any task of this TT
+    /// is executed.
+    /// @throw std::logic_error if a TT of a different type joined \c group
+    void set_batch_group(ttg::device::batch_group group) {
+      static_assert(!ttg::meta::is_void_v<keyT>, "Batching requires a non-void key type!");
+      group.join<TT>();
+      m_batch_group = std::move(group);
+    }
+
+    /// @return the identifier shared by all TTs whose tasks may be batched
+    ///         together with this TT's (\sa set_batch_group)
+    const void *batch_class() const {
+      return m_batch_group ? m_batch_group->id() : static_cast<const void *>(self.incarnations);
     }
 
     /// @return true if \sa set_batch_matcher was called with a matcher
