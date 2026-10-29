@@ -32,7 +32,7 @@ namespace ttg_parsec {
         if constexpr (std::is_const_v<view_type>) {
           // keep the flow at RW if it was RW to make sure we pull the data back out eventually
           access = PARSEC_FLOW_ACCESS_READ;
-        } else if (view.scope() == ttg::scope::Allocate) {
+        } else if (view.scope() == ttg::scope::Allocate || view.scope() == ttg::scope::SyncOut) {
           access = PARSEC_FLOW_ACCESS_WRITE;
         }
 
@@ -141,7 +141,7 @@ namespace ttg_parsec {
         auto access = PARSEC_FLOW_ACCESS_RW;
         if (is_const) {
           access = PARSEC_FLOW_ACCESS_READ;
-        } else if (ttg::scope::Allocate == scope) {
+        } else if (ttg::scope::Allocate == scope || ttg::scope::SyncOut == scope) {
           access = PARSEC_FLOW_ACCESS_WRITE;
         }
 

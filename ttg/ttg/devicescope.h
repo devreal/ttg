@@ -6,6 +6,8 @@ namespace ttg {
   enum class scope {
     Allocate     = 0x0,  //< memory allocated as scratch, but not moved in or out
     SyncIn       = 0x2,  //< memory allocated as scratch and data transferred to device
+    SyncOut      = 0x4,  //< like Allocate, but host memory is allocated eagerly so that a later
+                         //< transfer back to the host does not have to allocate it in the runtime
     Invalid      = 0xF,  //< invalid scope
   };
 } // namespace ttg

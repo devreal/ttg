@@ -64,9 +64,15 @@ namespace detail {
     using allocator_type = typename allocator_traits::allocator_type;
     using value_type = typename allocator_traits::value_type;
 
-    /* always allocate host memory if the host is the only execution space available */
+    /* always allocate host memory if the host is the only execution space available
+     * or if the application requests it, e.g., for host-only targets in a build
+     * that has device support enabled */
     static constexpr bool always_allocate_on_host
+#if defined(TTG_ALWAYS_ALLOCATE_ON_HOST)
+                          = true;
+#else
                           = (ttg::device::available_execution_space == ttg::ExecutionSpace::Host);
+#endif
 
     /* used as a hook into the PaRSEC object management system
      * so we can release the memory back to the allocator once
@@ -142,9 +148,11 @@ namespace detail {
         m_allocator = std::forward<AllocatorT>(alloc);
         this->m_size = size;
         this->dtt = parsec_datatype_int8_t;
-        if (always_allocate_on_host || scope == ttg::scope::SyncIn) {
+        if (always_allocate_on_host || scope == ttg::scope::SyncIn || scope == ttg::scope::SyncOut) {
           /* the user requested that the data be sync'ed into the device
-           * so we need to provide host memory for the user to fill prior */
+           * so we need to provide host memory for the user to fill prior,
+           * or the data will be sync'ed out and we allocate the host memory
+           * now instead of letting the runtime do it during the transfer */
           do_allocate();
         } else {
           /* if the user only requests an allocation on the device
@@ -261,6 +269,20 @@ private:
 
   friend parsec_data_t* detail::get_parsec_data<T>(const ttg_parsec::Buffer<T, Allocator>&);
 
+
+  /* allocate the host memory if it has not been allocated yet,
+   * using the callback registered with the host copy */
+  void allocate_host() {
+    assert(m_data != nullptr);
+    parsec_data_copy_t *copy = m_data->device_copies[0];
+    if (copy->device_private == nullptr && copy->alloc_cb != nullptr) {
+      parsec_atomic_lock(&m_data->lock);
+      if (copy->device_private == nullptr) {
+        copy->alloc_cb(copy, 0);
+      }
+      parsec_atomic_unlock(&m_data->lock);
+    }
+  }
 
   void release_data() {
     if (nullptr == m_data) return;
@@ -466,10 +488,11 @@ public:
         copy->coherency_state = PARSEC_DATA_COHERENCY_INVALID;
         copy->device_private = ptr;
         m_data->device_copies[parsec_id] =  copy;
+        m_data->device_copies[parsec_id]->version = 0;
       } else {
-        reset(m_count, ttg::scope::SyncIn);
+        /* allocate host memory without touching the version of any copy */
+        allocate_host();
       }
-      m_data->device_copies[parsec_id]->version = 0;
     }
   }
 
@@ -548,9 +571,15 @@ public:
    * the buffer is made available on a device the host
    * data will be copied from the host.
    * If scope is Allocate then no data will be moved.
+   * If scope is SyncOut then no data will be moved but host memory
+   * is allocated so that a later transfer back to the host does not
+   * have to allocate it.
    */
   void reset_scope(ttg::scope scope) {
-    if (scope == ttg::scope::Allocate) {
+    if (scope == ttg::scope::Allocate || scope == ttg::scope::SyncOut) {
+      if (scope == ttg::scope::SyncOut) {
+        allocate_host();
+      }
       m_data->device_copies[0]->version = 0;
     } else if (scope == ttg::scope::SyncIn) {
       m_data->device_copies[0]->version = 1;
