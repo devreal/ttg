@@ -160,6 +160,7 @@ namespace ttg_parsec {
       parsec_task_t parsec_task;
       int32_t in_data_count = 0;   //< number of satisfied inputs
       int32_t data_count = 0;      //< number of data elements in the copies array
+      int32_t copies_capacity = 0; //< number of entries in the copies array, set by the derived task
       ttg_data_copy_t **copies;    //< pointer to the fixed copies array of the derived task
       parsec_hash_table_item_t tt_ht_item = {};
 
@@ -297,6 +298,7 @@ namespace ttg_parsec {
           , tt(tt_ptr) {
         tt_ht_item.key = pkey();
         this->dev_ptr = this->dev_state.dev_ptr();
+        this->copies_capacity = static_cast<int32_t>(std::size(copies));
         // We store the hash of the key and the address where it can be found in locals considered as a scratchpad
         *(uintptr_t*)&(parsec_task.locals[0]) = 0; //there is no key
         *(uintptr_t*)&(parsec_task.locals[2]) = 0; //there is no key
@@ -311,6 +313,7 @@ namespace ttg_parsec {
           , tt(tt_ptr), key(key) {
         tt_ht_item.key = pkey();
         this->dev_ptr = this->dev_state.dev_ptr();
+        this->copies_capacity = static_cast<int32_t>(std::size(copies));
 
         // We store the hash of the key and the address where it can be found in locals considered as a scratchpad
         uint64_t hv = ttg::hash<std::decay_t<decltype(key)>>{}(key);
@@ -364,6 +367,7 @@ namespace ttg_parsec {
           , tt(tt_ptr) {
         tt_ht_item.key = pkey();
         this->dev_ptr = this->dev_state.dev_ptr();
+        this->copies_capacity = static_cast<int32_t>(std::size(copies));
       }
 
       parsec_ttg_task_t(parsec_thread_mempool_t *mempool, parsec_task_class_t *task_class,
@@ -374,6 +378,7 @@ namespace ttg_parsec {
           , tt(tt_ptr) {
         tt_ht_item.key = pkey();
         this->dev_ptr = this->dev_state.dev_ptr();
+        this->copies_capacity = static_cast<int32_t>(std::size(copies));
         init_stream_info(tt, streams);
         if constexpr (TT::derived_has_device_op()) {
           /* device tasks collect their inputs in prepare_input (see TT::device_static_prepare_input) */
