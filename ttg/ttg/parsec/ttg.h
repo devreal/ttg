@@ -692,7 +692,9 @@ namespace ttg_parsec {
         return false;
       }
 
-      if (MAX_PARAM_COUNT < task->data_count) {
+      /* the copies array holds copies_capacity entries: MAX_PARAM_COUNT for device tasks,
+       * the number of inputs plus one for host tasks */
+      if (task->data_count >= task->copies_capacity) {
         throw std::logic_error("Too many data copies, check MAX_PARAM_COUNT!");
       }
 
