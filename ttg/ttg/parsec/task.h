@@ -50,20 +50,6 @@ namespace ttg_parsec {
     inline thread_local pending_device_copies_t pending_device_copies;
 #endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
 
-    /* A device task as allocated from a TT's gpu_task_mempools. The gpu_task
-     * comes first: mempool elements must start with a parsec_list_item_t, and
-     * PaRSEC hands the gpu_task back to release_device_gpu_task. */
-    struct device_gpu_task_t {
-      parsec_gpu_task_t gpu_task;
-      parsec_thread_mempool_t* mempool_owner;  //< the thread mempool the element is returned to
-    };
-
-    /* parsec_release_device_task_function_t returning a gpu_task to its mempool */
-    inline void release_device_gpu_task(void* ptr) {
-      auto* elt = static_cast<device_gpu_task_t*>(ptr);
-      parsec_thread_mempool_free(elt->mempool_owner, elt);
-    }
-
     struct device_ptr_t {
       parsec_gpu_task_t* gpu_task = nullptr;
       parsec_flow_t* flows = nullptr;
@@ -105,7 +91,10 @@ namespace ttg_parsec {
       static constexpr bool support_device = false;
       static constexpr size_t num_flows = MAX_PARAM_COUNT;
       parsec_flow_t m_flows[num_flows];
-      device_ptr_t m_dev_ptr = {nullptr, &m_flows[0], nullptr, nullptr}; // gpu_task will be allocated in each task
+      /* storage for the device task, constructed in TT::device_static_prepare_input with
+       * parsec_obj_static_allocator so that releasing it in PaRSEC only destructs it */
+      parsec_gpu_task_t m_gpu_task;
+      device_ptr_t m_dev_ptr = {nullptr, &m_flows[0], nullptr, nullptr}; // gpu_task is set once m_gpu_task is constructed
       device_ptr_t* dev_ptr() {
         return &m_dev_ptr;
       }

@@ -1314,8 +1314,6 @@ namespace ttg_parsec {
     static_assert(ttg::meta::is_none_Void_v<input_valueTs>, "ttg::Void is for internal use only, do not use it");
 
     parsec_mempool_t mempools;
-    // device tasks handed to PaRSEC's device scheduler, only constructed if derived_has_device_op()
-    parsec_mempool_t gpu_task_mempools;
 
     // check for a non-type member named have_cuda_op
     template <typename T>
@@ -1951,20 +1949,15 @@ namespace ttg_parsec {
       parsec_gpu_task_t *gpu_task = task->dev_ptr->gpu_task;
       if (gpu_task == nullptr) {
 
-        /* set up a device task, zeroed as elements are recycled */
-        auto *elt = static_cast<detail::device_gpu_task_t *>(
-            parsec_thread_mempool_allocate(task->tt->get_thread_mempool(task->tt->gpu_task_mempools)));
-        gpu_task = &elt->gpu_task;
-        std::memset(gpu_task, 0, sizeof(*gpu_task));
-        PARSEC_OBJ_CONSTRUCT(gpu_task, parsec_list_item_t);
+        /* set up the device task in the task's storage; the constructor zeroes it and
+         * the static allocator only destructs it once PaRSEC releases it */
+        gpu_task = &task->dev_state.m_gpu_task;
+        PARSEC_OBJ_CONSTRUCT(gpu_task, parsec_gpu_task_t, &parsec_obj_static_allocator);
         gpu_task->ec = parsec_task;
         gpu_task->task_type = 0; // user task
         gpu_task->last_data_check_epoch = std::numeric_limits<uint64_t>::max(); // used internally
         gpu_task->pushout = 0;
         gpu_task->submit = &TT::device_static_submit;
-        /* PaRSEC releases the gpu_task once it is done with it, if the task is handed to
-         * its device scheduler; otherwise device_static_op releases it (see there) */
-        gpu_task->release_device_task = &detail::release_device_gpu_task;
         parsec_flow_t *flows = task->dev_ptr->flows;
         /* set up flow information so it is available for pushout */
         for (uint8_t i = 0; i < MAX_PARAM_COUNT; ++i) {
@@ -2060,12 +2053,12 @@ namespace ttg_parsec {
 
       task_t *task = (task_t*)parsec_task;
 
-      /* the gpu_task is only released by PaRSEC (see release_device_task) if handed
-       * to parsec_device_kernel_scheduler below, so release it if we return before */
+      /* the gpu_task is only released by PaRSEC if handed to
+       * parsec_device_kernel_scheduler below, so release it if we return before */
       auto release_gpu_task = [task]() {
         if (nullptr != task->dev_ptr->gpu_task) {
-          detail::release_device_gpu_task(task->dev_ptr->gpu_task);
-          task->dev_ptr->gpu_task = nullptr;
+          PARSEC_OBJ_RELEASE(task->dev_ptr->gpu_task);
+          assert(nullptr == task->dev_ptr->gpu_task);
         }
       };
 
@@ -4563,11 +4556,6 @@ namespace ttg_parsec {
 
       parsec_mempool_construct(&mempools, PARSEC_OBJ_CLASS(parsec_task_t), sizeof(task_t),
                                offsetof(parsec_task_t, mempool_owner), nbthreads);
-      if constexpr (derived_has_device_op()) {
-        parsec_mempool_construct(&gpu_task_mempools, PARSEC_OBJ_CLASS(parsec_list_item_t),
-                                 sizeof(detail::device_gpu_task_t),
-                                 offsetof(detail::device_gpu_task_t, mempool_owner), nbthreads);
-      }
 
       parsec_hash_table_init(&tasks_table, offsetof(detail::parsec_ttg_task_base_t, tt_ht_item), 8, tasks_hash_fcts,
                              NULL);
@@ -4645,9 +4633,6 @@ namespace ttg_parsec {
       print_incomplete_tasks();
       parsec_hash_table_fini(&tasks_table);
       parsec_mempool_destruct(&mempools);
-      if constexpr (derived_has_device_op()) {
-        parsec_mempool_destruct(&gpu_task_mempools);
-      }
       // uintptr_t addr = (uintptr_t)self.incarnations;
       // free((void *)addr);
       free((__parsec_chore_t *)self.incarnations);
