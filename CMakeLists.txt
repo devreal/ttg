@@ -276,6 +276,8 @@ if (TARGET PaRSEC::parsec AND TTG_HAVE_DEVICE)
       (void)&parsec_mca_device_type_supports_batch;
       unsigned f = PARSEC_DEV_CHORE_ALLOW_BATCH;
       (void)f;
+      parsec_gpu_task_t t;
+      t.batch_key = nullptr;
       return 0;
     }
   " TTG_HAVE_PARSEC_DEV_BATCH)
