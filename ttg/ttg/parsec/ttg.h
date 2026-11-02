@@ -1576,31 +1576,27 @@ namespace ttg_parsec {
      * the process-wide TT instance counter (get_instance_id()), so TTs whose
      * instance ids differ by a multiple of 256 share a task_class_id, also within
      * one taskpool. Compare the batch class instead (see TT::batch_class), stamped
-     * into every task's device_ptr_t: it is the TT's batch_group if it joined one
+     * into every gpu_task's batch_key: it is the TT's batch_group if it joined one
      * and the TT's incarnations array otherwise, which is allocated once per TT
      * object (see the TT constructor) and so distinct between live TTs. A
      * batch_group only admits TTs of a single type, so a candidate of the head's
      * batch class is always a task_t of this TT type -- though possibly of a
      * different TT instance: the head's matcher and max_batch_size apply to the
-     * whole batch. Compare the taskpool first, which is cheaper and also rules
-     * out tasks of other DSLs (e.g., PTG/DPLASMA) on the same device, whose
-     * tasks have no device_ptr_t to inspect.
+     * whole batch. The batch_key is compared before touching candidate->ec,
+     * which also rules out tasks of other DSLs (e.g., PTG/DPLASMA) on the same
+     * device: their batch_key is NULL or a pointer of their own, never one of
+     * a live TT or batch_group.
      *
      * Only candidates fresh off their select() (WAIT_TRANSFER) may join a
      * batch: a task of this TT re-routed through the device scheduler for a
      * pushout (SENDOUT) is also queued in fifo_pending, but its coroutine is
      * past the point where it could take part in a batch. */
     static int batch_match_cb(parsec_gpu_task_t *candidate, parsec_gpu_task_t *batch_head, void *cb_data) {
-      if (candidate->ec->taskpool != batch_head->ec->taskpool ||
-          candidate->ec->selected_chore != batch_head->ec->selected_chore) {
-        return 1;  // a different DSL (or incarnation): not compatible, keep scanning
+      if (candidate->batch_key != batch_head->batch_key) {
+        return 1;  // a TT outside the head's batch class, or another DSL: not compatible, keep scanning
       }
-      /* only TTG tasks pass the taskpool check, so the base is safe to inspect */
-      auto *candidate_base = reinterpret_cast<detail::parsec_ttg_task_base_t *>(candidate->ec);
-      auto *head_base = reinterpret_cast<detail::parsec_ttg_task_base_t *>(batch_head->ec);
-      if (nullptr == candidate_base->dev_ptr ||
-          candidate_base->dev_ptr->batch_class != head_base->dev_ptr->batch_class) {
-        return 1;  // a TT outside the head's batch class: not compatible, keep scanning
+      if (candidate->ec->selected_chore != batch_head->ec->selected_chore) {
+        return 1;  // a different incarnation: not compatible, keep scanning
       }
       if constexpr (ttg::meta::is_void_v<keyT>) {
         return -1;  // batching is not supported for void-keyed TTs (see set_batch_matcher)
@@ -1984,9 +1980,11 @@ namespace ttg_parsec {
 
         /* copy over the task class, because that's what we need */
         task->dev_ptr->task_class = *task->parsec_task.task_class;
-#ifdef TTG_HAVE_COROUTINE
-        task->dev_ptr->batch_class = task->tt->batch_class();
-#endif  // TTG_HAVE_COROUTINE
+#if defined(TTG_HAVE_PARSEC_DEV_BATCH)
+        /* the device moves tasks of the same batch group together through its stages
+         * and lets them compete for a single batch, see batch_match_cb */
+        gpu_task->batch_key = task->tt->batch_class();
+#endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
 
         // first invocation of the coroutine to get the coroutine handle
         static_op(parsec_task);
