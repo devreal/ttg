@@ -1452,7 +1452,7 @@ namespace ttg_parsec {
       //std::cout << "device_static_submit task " << task << std::endl;
 
       // get the promise which contains the views
-      auto dev_data = dev_task.promise();
+      auto& dev_data = dev_task.promise();
 
       if (dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT) {
         /* The device task is sending out already but we go through the device scheduler
@@ -1505,14 +1505,14 @@ namespace ttg_parsec {
       if (nullptr != task->suspended_task_address) {
         /* Get a new handle for the promise*/
         dev_task = ttg::device::detail::device_task_handle_type::from_address(task->suspended_task_address);
-        dev_data = dev_task.promise();
+        auto& new_dev_data = dev_task.promise();
 
-        assert(dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL ||
-               dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT     ||
-               dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE);
+        assert(new_dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_WAIT_KERNEL ||
+               new_dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT     ||
+               new_dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE);
 
-        if (ttg::device::detail::TTG_DEVICE_CORO_SENDOUT == dev_data.state() ||
-            ttg::device::detail::TTG_DEVICE_CORO_COMPLETE == dev_data.state()) {
+        if (ttg::device::detail::TTG_DEVICE_CORO_SENDOUT == new_dev_data.state() ||
+            ttg::device::detail::TTG_DEVICE_CORO_COMPLETE == new_dev_data.state()) {
           /* the task started sending so we won't come back here */
           //std::cout << "device_static_submit task " << task << " complete" << std::endl;
           discard_tmp_flows();
@@ -1750,10 +1750,10 @@ namespace ttg_parsec {
           auto old_output_tls_ptr = task->tt->outputs_tls_ptr_accessor();
           task->tt->set_outputs_tls_ptr();
           coro.resume();
-          if (coro.completed()) {
-            coro.destroy();
-            suspended_task_address = nullptr;
-          }
+          /* Do not destroy the coroutine here even if it completed: a kernel submitted
+           * without waiting for it may still be running on the stream and use state
+           * held in the coroutine frame. The frame is destroyed in complete_task_and_release
+           * once PaRSEC has observed the completion of the device task. */
           task->tt->set_outputs_tls_ptr(old_output_tls_ptr);
           detail::parsec_ttg_caller = nullptr;
         } else
@@ -1792,7 +1792,14 @@ namespace ttg_parsec {
 #ifdef TTG_HAVE_COROUTINE
       task->suspended_task_address = suspended_task_address;
 #endif // TTG_HAVE_COROUTINE
-      if (suspended_task_address == nullptr) {
+      bool done = (suspended_task_address == nullptr);
+#ifdef TTG_HAVE_DEVICE
+      /* completed device coroutines are kept alive until the task is released */
+      if (!done && task->coroutine_id == ttg::TaskCoroutineID::DeviceTask) {
+        done = ttg::device::detail::device_task_handle_type::from_address(suspended_task_address).promise().complete();
+      }
+#endif // TTG_HAVE_DEVICE
+      if (done) {
         if constexpr (!ttg::meta::is_void_v<keyT>)
           obj->trace(obj->get_world().rank(), ":", obj->get_name(), " : ", task->key, ": done executing");
         else
@@ -3922,22 +3929,23 @@ namespace ttg_parsec {
           auto dev_task = ttg::device::detail::device_task_handle_type::from_address(task->suspended_task_address);
 
           // get the promise which contains the views
-          auto dev_data = dev_task.promise();
+          auto& dev_data = dev_task.promise();
 
           assert(dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT ||
                  dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE);
 
+          /* set the current task, needed inside the sends and when destroying
+           * sends that were never executed */
+          detail::parsec_ttg_caller = task;
+          auto old_output_tls_ptr = task->tt->outputs_tls_ptr_accessor();
+          task->tt->set_outputs_tls_ptr();
           /* execute the sends we stored */
           if (dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT) {
-            /* set the current task, needed inside the sends */
-            detail::parsec_ttg_caller = task;
-            auto old_output_tls_ptr = task->tt->outputs_tls_ptr_accessor();
-            task->tt->set_outputs_tls_ptr();
             dev_data.do_sends(); // all sends happen here
-            task->tt->set_outputs_tls_ptr(old_output_tls_ptr);
-            detail::parsec_ttg_caller = nullptr;
           }
           dev_task.destroy(); // safe to destroy the coroutine now
+          task->tt->set_outputs_tls_ptr(old_output_tls_ptr);
+          detail::parsec_ttg_caller = nullptr;
         }
 #endif // TTG_HAVE_DEVICE
         /* the coroutine should have completed and we cannot access the promise anymore */

@@ -3,6 +3,8 @@
 #define TTG_DEVICE_TASK_H
 
 #include <array>
+#include <cassert>
+#include <utility>
 #include <type_traits>
 #include <span>
 
@@ -244,8 +246,45 @@ namespace ttg::device {
       t.send();
     };
 
-    struct send_t {
-      send_coro_state coro;
+    /**
+     * Owns a suspended send coroutine. The coroutine is resumed through run(),
+     * after which it destroys itself at its final suspend point. If the send is
+     * never run (e.g., it was not co_await'ed) the coroutine frame is destroyed
+     * here to release the data it holds.
+     */
+    struct [[nodiscard]] send_t {
+      send_t(send_coro_state coro) : m_coro(std::move(coro)) {}
+
+      send_t(const send_t&) = delete;
+      send_t& operator=(const send_t&) = delete;
+
+      send_t(send_t&& other) noexcept : m_coro(std::exchange(other.m_coro, send_coro_handle_type{})) {}
+
+      send_t& operator=(send_t&& other) noexcept {
+        if (this != &other) {
+          reset();
+          m_coro = std::exchange(other.m_coro, send_coro_handle_type{});
+        }
+        return *this;
+      }
+
+      ~send_t() { reset(); }
+
+      /// execute the send/broadcast; the coroutine frame is destroyed once it completes
+      void run() {
+        assert(m_coro);
+        std::exchange(m_coro, send_coro_handle_type{}).resume();
+      }
+
+     private:
+      void reset() {
+        if (m_coro) {
+          m_coro.destroy();
+          m_coro = send_coro_handle_type{};
+        }
+      }
+
+      send_coro_handle_type m_coro;
     };
   }  // namespace detail
 
@@ -553,8 +592,11 @@ namespace ttg::device {
   template<typename... Args, ttg::Runtime Runtime = ttg::ttg_runtime>
   [[nodiscard]]
   std::vector<device::detail::send_t> forward(Args&&... args) {
-    // TODO: check the cost of this!
-    return std::vector<device::detail::send_t>{std::forward<Args>(args)...};
+    /* send_t is move-only so we cannot use an initializer list */
+    std::vector<device::detail::send_t> sends;
+    sends.reserve(sizeof...(Args));
+    (sends.emplace_back(std::forward<Args>(args)), ...);
+    return sends;
   }
 
   /*******************************************
@@ -689,7 +731,7 @@ namespace ttg::device {
       /* execute all pending send and broadcast operations */
       void do_sends() {
         for (auto& send : m_sends) {
-          send.coro();
+          send.run();
         }
         m_sends.clear();
       }
