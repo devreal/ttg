@@ -452,11 +452,12 @@ namespace ttg_parsec {
           // We are locally ready (i.e. we won't add new tasks)
           tpool->tdm.module->taskpool_addto_runtime_actions(tpool, -1);
           ttg::trace("ttg_parsec(", this->rank(), "): final waiting for completion");
-          if (own_ctx)
-            parsec_context_wait(ctx);
-          else
-            parsec_taskpool_wait(tpool);
+          if (!own_ctx) parsec_taskpool_wait(tpool);
         }
+        // Another runtime sharing our context (e.g., MADNESS's PaRSEC backend) may have started it
+        // even if our taskpool never was; the reference parsec_context_start took is only dropped by
+        // parsec_context_wait, without which parsec_fini waits for workers that never return.
+        if (own_ctx && (ctx->flags & PARSEC_CONTEXT_FLAG_CONTEXT_ACTIVE)) parsec_context_wait(ctx);
         release_ops();
         ttg::detail::deregister_world(*this);
         destroy_tpool();
