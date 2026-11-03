@@ -1542,6 +1542,10 @@ namespace ttg_parsec {
 
 #ifdef TTG_HAVE_DEVICE
 #if defined(TTG_HAVE_PARSEC_DEV_BATCH)
+    /* number of times a batch head that could not fill its batch waits for more
+     * tasks (see device_static_submit) */
+    static constexpr int max_batch_waits = 1;
+
     struct batch_match_ctx_t {
       TT *tt;
       const keyT *head_key;
@@ -1744,7 +1748,10 @@ namespace ttg_parsec {
         if constexpr (!ttg::meta::is_void_v<keyT>) {
           TT *tt = task->tt;
           if (tt->batching_enabled() && parsec_mca_device_type_supports_batch(gpu_device->super.type)) {
-            batch_match_ctx_t ctx{tt, &task->key, 0, tt->m_max_batch_size};
+            /* a head resumed after PARSEC_HOOK_RETURN_BATCH_WAIT still carries the
+             * followers it collected before, count them towards the batch size */
+            std::size_t collected = parsec_gpu_task_batch_size(gpu_task) - 1;
+            batch_match_ctx_t ctx{tt, &task->key, collected, tt->m_max_batch_size};
             int nb = parsec_gpu_task_collect_batch(gpu_stream, gpu_task, &batch_match_cb, &ctx);
             /* nb < 0 means the callback stopped the scan early (batch_match_cb
              * only ever does so once capacity is reached, never on a genuine
@@ -1763,6 +1770,15 @@ namespace ttg_parsec {
                 mtask->dev_ptr->device = gpu_device;
                 cur = (parsec_gpu_task_t *)cur->list_item.list_next;
               }
+            }
+            /* The batch is not full: park the head with its followers so that the
+             * device scheduler can ingest and stage in more tasks, and collect them
+             * when the head is resumed. Nothing has been queued on the stream yet,
+             * as required by PaRSEC. Bounded by max_batch_waits, since PaRSEC never
+             * forces a parked head to execute. */
+            if (ctx.accepted + 1 < ctx.max_size && task->dev_ptr->batch_waits < max_batch_waits) {
+              ++task->dev_ptr->batch_waits;
+              return PARSEC_HOOK_RETURN_BATCH_WAIT;
             }
           }
         }

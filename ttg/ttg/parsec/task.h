@@ -68,6 +68,9 @@ namespace ttg_parsec {
       std::shared_ptr<const void> batch_members;
       /* the coop() instantiation of batch_members (see ttg::device::detail::coop_type_tag) */
       const void* batch_members_type = nullptr;
+      /* number of times this task, as a batch head, returned PARSEC_HOOK_RETURN_BATCH_WAIT
+       * to wait for more tasks to fill its batch (see TT::device_static_submit) */
+      int batch_waits = 0;
     };
 
     template<bool SupportDevice>
