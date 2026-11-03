@@ -6,6 +6,9 @@
 #ifndef TTG_ENV_H
 #define TTG_ENV_H
 
+#include "ttg/config.h"
+#include "ttg/util/sizeclass_pool.h"
+
 #include <umpire_cxx_allocator.hpp>
 
 #include <umpire/strategy/QuickPool.hpp>
@@ -139,12 +142,94 @@ namespace ttg {
 
   }
 
-  /// pooled thread-safe pinned host memory allocator for device computing
+  namespace detail {
+
+    /// Upstream of the size-class pinned pool: obtains slabs (and oversized blocks) from
+    /// Env::pinned_allocator(). Uses the same lock as umpire_pinned_allocator_t, so both
+    /// allocators can be used side by side.
+    struct pinned_pool_upstream {
+      /// QuickPool in Env::initialize() is created with 16-byte alignment
+      static constexpr std::size_t alignment = 16;
+
+      void* allocate(std::size_t bytes) {
+        auto* strategy = Env::instance()->pinned_allocator().getAllocationStrategy();
+        env_lock_guard lock;
+        return strategy->allocate_internal(bytes);
+      }
+
+      void deallocate(void* ptr, std::size_t bytes) {
+        auto* strategy = Env::instance()->pinned_allocator().getAllocationStrategy();
+        env_lock_guard lock;
+        strategy->deallocate_internal(ptr, bytes);
+      }
+
+     private:
+      /// holds the lock that also serializes umpire_pinned_allocator_t
+      struct env_lock_guard {
+        env_lock_guard() { ::umpire::detail::MutexLock<::ttg::Env>::lock(); }
+        ~env_lock_guard() { ::umpire::detail::MutexLock<::ttg::Env>::unlock(); }
+        env_lock_guard(const env_lock_guard&) = delete;
+        env_lock_guard& operator=(const env_lock_guard&) = delete;
+      };
+    };
+
+    using pinned_pool_t = SizeClassPool<pinned_pool_upstream>;
+
+    /// the process-wide size-class pinned pool; tunable via the environment variables
+    /// TTG_PINNED_POOL_{MAX_CLASS_BYTES, SLAB_BLOCKS, MIN_SLAB_BYTES, MAX_SLAB_BYTES, CENTRAL_KEEP_BYTES,
+    /// THREAD_CACHE_CLASS_BYTES, THREAD_CACHE_BYTES, MAX_CACHED_BLOCKS} (see SizeClassPoolConfig)
+    /// @note intentionally never destroyed, so that thread caches flushed at thread exit
+    ///       (including after main() returns) always find a live pool
+    inline pinned_pool_t& pinned_pool() {
+      static pinned_pool_t* pool = new pinned_pool_t(SizeClassPoolConfig::from_env("TTG_PINNED_POOL"));
+      return *pool;
+    }
+
+    struct pinned_pool_getter {
+      pinned_pool_t& operator()() const { return pinned_pool(); }
+    };
+
+  }  // namespace detail
+
+  /// pooled thread-safe pinned host memory allocator, serialized by a single global mutex
   template <typename T>
-  using pinned_allocator_t = ::umpire::default_init_allocator<
+  using umpire_pinned_allocator_t = ::umpire::default_init_allocator<
       T, ::umpire::allocator<T, ::umpire::detail::MutexLock<::ttg::Env>,
                              umpire::pinned_allocator_getter>>;
 
+  /// pooled thread-scalable pinned host memory allocator (size classes + per-thread caches);
+  /// draws slabs from the same pinned QuickPool as umpire_pinned_allocator_t
+  /// @note memory, once obtained from the QuickPool, is retained by the pool for the lifetime of the
+  ///       process; Env::pinned_allocator_getCurrentSize() reports it as in use
+  template <typename T>
+  using sizeclass_pinned_allocator_t = detail::sizeclass_allocator<T, detail::pinned_pool_getter>;
+
+  /// pooled thread-safe pinned host memory allocator for device computing
+#if defined(TTG_PINNED_ALLOCATOR_SIZECLASS)
+  template <typename T>
+  using pinned_allocator_t = sizeclass_pinned_allocator_t<T>;
+#else
+  template <typename T>
+  using pinned_allocator_t = umpire_pinned_allocator_t<T>;
+#endif
+
 }  // namespace ttg
+
+#if defined(__has_include)
+#if __has_include(<madness/world/archive.h>)
+#include <madness/world/archive.h>
+namespace madness::archive {
+  // sizeclass_allocator is stateless: nothing to (de)serialize
+  template <class Archive, typename T, typename PoolAccessor>
+  struct ArchiveLoadImpl<Archive, ttg::detail::sizeclass_allocator<T, PoolAccessor>> {
+    static inline void load(const Archive&, ttg::detail::sizeclass_allocator<T, PoolAccessor>&) {}
+  };
+  template <class Archive, typename T, typename PoolAccessor>
+  struct ArchiveStoreImpl<Archive, ttg::detail::sizeclass_allocator<T, PoolAccessor>> {
+    static inline void store(const Archive&, const ttg::detail::sizeclass_allocator<T, PoolAccessor>&) {}
+  };
+}  // namespace madness::archive
+#endif
+#endif
 
 #endif  // TTG_ENV_H

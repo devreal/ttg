@@ -75,6 +75,7 @@ option(TTG_ENABLE_COROUTINES "Whether to enable C++ coroutines, needed for accel
 option(TTG_FETCH_BOOST "Whether to fetch+build Boost, if missing" ON)
 option(TTG_IGNORE_BUNDLED_EXTERNALS "Whether to skip installation and use of bundled external dependencies (Boost.CallableTraits)" OFF)
 option(TTG_ENABLE_TRACE "Whether to enable ttg::trace() output" OFF)
+option(TTG_PINNED_ALLOCATOR_SIZECLASS "Whether ttg::pinned_allocator_t uses the thread-scalable size-class pool instead of the mutex-serialized Umpire QuickPool" OFF)
 # See https://medium.com/@alasher/colored-c-compiler-output-with-ninja-clang-gcc-10bfe7f2b949
 option (FORCE_COLORED_OUTPUT "Always produce ANSI-colored output (GNU/Clang only)." TRUE)
 if (FORCE_COLORED_OUTPUT)
