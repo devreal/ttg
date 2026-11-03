@@ -36,6 +36,9 @@
 /** whether the linked PaRSEC supports GPU kernel batching (see ttg::device::coop) */
 #cmakedefine TTG_HAVE_PARSEC_DEV_BATCH
 
+/** whether ttg::pinned_allocator_t is the size-class pool allocator (ttg::sizeclass_pinned_allocator_t) */
+#cmakedefine TTG_PINNED_ALLOCATOR_SIZECLASS
+
 /** whether TTG has MPI library */
 #cmakedefine TTG_HAVE_MPI
 

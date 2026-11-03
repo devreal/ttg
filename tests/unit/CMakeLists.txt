@@ -5,6 +5,7 @@ include(AddTTGExecutable)
 set(ut_src
         fibonacci.cc
         ranges.cc
+        sizeclass_pool.cc
         tt.cc
         unit_main.cpp
 		streams.cc
@@ -44,3 +45,9 @@ endif(TTG_PARSEC_USE_BOOST_SERIALIZATION)
 
 catch_discover_tests(serialization-parsec TEST_PREFIX "ttg/test/unit/")
 catch_discover_tests(serialization-mad TEST_PREFIX "ttg/test/unit/")
+
+# microbenchmark for ttg/util/sizeclass_pool.h; not built by default, not run by ctest
+# (with device support it compares ttg::umpire_pinned_allocator_t and ttg::sizeclass_pinned_allocator_t)
+find_package(Threads REQUIRED)
+add_executable(sizeclass-pool-bench EXCLUDE_FROM_ALL sizeclass_pool_bench.cc)
+target_link_libraries(sizeclass-pool-bench PRIVATE ttg Threads::Threads)
