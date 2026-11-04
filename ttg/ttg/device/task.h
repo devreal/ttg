@@ -2,7 +2,9 @@
 #ifndef TTG_DEVICE_TASK_H
 #define TTG_DEVICE_TASK_H
 
+#include <algorithm>
 #include <array>
+#include <vector>
 #include <type_traits>
 #include <stdexcept>
 #include <span>
@@ -324,6 +326,69 @@ namespace ttg::device {
 
     struct send_t {
       send_coro_state coro;
+    };
+
+    /**
+     * The sends and broadcasts of a device task, executed once the task has completed.
+     * Holds up to inline_capacity sends without allocating (a send is a single coroutine
+     * handle), so that collecting the sends of a task does not put malloc on the critical
+     * path of the thread managing the device. Move-only: every send runs exactly once.
+     */
+    class send_list {
+     public:
+      static constexpr std::size_t inline_capacity = 16;
+
+      send_list() = default;
+
+      send_list(send_list &&other) noexcept
+          : m_inline(other.m_inline), m_overflow(std::move(other.m_overflow)), m_size(other.m_size) {
+        other.m_size = 0;
+        other.m_overflow.clear();
+      }
+
+      send_list &operator=(send_list &&other) noexcept {
+        if (this != &other) {
+          m_inline = other.m_inline;
+          m_overflow = std::move(other.m_overflow);
+          m_size = other.m_size;
+          other.m_size = 0;
+          other.m_overflow.clear();
+        }
+        return *this;
+      }
+
+      send_list(const send_list &) = delete;
+      send_list &operator=(const send_list &) = delete;
+
+      void push_back(send_t send) {
+        if (m_size < inline_capacity) {
+          m_inline[m_size] = send.coro.handle();
+        } else {
+          m_overflow.push_back(send.coro.handle());
+        }
+        ++m_size;
+      }
+
+      std::size_t size() const { return m_size; }
+      bool empty() const { return m_size == 0; }
+
+      void clear() {
+        m_size = 0;
+        m_overflow.clear();
+      }
+
+      /// execute all sends, in the order they were added, and clear the list
+      void run() {
+        const std::size_t n_inline = std::min(m_size, inline_capacity);
+        for (std::size_t i = 0; i < n_inline; ++i) m_inline[i].resume();
+        for (auto &h : m_overflow) h.resume();
+        clear();
+      }
+
+     private:
+      std::array<send_coro_handle_type, inline_capacity> m_inline{};
+      std::vector<send_coro_handle_type> m_overflow;
+      std::size_t m_size = 0;
     };
   }  // namespace detail
 
@@ -659,9 +724,10 @@ namespace ttg::device {
 
   template<typename... Args, ttg::Runtime Runtime = ttg::ttg_runtime>
   [[nodiscard]]
-  std::vector<device::detail::send_t> forward(Args&&... args) {
-    // TODO: check the cost of this!
-    return std::vector<device::detail::send_t>{std::forward<Args>(args)...};
+  device::detail::send_list forward(Args&&... args) {
+    device::detail::send_list sends;
+    (sends.push_back(std::forward<Args>(args)), ...);
+    return sends;
   }
 
   /*******************************************
@@ -765,8 +831,16 @@ namespace ttg::device {
         return a;
       }
 
+      ttg::suspend_always await_transform(device::detail::send_list&& v) {
+        m_sends = std::move(v);
+        m_state = ttg::device::detail::TTG_DEVICE_CORO_SENDOUT;
+        return {};
+      }
+
       ttg::suspend_always await_transform(std::vector<device::detail::send_t>&& v) {
-        m_sends = std::forward<std::vector<device::detail::send_t>>(v);
+        m_sends.clear();
+        for (auto& send : v) m_sends.push_back(send);
+        v.clear();
         m_state = ttg::device::detail::TTG_DEVICE_CORO_SENDOUT;
         return {};
       }
@@ -830,10 +904,7 @@ namespace ttg::device {
 
       /* execute all pending send and broadcast operations */
       void do_sends() {
-        for (auto& send : m_sends) {
-          send.coro();
-        }
-        m_sends.clear();
+        m_sends.run();
       }
 
       auto state() {
@@ -852,7 +923,7 @@ namespace ttg::device {
         m_selected = true;
       }
 
-      std::vector<device::detail::send_t> m_sends;
+      device::detail::send_list m_sends;
       ttg_device_coro_state m_state = ttg::device::detail::TTG_DEVICE_CORO_STATE_NONE;
       void* m_batch_args_erased = nullptr;
       const void* m_batch_args_type = nullptr;

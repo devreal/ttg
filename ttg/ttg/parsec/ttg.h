@@ -4378,7 +4378,7 @@ namespace ttg_parsec {
           auto dev_task = ttg::device::detail::device_task_handle_type::from_address(task->suspended_task_address);
 
           // get the promise which contains the views
-          auto dev_data = dev_task.promise();
+          auto& dev_data = dev_task.promise();  // by reference: the promise owns the sends
 
           assert(dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT ||
                  dev_data.state() == ttg::device::detail::TTG_DEVICE_CORO_COMPLETE);
