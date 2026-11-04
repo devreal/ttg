@@ -18,6 +18,7 @@
 #include "ttg/parsec/thread_local.h"
 #include "ttg/parsec/parsec-ext.h"
 #include "ttg/util/span.h"
+#include "ttg/util/pooled_object.h"
 
 
 namespace ttg_parsec {
@@ -55,7 +56,33 @@ namespace ttg_parsec {
      * readers or writers but merely prevent the object from being
      * destroyed once no readers/writers exist.
      */
-    struct ttg_data_copy_t : public ttg_data_copy_self_t {
+    /// pool of ttg_data_copy_t objects (TTValue-derived values and value wrappers)
+    struct data_copy_pool_tag {
+      static constexpr const char* env_prefix = "TTG_DATA_COPY_POOL";
+
+      static ttg::detail::SizeClassPoolConfig default_config() {
+        ttg::detail::SizeClassPoolConfig cfg;
+        cfg.max_class_size = std::size_t{64} << 10;  // larger values go to malloc directly
+        cfg.slab_blocks = 64;
+        cfg.min_slab_bytes = std::size_t{64} << 10;
+        cfg.max_slab_bytes = std::size_t{1} << 20;
+        cfg.central_keep_bytes = std::size_t{4} << 20;
+        cfg.thread_cache_class_bytes = std::size_t{256} << 10;
+        cfg.thread_cache_bytes = std::size_t{2} << 20;
+        cfg.max_cached_blocks = 128;
+        return cfg;
+      }
+    };
+
+    /* Copies are created by whichever thread sends a value that is not tracked yet (for
+     * device tasks: the thread managing the device) and released by the thread releasing
+     * the last reference, so they are allocated from a pool with per-thread caches, which
+     * TTValue-derived types inherit as well (see ttg::detail::pooled_object). Copies are
+     * always deleted through ttg_data_copy_t*, whose destructor is virtual, so the pool
+     * receives the size of the dynamic type. Placement new is supported for values
+     * constructed in place, e.g. when deserializing. */
+    struct ttg_data_copy_t : public ttg_data_copy_self_t
+                           , public ttg::detail::pooled_object_with_placement<data_copy_pool_tag> {
 
       /* special value assigned to parsec_data_copy_t::readers to mark the copy as
       * mutable, i.e., a task will modify it */
