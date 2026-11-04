@@ -11,6 +11,8 @@
 #ifdef TTG_HAVE_COROUTINE
 #include TTG_CXX_COROUTINE_HEADER
 
+#include "ttg/util/coro_frame_pool.h"
+
 #include <algorithm>
 #include <array>
 
@@ -77,7 +79,7 @@ namespace ttg {
 
   /// encapsulates the state of the coroutine object visible to the outside world
   /// @note this is the `promise_type` for resumable_task coroutine
-  struct resumable_task_state {
+  struct resumable_task_state : public detail::pooled_coro_frame {
     resumable_task_state() noexcept = default;
     // these only live on coroutine frames so make noncopyable and nonmovable
     resumable_task_state(const resumable_task_state&) = delete;
@@ -109,18 +111,7 @@ namespace ttg {
     /// @name optional members of the promise_type concept
     /// @{
 
-    // these can be used to use optional storage provided by the runtime (e.g. part of the runtime's task data struct)
-    // N.B. the existing buffer must be passed to operator new via TLS
-    //    void* operator new(std::size_t size)
-    //    {
-    //      return ::operator new(size);
-    //    }
-
-    // N.B. whether the external buffer was used by operator new must be passed via TLS
-    //    void operator delete(void* ptr, std::size_t size)
-    //    {
-    //      ::operator delete(ptr, size);
-    //    }
+    // operator new/delete are provided by pooled_coro_frame: frames come from coro_frame_pool()
 
     /// @}
 

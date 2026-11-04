@@ -13,6 +13,7 @@
 #include "ttg/ptr.h"
 #include "ttg/devicescope.h"
 #include "ttg/device/batch.h"
+#include "ttg/util/coro_frame_pool.h"
 
 #ifdef TTG_HAVE_COROUTINE
 
@@ -251,7 +252,7 @@ namespace ttg::device {
     };
 
     /// the promise type for the send coroutine
-    struct send_coro_promise_type {
+    struct send_coro_promise_type : public ttg::detail::pooled_coro_frame {
       /* do not suspend the coroutine on first invocation, we want to run
       * the coroutine immediately and suspend only once.
        */
@@ -302,8 +303,14 @@ namespace ttg::device {
       t.sendk(k);
     };
 
-    template <ttg::Runtime Runtime = ttg::ttg_runtime>
-    inline send_coro_state send_coro(ttg::Out<void, void> &t) {
+    /* NOTE: the terminal type is a template parameter only to work around an nvcc (13.3)
+     *       front-end crash ("internal error ... in select_overloaded_function") on coroutine
+     *       function templates whose parameter types do not depend on any template parameter
+     *       when the promise type declares operator new (see pooled_coro_frame). */
+    template <typename OutT, ttg::Runtime Runtime = ttg::ttg_runtime>
+    inline send_coro_state send_coro(OutT &t) {
+      static_assert(std::is_same_v<std::remove_const_t<OutT>, ttg::Out<void, void>>,
+                    "send_coro(t) sends on a terminal without key and value");
       // no need to prepare the send but we have to suspend once
       co_await ttg::Void{};  // we'll come back once the task is done
       t.send();
@@ -705,7 +712,7 @@ namespace ttg::device {
     * application task coroutine on the first co_yield. It subsequently
     * tracks the state of the task when it moves from waiting for transfers
     * to waiting for the submitted kernel to complete. */
-    struct device_task_promise_type {
+    struct device_task_promise_type : public ttg::detail::pooled_coro_frame {
 
       /* do not suspend the coroutine on first invocation, we want to run
       * the coroutine immediately and suspend when we get the device transfers.
@@ -900,7 +907,7 @@ namespace ttg::device {
   * application task coroutine on the first co_yield. It subsequently
   * tracks the state of the task when it moves from waiting for transfers
   * to waiting for the submitted kernel to complete. */
-  struct device_reducer_promise_type {
+  struct device_reducer_promise_type : public ttg::detail::pooled_coro_frame {
 
     /* do not suspend the coroutine on first invocation, we want to run
     * the coroutine immediately and suspend when we get the device transfers.
