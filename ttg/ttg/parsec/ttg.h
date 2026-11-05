@@ -4864,10 +4864,15 @@ namespace ttg_parsec {
     static void ht_iter_cb(void *item, void *cb_data) {
       task_t *task = (task_t *)item;
       ttT *op = (ttT *)cb_data;
+      /* which data inputs arrived (1) and which are missing (0), and the number of inputs received */
+      std::string inputs;
+      for (std::size_t i = 0; i < numins; ++i) inputs += (task->copies[i] != nullptr) ? '1' : '0';
       if constexpr (!ttg::meta::is_void_v<keyT>) {
-        std::cout << "Left over task " << op->get_name() << " " << task->key << std::endl;
+        std::cout << "Left over task " << op->get_name() << " " << task->key << " inputs " << inputs
+                  << " received " << task->in_data_count << std::endl;
       } else {
-        std::cout << "Left over task " << op->get_name() << std::endl;
+        std::cout << "Left over task " << op->get_name() << " inputs " << inputs
+                  << " received " << task->in_data_count << std::endl;
       }
     }
 
