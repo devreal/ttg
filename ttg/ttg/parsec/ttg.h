@@ -2619,13 +2619,11 @@ namespace ttg_parsec {
           set_arg_local_impl<i>(key, *reinterpret_cast<valueT *>(copy->get_ptr()), copy, &task_ring);
         }
         else {
-          // not copy-constructible? can move, but only to single key
+          // not copy-constructible? every key shares the received copy, as with a local broadcast:
+          // with a copy passed in, set_arg_local_impl registers the copy and does not move from the value.
+          // register_data_copy throws if a consumer needs a copy of its own.
           static_assert(!std::is_reference_v<valueT>);
-          if (std::size(keylist) == 1)
-            set_arg_local_impl<i>(key, std::move(*reinterpret_cast<valueT *>(copy->get_ptr())), copy, &task_ring);
-          else {
-            throw std::logic_error(std::string("TTG::PaRSEC: need to copy a datum of type") + typeid(std::decay_t<valueT>).name() + " but the type is not copyable");
-          }
+          set_arg_local_impl<i>(key, std::move(*reinterpret_cast<valueT *>(copy->get_ptr())), copy, &task_ring);
         }
       }
 
