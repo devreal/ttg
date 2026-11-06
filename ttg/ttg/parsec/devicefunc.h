@@ -224,7 +224,8 @@ namespace ttg_parsec {
        * empty/default-constructed placeholder buffer), which must NOT reach the device_copies[owner_device]
        * indexing below -- that would read one element before the array. Only a genuine non-host device
        * owner (> 0) needs writing back. */
-      if (nullptr != data && data->owner_device > 0) {
+      /* nothing to transfer for an empty buffer (batched copies reject empty items) */
+      if (nullptr != data && data->owner_device > 0 && data->nb_elts > 0) {
         if (nullptr == data->device_copies[0]->device_private) {
           assert(nullptr != data->device_copies[0]->alloc_cb);
           data->device_copies[0]->alloc_cb(data->device_copies[0], 0);
