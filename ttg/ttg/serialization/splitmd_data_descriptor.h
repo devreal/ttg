@@ -3,6 +3,7 @@
 #define TTG_SERIALIZATION_SPLITMD_DATA_DESCRIPTOR_H
 
 #include <type_traits>
+#include <vector>
 #include "ttg/util/meta.h"
 #include "ttg/util/iovec.h"
 
@@ -43,6 +44,28 @@ namespace ttg {
   struct has_split_metadata<
       T, ttg::meta::void_t<decltype(std::declval<SplitMetadataDescriptor<T>>().get_metadata(std::declval<T>()))>>
       : std::true_type {};
+
+  /**
+   * Vectors of trivially copyable elements are transferred as their size (the metadata)
+   * and their contiguous storage (the payload), which is sent directly from the vector
+   * instead of being serialized into the message. Large vectors thereby take the RMA path
+   * instead of exceeding the size of an active message.
+   */
+  template <typename T, typename Allocator>
+    requires(std::is_trivially_copyable_v<T> && !std::is_same_v<T, bool>)
+  struct SplitMetadataDescriptor<std::vector<T, Allocator>> {
+    std::size_t get_metadata(const std::vector<T, Allocator>& v) const { return v.size(); }
+
+    std::vector<T, Allocator> create_from_metadata(std::size_t size) const {
+      return std::vector<T, Allocator>(size);
+    }
+
+    /* no payload for an empty vector: its data() may be null */
+    std::vector<iovec> get_data(std::vector<T, Allocator>& v) const {
+      if (v.empty()) return {};
+      return {iovec{v.size() * sizeof(T), static_cast<void*>(v.data())}};
+    }
+  };
 
 }  // namespace ttg
 

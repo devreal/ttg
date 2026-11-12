@@ -13,6 +13,7 @@
 #include "ttg/serialization/stream.h"
 
 #include <cstring>  // for std::memcpy
+#include <stdexcept>
 
 #include "ttg/serialization/splitmd_data_descriptor.h"
 
@@ -111,10 +112,10 @@ namespace ttg {
     /// @return the number of bytes needed for binary representation of @p object
     static uint64_t payload_size(const void *object) {
       SplitMetadataDescriptor<T> smd;
-      const T *t = reinterpret_cast<T *>(object);
-      auto metadata = smd.get_metadata(t);
+      T *t = const_cast<T *>(reinterpret_cast<const T *>(object));
+      auto metadata = smd.get_metadata(*t);
       size_t size = sizeof(metadata);
-      for (auto &&iovec : smd.get_data(t)) {
+      for (auto &&iovec : smd.get_data(*t)) {
         size += iovec.num_bytes;
       }
 
@@ -129,17 +130,17 @@ namespace ttg {
     /// @return position in \p buf after the last byte written
     static uint64_t pack_payload(const void *object, uint64_t max_nbytes_to_write, uint64_t begin, void *buf) {
       SplitMetadataDescriptor<T> smd;
-      const T *t = reinterpret_cast<T *>(object);
+      T *t = const_cast<T *>(reinterpret_cast<const T *>(object));
 
       unsigned char *char_buf = reinterpret_cast<unsigned char *>(buf);
-      auto metadata = smd.get_metadata(t);
-      assert(sizeof(metadata) <= max_nbytes_to_write);
-      std::memcpy(&char_buf[begin], metadata, sizeof(metadata));
+      auto metadata = smd.get_metadata(*t);
+      if (sizeof(metadata) > max_nbytes_to_write) throw std::runtime_error("pack_payload: buffer too small");
+      std::memcpy(&char_buf[begin], &metadata, sizeof(metadata));
       size_t pos = sizeof(metadata);
-      for (auto &&iovec : smd.get_data(t)) {
+      for (auto &&iovec : smd.get_data(*t)) {
+        if (pos + iovec.num_bytes > max_nbytes_to_write) throw std::runtime_error("pack_payload: buffer too small");
         std::memcpy(&char_buf[begin + pos], iovec.data, iovec.num_bytes);
         pos += iovec.num_bytes;
-        assert(pos <= max_nbytes_to_write);
       }
       return begin + pos;
     }
@@ -154,17 +155,17 @@ namespace ttg {
       SplitMetadataDescriptor<T> smd;
       T *t = reinterpret_cast<T *>(object);
 
-      using metadata_t = decltype(smd.get_metadata(t));
-      assert(sizeof(metadata_t) <= max_nbytes_to_read);
+      using metadata_t = std::decay_t<decltype(smd.get_metadata(*t))>;
+      if (sizeof(metadata_t) > max_nbytes_to_read) throw std::runtime_error("unpack_payload: buffer too small");
       const unsigned char *char_buf = reinterpret_cast<const unsigned char *>(buf);
-      const metadata_t *metadata = reinterpret_cast<const metadata_t *>(char_buf + begin);
-      T t_created = smd.create_from_metadata();
+      metadata_t metadata;
+      std::memcpy(&metadata, char_buf + begin, sizeof(metadata));
+      *t = smd.create_from_metadata(metadata);
       size_t pos = sizeof(metadata);
-      *t = t_created;
-      for (auto &&iovec : smd.get_data(t)) {
+      for (auto &&iovec : smd.get_data(*t)) {
+        if (pos + iovec.num_bytes > max_nbytes_to_read) throw std::runtime_error("unpack_payload: buffer too small");
         std::memcpy(iovec.data, &char_buf[begin + pos], iovec.num_bytes);
         pos += iovec.num_bytes;
-        assert(pos <= max_nbytes_to_read);
       }
       return begin + pos;
     }
