@@ -4349,13 +4349,15 @@ namespace ttg_parsec {
             }
           }
           if (gpu_task->flow[flowidx]->flow_flags == PARSEC_FLOW_ACCESS_NONE) {
-            /* no flow found, add one and mark it pushout */
+            /* no flow found, add a read-only one and mark it pushout */
             detail::parsec_ttg_caller->parsec_task.data[flowidx].data_in = data->device_copies[0];
             detail::parsec_ttg_caller->parsec_task.data[flowidx].data_out = data->device_copies[data->owner_device];
             gpu_task->flow_nb_elts[flowidx] = data->nb_elts;
+            ((parsec_flow_t *)gpu_task->flow[flowidx])->flow_flags = PARSEC_FLOW_ACCESS_READ;
           }
-          /* need to mark the flow WRITE, otherwise PaRSEC will not do the pushout */
-          ((parsec_flow_t *)gpu_task->flow[flowidx])->flow_flags |= PARSEC_FLOW_ACCESS_WRITE;
+          /* PaRSEC pushes out read-only flows too: the flow keeps its access mode, so a
+           * pushout of data this task only reads does not claim write access to it
+           * (which would conflict with concurrent readers of the device copy) */
           gpu_task->pushout |= 1<<flowidx;
         }
       };
