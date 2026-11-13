@@ -378,12 +378,23 @@ public:
   bool is_current_on(ttg::device::Device dev) const {
     if (empty()) return true; // empty is current everywhere
     int parsec_id = detail::ttg_device_to_parsec_device(dev);
+    /* A device copy marked invalid holds no valid data, whatever its version: PaRSEC attaches
+     * a copy reserved for a task with a scrap version (UINT_MAX) until its stage-in, and leaves
+     * it attached if the task fails to reserve its other flows (no device memory) and retries
+     * later; a copy being staged in is also invalid until the transfer completes. Counting such
+     * a copy made the host copy look stale under memory pressure. (Only device copies: TTG does
+     * not keep the coherency state of host copies up to date.) */
+    auto is_invalid_device_copy = [&](int i) {
+      return i > 0 && PARSEC_DATA_COHERENCY_INVALID == m_data->device_copies[i]->coherency_state;
+    };
     uint32_t max_version = 0;
     for (int i = 0; i < parsec_nb_devices; ++i) {
       if (nullptr == m_data->device_copies[i] || m_data->device_copies[i]->device_private == nullptr) continue;
+      if (is_invalid_device_copy(i)) continue;
       max_version = std::max(max_version, m_data->device_copies[i]->version);
     }
     return (m_data->device_copies[parsec_id] && m_data->device_copies[parsec_id]->device_private != nullptr &&
+            !is_invalid_device_copy(parsec_id) &&
             m_data->device_copies[parsec_id]->version == max_version);
   }
 
