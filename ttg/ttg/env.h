@@ -84,7 +84,12 @@ namespace ttg {
                 "QuickPool_SizeLimited_PINNED", pinned_size_limited_alloc,
                 /* first_minimum_pool_allocation_size = */ 0,
                 /* next_minimum_pool_allocation_size = */ page_size,
-                /* alignment */ 16);
+                /* alignment */ 16,
+                // never coalesce: by default the pool, once entirely free, releases all its
+                // blocks and allocates one of their total size, which for pinned memory
+                // re-pins all of it in one call (minutes for tens of GB) only to free it again
+                // at the end of the program
+                umpire::strategy::QuickPool::percent_releasable(0));
 
         auto env = std::unique_ptr<Env>(new Env(pinned_dynamic_pool));
         instance_accessor() = std::move(env);
