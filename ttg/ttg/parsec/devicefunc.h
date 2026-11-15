@@ -230,6 +230,9 @@ namespace ttg_parsec {
           data->device_copies[0]->alloc_cb(data->device_copies[0], 0);
         }
 
+        if (0 == data->nb_elts) {
+          /* nothing to copy: an empty buffer, and batched copies reject empty items */
+        } else
 #if defined(TTG_HAVE_PARSEC_DEV_BATCH)
         /* Defer if device_static_submit is progressing a ring on this thread:
          * coalesced with every other pending copy of this task -- and of every

@@ -160,7 +160,8 @@ namespace ttg_parsec {
       MSG_SET_ARG = 0,
       MSG_SET_ARGSTREAM_SIZE = 1,
       MSG_FINALIZE_ARGSTREAM_SIZE = 2,
-      MSG_GET_FROM_PULL = 3 } fn_id_t;
+      MSG_GET_FROM_PULL = 3,
+      MSG_FETCH_LARGE = 4 /* a message too large for an active message, to be pulled with RMA */ } fn_id_t;
     uint32_t taskpool_id = std::numeric_limits<uint32_t>::max();
     uint64_t op_id = std::numeric_limits<uint64_t>::max();
     std::size_t key_offset = 0;
@@ -206,6 +207,66 @@ namespace ttg_parsec {
     };
 
     inline std::size_t max_inline_size = msg_t::max_payload_size;
+
+    /* A message whose payload may exceed msg_t::max_payload_size: the storage extends beyond
+     * msg_t (bytes is its trailing array) to the requested capacity. */
+    struct msg_deleter {
+      void operator()(msg_t *m) const {
+        m->~msg_t();
+        ::operator delete(static_cast<void *>(m));
+      }
+    };
+    using msg_ptr_t = std::unique_ptr<msg_t, msg_deleter>;
+
+    template <typename... Args>
+    msg_ptr_t make_msg(std::size_t payload_capacity, Args &&...args) {
+      const std::size_t size = std::max(sizeof(msg_t), sizeof(msg_header_t) + payload_capacity);
+      void *mem = ::operator new(size);
+      return msg_ptr_t(new (mem) msg_t(std::forward<Args>(args)...));
+    }
+
+    /* upper bound of the bytes packed for the registration of one iovec: size, handle, callback */
+    constexpr const std::size_t iovec_header_bound = sizeof(int32_t) + 1024 + sizeof(std::intptr_t);
+
+    static int get_remote_complete_cb(parsec_comm_engine_t *ce, parsec_ce_tag_t tag, void *msg, size_t msg_size,
+                                      int src, void *cb_data);
+
+    /* Send a message of `size` bytes (header included). One too large for an active message is
+     * copied into a registered buffer and only its description (MSG_FETCH_LARGE) is sent: the
+     * receiver pulls the message and processes it as if it had arrived as an active message,
+     * and the buffer is released once the receiver signals completion of the transfer. */
+    inline void send_msg(int tag, int owner, msg_t *msg, std::size_t size) {
+      if (size <= static_cast<std::size_t>(PARSEC_TTG_MAX_AM_SIZE)) {
+        parsec_ce.send_am(&parsec_ce, tag, owner, static_cast<void *>(msg), size);
+        return;
+      }
+      std::shared_ptr<std::byte[]> buf(new std::byte[size]);
+      std::memcpy(buf.get(), msg, size);
+      parsec_ce_mem_reg_handle_t lreg;
+      size_t lreg_size;
+      parsec_ce.mem_register(buf.get(), PARSEC_MEM_TYPE_NONCONTIGUOUS, size, parsec_datatype_int8_t, size, &lreg,
+                             &lreg_size);
+      auto *fn = new std::function<void(void)>([buf, lreg]() mutable {
+        parsec_ce.mem_unregister(&lreg);
+        buf.reset();
+      });
+      auto env = make_msg(sizeof(uint64_t) + sizeof(int32_t) + lreg_size + sizeof(std::intptr_t));
+      env->tt_id = msg->tt_id;
+      env->tt_id.fn_id = msg_header_t::MSG_FETCH_LARGE;
+      uint64_t pos = 0;
+      uint64_t size64 = size;
+      std::memcpy(env->bytes + pos, &size64, sizeof(size64));
+      pos += sizeof(size64);
+      int32_t lreg_size_i = lreg_size;
+      std::memcpy(env->bytes + pos, &lreg_size_i, sizeof(lreg_size_i));
+      pos += sizeof(lreg_size_i);
+      std::memcpy(env->bytes + pos, lreg, lreg_size);
+      pos += lreg_size;
+      std::intptr_t fn_ptr{reinterpret_cast<std::intptr_t>(fn)};
+      std::memcpy(env->bytes + pos, &fn_ptr, sizeof(fn_ptr));
+      pos += sizeof(fn_ptr);
+      parsec_ce.send_am(&parsec_ce, tag, owner, static_cast<void *>(env.get()), sizeof(msg_header_t) + pos);
+    }
 
     static int static_unpack_msg(parsec_comm_engine_t *ce, uint64_t tag, void *data, long unsigned int size,
                                  int src_rank, void *obj) {
@@ -2534,6 +2595,76 @@ namespace ttg_parsec {
       return pos;
     }
 
+    /* a message pulled with RMA (see detail::send_msg) */
+    struct large_msg_fetch {
+      std::unique_ptr<std::byte[]> buf;
+      std::size_t size;
+      TT *tt;
+    };
+
+    static int large_msg_fetched_cb(parsec_comm_engine_t *comm_engine, parsec_ce_mem_reg_handle_t lreg,
+                                    ptrdiff_t ldispl, parsec_ce_mem_reg_handle_t rreg, ptrdiff_t rdispl, size_t size,
+                                    int remote, void *cb_data) {
+      parsec_ce.mem_unregister(&lreg);
+      std::unique_ptr<large_msg_fetch> fetch(static_cast<large_msg_fetch *>(cb_data));
+      TT *tt = fetch->tt;
+      static_set_arg(fetch->buf.get(), fetch->size, tt);
+      /* the fetch kept the taskpool from terminating until the message was processed */
+      tt->world.impl().decrement_inflight_msg();
+      return PARSEC_SUCCESS;
+    }
+
+    void fetch_large_msg(void *data, std::size_t size) {
+      detail::msg_t *msg = static_cast<detail::msg_t *>(data);
+      uint64_t pos = 0;
+      uint64_t msg_size;
+      std::memcpy(&msg_size, msg->bytes + pos, sizeof(msg_size));
+      pos += sizeof(msg_size);
+      int32_t rreg_size_i;
+      std::memcpy(&rreg_size_i, msg->bytes + pos, sizeof(rreg_size_i));
+      pos += sizeof(rreg_size_i);
+      parsec_ce_mem_reg_handle_t rreg = static_cast<parsec_ce_mem_reg_handle_t>(msg->bytes + pos);
+      pos += rreg_size_i;
+      std::intptr_t fn_ptr;
+      std::memcpy(&fn_ptr, msg->bytes + pos, sizeof(fn_ptr));
+      pos += sizeof(fn_ptr);
+
+      auto *fetch = new large_msg_fetch{std::make_unique_for_overwrite<std::byte[]>(msg_size), msg_size, this};
+      parsec_ce_mem_reg_handle_t lreg;
+      size_t lreg_size;
+      parsec_ce.mem_register(fetch->buf.get(), PARSEC_MEM_TYPE_NONCONTIGUOUS, msg_size, parsec_datatype_int8_t, msg_size,
+                             &lreg, &lreg_size);
+      world.impl().increment_inflight_msg();
+      parsec_ce_tag_t cbtag = reinterpret_cast<parsec_ce_tag_t>(&detail::get_remote_complete_cb);
+      parsec_ce.get(&parsec_ce, lreg, 0, rreg, 0, msg_size, msg->tt_id.sender, &large_msg_fetched_cb, fetch, cbtag,
+                    &fn_ptr, sizeof(std::intptr_t));
+    }
+
+    /* Upper bound of the payload of a message carrying `value` and `num_keys` keys like `key`
+     * (as packed by set_arg_impl and broadcast_arg). */
+    template <typename Value, typename Key>
+    std::size_t msg_payload_bound(Value *value_ptr, bool inline_data, const Key &key, std::size_t num_keys) {
+      using decvalueT = std::decay_t<Value>;
+      std::size_t bound = 64; /* size prefixes, callback tag */
+      if constexpr (ttg::has_split_metadata<decvalueT>::value) {
+        ttg::SplitMetadataDescriptor<decvalueT> descr;
+        auto metadata = descr.get_metadata(*const_cast<decvalueT *>(value_ptr));
+        bound += sizeof(uint64_t) + ttg::default_data_descriptor<decltype(metadata)>::payload_size(&metadata);
+        for (auto &&iov : descr.get_data(*const_cast<decvalueT *>(value_ptr))) {
+          bound += inline_data ? iov.num_bytes : detail::iovec_header_bound;
+        }
+      } else {
+        bound += sizeof(uint64_t) + ttg::default_data_descriptor<ttg::meta::remove_cvr_t<Value>>::payload_size(value_ptr);
+        detail::foreach_parsec_data(*value_ptr, [&](parsec_data_t *data) {
+          bound += inline_data ? data->nb_elts : detail::iovec_header_bound;
+        });
+      }
+      if constexpr (!ttg::meta::is_void_v<Key>) {
+        bound += num_keys * (sizeof(uint64_t) + ttg::default_data_descriptor<Key>::payload_size(&key));
+      }
+      return bound;
+    }
+
     static void static_set_arg(void *data, std::size_t size, ttg::TTBase *bop) {
       assert(size >= sizeof(msg_header_t) &&
              "Trying to unpack as message that does not hold enough bytes to represent a single header");
@@ -2571,6 +2702,10 @@ namespace ttg_parsec {
           assert(hd->param_id < obj->get_from_pull_msg_fcts.size());
           auto member = obj->get_from_pull_msg_fcts[hd->param_id];
           (obj->*member)(data, size);
+          break;
+        }
+        case msg_header_t::MSG_FETCH_LARGE: {
+          obj->fetch_large_msg(data, size);
           break;
         }
         default:
@@ -2619,13 +2754,11 @@ namespace ttg_parsec {
           set_arg_local_impl<i>(key, *reinterpret_cast<valueT *>(copy->get_ptr()), copy, &task_ring);
         }
         else {
-          // not copy-constructible? can move, but only to single key
+          // not copy-constructible? every key shares the received copy, as with a local broadcast:
+          // with a copy passed in, set_arg_local_impl registers the copy and does not move from the value.
+          // register_data_copy throws if a consumer needs a copy of its own.
           static_assert(!std::is_reference_v<valueT>);
-          if (std::size(keylist) == 1)
-            set_arg_local_impl<i>(key, std::move(*reinterpret_cast<valueT *>(copy->get_ptr())), copy, &task_ring);
-          else {
-            throw std::logic_error(std::string("TTG::PaRSEC: need to copy a datum of type") + typeid(std::decay_t<valueT>).name() + " but the type is not copyable");
-          }
+          set_arg_local_impl<i>(key, std::move(*reinterpret_cast<valueT *>(copy->get_ptr())), copy, &task_ring);
         }
       }
 
@@ -3543,8 +3676,13 @@ namespace ttg_parsec {
       auto &world_impl = world.impl();
       uint64_t pos = 0;
       int num_iovecs = 0;
-      std::unique_ptr<msg_t> msg = std::make_unique<msg_t>(get_instance_id(), world_impl.taskpool()->taskpool_id,
-                                                           msg_header_t::MSG_SET_ARG, i, world_impl.rank(), 1);
+      std::size_t msg_capacity = msg_t::max_payload_size;
+      if constexpr (!ttg::meta::is_void_v<decvalueT>) {
+        msg_capacity = std::max(msg_capacity,
+                                msg_payload_bound(value_ptr, can_inline_data(value_ptr, copy_in, key, 1), key, 1));
+      }
+      detail::msg_ptr_t msg = detail::make_msg(msg_capacity, get_instance_id(), world_impl.taskpool()->taskpool_id,
+                                               msg_header_t::MSG_SET_ARG, i, world_impl.rank(), 1);
 
       if constexpr (!ttg::meta::is_void_v<decvalueT>) {
 
@@ -3665,8 +3803,7 @@ namespace ttg_parsec {
       tp->tdm.module->outgoing_message_start(tp, owner, NULL);
       tp->tdm.module->outgoing_message_pack(tp, owner, NULL, NULL, 0);
       //std::cout << "set_arg_impl send_am owner " << owner << " sender " << msg->tt_id.sender << std::endl;
-      parsec_ce.send_am(&parsec_ce, world_impl.parsec_ttg_tag(), owner, static_cast<void *>(msg.get()),
-                        sizeof(msg_header_t) + pos);
+      detail::send_msg(world_impl.parsec_ttg_tag(), owner, msg.get(), sizeof(msg_header_t) + pos);
 #if defined(PARSEC_PROF_TRACE) && defined(PARSEC_TTG_PROFILE_BACKEND)
       if(world.impl().profiling()) {
         parsec_profiling_ts_trace(world.impl().parsec_ttg_profile_backend_set_arg_end, 0, 0, NULL);
@@ -3760,12 +3897,17 @@ namespace ttg_parsec {
 
         using msg_t = detail::msg_t;
         auto &world_impl = world.impl();
-        std::unique_ptr<msg_t> msg = std::make_unique<msg_t>(get_instance_id(), world_impl.taskpool()->taskpool_id,
-                                                             msg_header_t::MSG_SET_ARG, i, world_impl.rank());
-
         /* check if we inline the data */
         /* TODO: this assumes the worst case: that all keys are packed at once (i.e., go to the same remote). Can we do better?*/
         bool inline_data = can_inline_data(&value, copy, keylist_sorted[0], keylist_sorted.size());
+        /* The keys of an owner are split across messages of at most max_payload_size. If the value
+         * (with a key) does not fit into one, the message holds all keys and is pulled with RMA. */
+        std::size_t msg_capacity = msg_t::max_payload_size;
+        if (msg_payload_bound(&value, inline_data, keylist_sorted[0], 1) > msg_t::max_payload_size) {
+          msg_capacity = msg_payload_bound(&value, inline_data, keylist_sorted[0], keylist_sorted.size());
+        }
+        detail::msg_ptr_t msg = detail::make_msg(msg_capacity, get_instance_id(), world_impl.taskpool()->taskpool_id,
+                                                 msg_header_t::MSG_SET_ARG, i, world_impl.rank());
         msg->tt_id.inline_data = inline_data;
 
         std::vector<std::pair<int32_t, std::shared_ptr<void>>> memregs;
@@ -3894,9 +4036,15 @@ namespace ttg_parsec {
           /* mark the beginning of the keys */
           msg->tt_id.key_offset = pos;
 
-          /* pack all keys for this owner */
+          /* pack the keys for this owner, as many as fit into the message: the remaining keys of
+           * this owner go into further messages (the loop comes back here with the same owner) */
           int num_keys = 0;
           do {
+            const std::size_t key_size = sizeof(uint64_t) + ttg::default_data_descriptor<Key>::payload_size(&*it);
+            if (num_keys > 0 && pos + key_size > msg_capacity) break;
+            if (pos + key_size > msg_capacity) {
+              throw std::runtime_error("broadcast_arg: a key does not fit into a message");
+            }
             ++num_keys;
             pos = pack(*it, msg->bytes, pos);
             ++it;
@@ -3906,8 +4054,7 @@ namespace ttg_parsec {
           tp->tdm.module->outgoing_message_start(tp, owner, NULL);
           tp->tdm.module->outgoing_message_pack(tp, owner, NULL, NULL, 0);
           //std::cout << "broadcast_arg send_am owner " << owner << std::endl;
-          parsec_ce.send_am(&parsec_ce, world_impl.parsec_ttg_tag(), owner, static_cast<void *>(msg.get()),
-                            sizeof(msg_header_t) + pos);
+          detail::send_msg(world_impl.parsec_ttg_tag(), owner, msg.get(), sizeof(msg_header_t) + pos);
         }
         /* handle local keys */
         broadcast_arg_local<i>(local_begin, local_end, value);
@@ -4202,13 +4349,15 @@ namespace ttg_parsec {
             }
           }
           if (gpu_task->flow[flowidx]->flow_flags == PARSEC_FLOW_ACCESS_NONE) {
-            /* no flow found, add one and mark it pushout */
+            /* no flow found, add a read-only one and mark it pushout */
             detail::parsec_ttg_caller->parsec_task.data[flowidx].data_in = data->device_copies[0];
             detail::parsec_ttg_caller->parsec_task.data[flowidx].data_out = data->device_copies[data->owner_device];
             gpu_task->flow_nb_elts[flowidx] = data->nb_elts;
+            ((parsec_flow_t *)gpu_task->flow[flowidx])->flow_flags = PARSEC_FLOW_ACCESS_READ;
           }
-          /* need to mark the flow WRITE, otherwise PaRSEC will not do the pushout */
-          ((parsec_flow_t *)gpu_task->flow[flowidx])->flow_flags |= PARSEC_FLOW_ACCESS_WRITE;
+          /* PaRSEC pushes out read-only flows too: the flow keeps its access mode, so a
+           * pushout of data this task only reads does not claim write access to it
+           * (which would conflict with concurrent readers of the device copy) */
           gpu_task->pushout |= 1<<flowidx;
         }
       };
@@ -4866,10 +5015,15 @@ namespace ttg_parsec {
     static void ht_iter_cb(void *item, void *cb_data) {
       task_t *task = (task_t *)item;
       ttT *op = (ttT *)cb_data;
+      /* which data inputs arrived (1) and which are missing (0), and the number of inputs received */
+      std::string inputs;
+      for (std::size_t i = 0; i < numins; ++i) inputs += (task->copies[i] != nullptr) ? '1' : '0';
       if constexpr (!ttg::meta::is_void_v<keyT>) {
-        std::cout << "Left over task " << op->get_name() << " " << task->key << std::endl;
+        std::cout << "Left over task " << op->get_name() << " " << task->key << " inputs " << inputs
+                  << " received " << task->in_data_count << std::endl;
       } else {
-        std::cout << "Left over task " << op->get_name() << std::endl;
+        std::cout << "Left over task " << op->get_name() << " inputs " << inputs
+                  << " received " << task->in_data_count << std::endl;
       }
     }
 

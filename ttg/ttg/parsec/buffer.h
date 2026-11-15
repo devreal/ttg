@@ -378,12 +378,23 @@ public:
   bool is_current_on(ttg::device::Device dev) const {
     if (empty()) return true; // empty is current everywhere
     int parsec_id = detail::ttg_device_to_parsec_device(dev);
+    /* A device copy marked invalid holds no valid data, whatever its version: PaRSEC attaches
+     * a copy reserved for a task with a scrap version (UINT_MAX) until its stage-in, and leaves
+     * it attached if the task fails to reserve its other flows (no device memory) and retries
+     * later; a copy being staged in is also invalid until the transfer completes. Counting such
+     * a copy made the host copy look stale under memory pressure. (Only device copies: TTG does
+     * not keep the coherency state of host copies up to date.) */
+    auto is_invalid_device_copy = [&](int i) {
+      return i > 0 && PARSEC_DATA_COHERENCY_INVALID == m_data->device_copies[i]->coherency_state;
+    };
     uint32_t max_version = 0;
     for (int i = 0; i < parsec_nb_devices; ++i) {
       if (nullptr == m_data->device_copies[i] || m_data->device_copies[i]->device_private == nullptr) continue;
+      if (is_invalid_device_copy(i)) continue;
       max_version = std::max(max_version, m_data->device_copies[i]->version);
     }
     return (m_data->device_copies[parsec_id] && m_data->device_copies[parsec_id]->device_private != nullptr &&
+            !is_invalid_device_copy(parsec_id) &&
             m_data->device_copies[parsec_id]->version == max_version);
   }
 
@@ -594,10 +605,26 @@ public:
   }
 
   ttg::scope scope() const {
-    /* if the host owns the data and has a version of zero we only have to allocate data */
+    /* we only have to allocate data if no copy holds any: neither the host copy nor the copy of
+     * the owning device. Data written only on a device leaves the host copy at version 0, and
+     * reporting Allocate for it would select it write-only: PaRSEC then never stages it in, and a
+     * task reading it again after its device copy was evicted would see uninitialized memory. */
     if (nullptr == m_data) return ttg::scope::Invalid;
-    return (m_data->device_copies[0]->version == 0)
-            ? ttg::scope::Allocate : ttg::scope::SyncIn;
+    auto copy_has_data = [&](int i) {
+      const parsec_data_copy_t* copy = m_data->device_copies[i];
+      return nullptr != copy && copy->version > 0;
+    };
+    bool has_data = copy_has_data(0);
+    if (!has_data) {
+      if (m_data->owner_device >= 0) {
+        /* reset_scope(Allocate) makes the host the owner, so its data is not considered */
+        has_data = copy_has_data(m_data->owner_device);
+      } else {
+        /* shared between devices without an owner (owner_device == -1): any copy will do */
+        for (int i = 1; i < parsec_nb_devices && !has_data; ++i) has_data = copy_has_data(i);
+      }
+    }
+    return has_data ? ttg::scope::SyncIn : ttg::scope::Allocate;
   }
 
   void prefer_device(ttg::device::Device dev) {
