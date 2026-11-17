@@ -1384,7 +1384,26 @@ namespace ttg_parsec {
     static_assert((ttg::meta::none_has_reference_v<input_valueTs>), "Input typelist cannot contain reference types");
     static_assert(ttg::meta::is_none_Void_v<input_valueTs>, "ttg::Void is for internal use only, do not use it");
 
-    parsec_mempool_t mempools;
+    /// The memory pool of this TT's task objects, shared by all TTs of this type (see
+    /// shared_task_mempool)
+    parsec_mempool_t *mempools = nullptr;
+
+    /// The task memory pool of all TTs of this type (task_t). Destroying a pool frees every task
+    /// object it ever handed out, one at a time, which made the destruction of a graph's TTs take
+    /// tens of milliseconds; TTs created later reuse the task objects instead. The pool lives until
+    /// the process exits: destroying it in ttg_finalize crashed (the PaRSEC context it was made
+    /// with may already be gone).
+    static parsec_mempool_t *shared_task_mempool(int nbthreads) {
+      static parsec_mempool_t *pool = [nbthreads] {
+        auto *p = new parsec_mempool_t;
+        parsec_mempool_construct(p, PARSEC_OBJ_CLASS(parsec_task_t), sizeof(task_t),
+                                 offsetof(parsec_task_t, mempool_owner), nbthreads);
+        return p;
+      }();
+      if (static_cast<int>(pool->nb_thread_mempools) != nbthreads)
+        throw std::runtime_error("ttg_parsec::TT: the number of threads changed after the first TT of a type");
+      return pool;
+    }
 
     // check for a non-type member named have_cuda_op
     template <typename T>
@@ -2723,7 +2742,7 @@ namespace ttg_parsec {
 
     /** Returns the task memory pool owned by the calling thread */
     inline parsec_thread_mempool_t *get_task_mempool(void) {
-      return get_thread_mempool(mempools);
+      return get_thread_mempool(*mempools);
     }
 
     template <size_t i, typename valueT>
@@ -3191,7 +3210,7 @@ namespace ttg_parsec {
         complete_task_and_release(es, parent_parsec_task);
         parent_task->destroy();
         /* the task may have been allocated by another thread: return it to its owning thread mempool */
-        parsec_mempool_free(&mempools, parent_parsec_task);
+        parsec_mempool_free(mempools, parent_parsec_task);
         /* parent_task was counted as "created" when first set up (the same code path used for any
          * multi-input task), but -- unlike a normal task -- it never runs through the scheduler, so it
          * never decrements that count on its own; balance it out here now that it's truly done. */
@@ -4951,8 +4970,7 @@ namespace ttg_parsec {
         nbthreads += context->virtual_processes[i]->nb_cores;
       }
 
-      parsec_mempool_construct(&mempools, PARSEC_OBJ_CLASS(parsec_task_t), sizeof(task_t),
-                               offsetof(parsec_task_t, mempool_owner), nbthreads);
+      mempools = shared_task_mempool(nbthreads);
 
       parsec_hash_table_init(&tasks_table, offsetof(detail::parsec_ttg_task_base_t, tt_ht_item), 8, tasks_hash_fcts,
                              NULL);
@@ -5041,7 +5059,7 @@ namespace ttg_parsec {
       /* print all outstanding tasks */
       print_incomplete_tasks();
       parsec_hash_table_fini(&tasks_table);
-      parsec_mempool_destruct(&mempools);
+      // the task objects stay in the shared pool of this TT type (see shared_task_mempool)
       // uintptr_t addr = (uintptr_t)self.incarnations;
       // free((void *)addr);
       free((__parsec_chore_t *)self.incarnations);
@@ -5317,6 +5335,12 @@ namespace ttg_parsec {
     template<typename Devicemap>
     void set_devicemap(Devicemap&& dm) {
       //static_assert(derived_has_device_op(), "Device map only allowed on device-enabled TT!");
+      // TTG_IGNORE_DEVICEMAP=1: leave the choice of device to PaRSEC (by data location and load)
+      static const bool ignore = [] {
+        const char *e = std::getenv("TTG_IGNORE_DEVICEMAP");
+        return e != nullptr && std::atoi(e) != 0;
+      }();
+      if (ignore) return;
       if constexpr (std::is_same_v<ttg::device::Device, decltype(dm(std::declval<keyT>()))>) {
         // dm returns a Device
         devicemap = std::forward<Devicemap>(dm);
