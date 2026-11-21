@@ -10,6 +10,7 @@
 #include <parsec/mca/device/device.h>
 #include <parsec/mca/device/device_gpu.h>
 #include <parsec/utils/zone_malloc.h>
+#include <parsec/class/parsec_obj_freelist.h>
 #include "ttg/parsec/ttg_data_copy.h"
 #include "ttg/parsec/parsec-ext.h"
 #include "ttg/util/iovec.h"
@@ -52,6 +53,30 @@ namespace detail {
   template<typename T>
   inline auto to_address(T&& ptr) {
     return ptr.get(); // smart pointer
+  }
+
+  /**
+   * The storage of the PaRSEC objects behind a buffer (its parsec_data_t and host
+   * copy) comes from free-lists rather than malloc: they are created by the tasks
+   * that make a buffer but often released by another thread (e.g., the device
+   * manager, when it drops a discarded device copy), which made their free a
+   * cross-arena free on the manager's critical path. The free-lists are never
+   * destructed, so objects may outlive ttg::finalize.
+   */
+  inline parsec_obj_allocator_t* obj_freelist(std::size_t elt_size) {
+    auto* fl = new parsec_obj_freelist_t;
+    if (PARSEC_SUCCESS != parsec_obj_freelist_construct(fl, elt_size)) {
+      delete fl;
+      return nullptr; // PARSEC_OBJ_NEW falls back to malloc
+    }
+    return &fl->super;
+  }
+
+  /* the size of parsec_data_t is only known once PaRSEC registered its devices
+   * (parsec_data_init), before any buffer is created */
+  inline parsec_obj_allocator_t* data_allocator() {
+    static parsec_obj_allocator_t* allocator = obj_freelist(PARSEC_OBJ_CLASS(parsec_data_t)->cls_sizeof);
+    return allocator;
   }
 
   /**
@@ -189,14 +214,19 @@ namespace detail {
                                             data_copy_construct,
                                             data_copy_destruct);
 
+    static parsec_obj_allocator_t* copy_allocator() {
+      static parsec_obj_allocator_t* allocator = obj_freelist(sizeof(data_copy_type));
+      return allocator;
+    }
+
     static parsec_data_t * create_data(std::size_t size, ttg::scope scope,
                                        const allocator_type& allocator = allocator_type()) {
-      parsec_data_t *data = PARSEC_OBJ_NEW(parsec_data_t);
+      parsec_data_t *data = PARSEC_OBJ_NEW(parsec_data_t, data_allocator());
       data->owner_device = 0;
       data->nb_elts = size*sizeof(value_type);
 
       /* create the host copy and allocate host memory */
-      data_copy_type *copy = PARSEC_OBJ_NEW(data_copy_type);
+      data_copy_type *copy = PARSEC_OBJ_NEW(data_copy_type, copy_allocator());
       copy->construct(size, scope, allocator);
       parsec_data_copy_attach(data, copy, 0);
 
@@ -215,12 +245,12 @@ namespace detail {
     }
 
     static parsec_data_t * create_data(PtrT& ptr, std::size_t size, ttg::scope scope) {
-      parsec_data_t *data = PARSEC_OBJ_NEW(parsec_data_t);
+      parsec_data_t *data = PARSEC_OBJ_NEW(parsec_data_t, data_allocator());
       data->owner_device = 0;
       data->nb_elts = size*sizeof(value_type);
 
       /* create the host copy and allocate host memory */
-      data_copy_type *copy = PARSEC_OBJ_NEW(data_copy_type);
+      data_copy_type *copy = PARSEC_OBJ_NEW(data_copy_type, copy_allocator());
       copy->construct(std::move(ptr), size);
       parsec_data_copy_attach(data, copy, 0);
 
