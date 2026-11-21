@@ -4498,7 +4498,16 @@ namespace ttg_parsec {
 
       /* TODO: remove this once we support reductions on the GPU */
       auto &reducer = std::get<i>(input_reducers);
-      if (reducer) {
+      /* an aggregating input only collects references to the values (its reducer is a
+       * placeholder that never runs), so the data can stay on the device */
+      constexpr const bool is_aggregator_input = [] {
+        if constexpr (i < std::tuple_size_v<input_edges_type>) {
+          return ttg::detail::is_aggregator_v<typename std::tuple_element_t<i, input_edges_type>::value_type>;
+        } else {
+          return false;
+        }
+      }();
+      if (reducer && !is_aggregator_input) {
         /* reductions are currently done only on the host so push out */
         copy_mark_pushout(value);
         caller->data_flags |= detail::ttg_parsec_data_flags::MARKED_PUSHOUT;
