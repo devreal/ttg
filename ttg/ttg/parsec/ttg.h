@@ -13,6 +13,9 @@
  * This may cause deadlocks, so use with caution. */
 #define TTG_PARSEC_DEFER_WRITER false
 
+/* ttg_parsec::detail::defer_to_stream_completion is available */
+#define TTG_HAVE_STREAM_COMPLETION_CALLBACKS 1
+
 #include "ttg/config.h"
 
 #include "ttg/impl_selector.h"
@@ -768,6 +771,36 @@ namespace ttg_parsec {
       task->copies[task->data_count] = copy;
       task->data_count++;
       return true;
+    }
+
+    /**
+     * Runs fn(arg) once the work the calling device task has submitted to its stream so far
+     * completed: when the device scheduler re-enters the task (or its batch ring) after the
+     * stream event fired, i.e., where a ttg::device::wait() completes, or, if the task does
+     * not come back, when the event PaRSEC records after its last submission fired (see
+     * stream_completion_stage); at the latest when the task is released. Lets code that submits device work on behalf
+     * of a task (e.g., a batched launch) reclaim resources that work uses without recording and querying an
+     * event of its own. Returns false, registering nothing, outside a device task or when
+     * the task has max_release_callbacks registered already; the caller then has to track
+     * completion itself.
+     */
+    inline bool defer_to_stream_completion(void (*fn)(void*), void* arg) {
+      parsec_ttg_task_base_t *task = parsec_ttg_caller;
+      if (task == nullptr || task->dev_ptr == nullptr) return false;
+#ifdef TTG_HAVE_COROUTINE
+      if (task->coroutine_id != ttg::TaskCoroutineID::DeviceTask) return false;
+#endif // TTG_HAVE_COROUTINE
+      if (task->num_release_callbacks >= parsec_ttg_task_base_t::max_release_callbacks) return false;
+      task->release_callbacks[task->num_release_callbacks++] = {fn, arg};
+      return true;
+    }
+
+    /* runs and clears the callbacks registered with defer_to_stream_completion */
+    inline void run_stream_completion_callbacks(parsec_ttg_task_base_t *task) {
+      for (int i = 0; i < task->num_release_callbacks; ++i) {
+        task->release_callbacks[i].fn(task->release_callbacks[i].arg);
+      }
+      task->num_release_callbacks = 0;
     }
 
     inline void remove_data_copy(ttg_data_copy_t *copy, parsec_ttg_task_base_t *task) {
@@ -1763,6 +1796,26 @@ namespace ttg_parsec {
 #endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
 
     /**
+     * complete_stage of a ring whose members deferred work until their stream work completed
+     * (see device_static_submit_impl): PaRSEC calls it on the ring head once the event
+     * recorded after the ring's submission fired; the ring is still intact then.
+     */
+    static int stream_completion_stage(parsec_device_gpu_module_t *gpu_device,
+                                       parsec_gpu_task_t **gpu_task,
+                                       parsec_gpu_exec_stream_t *gpu_stream) {
+      (void)gpu_device;
+      (void)gpu_stream;
+      parsec_gpu_task_t *head = *gpu_task;
+      parsec_gpu_task_t *cur = head;
+      do {
+        detail::run_stream_completion_callbacks((task_t *)cur->ec);
+        cur = (parsec_gpu_task_t *)cur->list_item.list_next;
+      } while (cur != head);
+      head->complete_stage = nullptr;
+      return PARSEC_HOOK_RETURN_DONE;
+    }
+
+    /**
      * Submit callback called by PaRSEC once all input transfers have completed.
      * PaRSEC's device manager is C code that exceptions must not unwind through,
      * so errors raised while progressing the ring (by the runtime, e.g. a misuse
@@ -1812,6 +1865,17 @@ namespace ttg_parsec {
         return (item->list_next == item) && (item->list_prev == item);
       };
 
+
+      /* On a later entry the stream event fired: the work every member of gpu_task's ring
+       * (gpu_task alone if it is a singleton) submitted before the previous return
+       * completed, so run what they deferred until then (defer_to_stream_completion). */
+      if (head_state != ttg::device::detail::TTG_DEVICE_CORO_WAIT_TRANSFER) {
+        parsec_gpu_task_t *cur = gpu_task;
+        do {
+          detail::run_stream_completion_callbacks((task_t *)cur->ec);
+          cur = (parsec_gpu_task_t *)cur->list_item.list_next;
+        } while (cur != gpu_task);
+      }
 
       /**
        * NOTE: we can only take this short-cut if the device is a singleton, i.e., it
@@ -2063,7 +2127,23 @@ namespace ttg_parsec {
         } while (cur != ring_head);
       }
 
-      return any_pending ? PARSEC_HOOK_RETURN_AGAIN : PARSEC_HOOK_RETURN_DONE;
+      if (any_pending) return PARSEC_HOOK_RETURN_AGAIN;
+
+      /* No member comes back. If a member deferred work until its stream work completed
+       * (defer_to_stream_completion), run it from complete_stage, which PaRSEC calls once
+       * the event it records after every submission (parsec_device_kernel_exec) fired. */
+      {
+        bool any_callbacks = false;
+        parsec_gpu_task_t *cur = ring_head;
+        do {
+          if (((task_t *)cur->ec)->num_release_callbacks > 0) any_callbacks = true;
+          cur = (parsec_gpu_task_t *)cur->list_item.list_next;
+        } while (!any_callbacks && cur != ring_head);
+        if (any_callbacks) {
+          gpu_task->complete_stage = &stream_completion_stage;
+        }
+      }
+      return PARSEC_HOOK_RETURN_DONE;
     }
 
     /* @return true if the task's coroutine is suspended in ttg::device::suspend() */
@@ -4814,6 +4894,9 @@ namespace ttg_parsec {
           c(task->key);
         }
       }
+
+      /* callbacks registered with defer_to_stream_completion and not yet run */
+      detail::run_stream_completion_callbacks(task);
 
       return PARSEC_HOOK_RETURN_DONE;
     }

@@ -248,6 +248,16 @@ namespace ttg_parsec {
       ttg::TaskCoroutineID coroutine_id = ttg::TaskCoroutineID::Invalid;
 #endif // TTG_HAVE_COROUTINE
 
+      /* callbacks run once the stream work the device task submitted so far completed,
+       * at the latest when the task is released; see defer_to_stream_completion */
+      struct release_callback_t {
+        void (*fn)(void*);
+        void* arg;
+      };
+      static constexpr int max_release_callbacks = 4;
+      release_callback_t release_callbacks[max_release_callbacks];
+      int num_release_callbacks = 0;
+
       /*
       virtual void release_task() = 0;
       */
