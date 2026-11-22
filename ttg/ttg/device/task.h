@@ -26,13 +26,14 @@ namespace ttg::device {
     struct device_input_data_t {
       using impl_data_t = decltype(TTG_IMPL_NS::buffer_data(std::declval<ttg::Buffer<int>>()));
 
+      device_input_data_t() = default;
       device_input_data_t(impl_data_t data, ttg::scope scope, bool isconst, bool isscratch)
       : impl_data(data), scope(scope), is_const(isconst), is_scratch(isscratch)
       { }
-      impl_data_t impl_data;
-      ttg::scope scope;
-      bool is_const;
-      bool is_scratch;
+      impl_data_t impl_data{};
+      ttg::scope scope{};
+      bool is_const = false;
+      bool is_scratch = false;
     };
 
     template <typename... Ts>
@@ -61,26 +62,48 @@ namespace ttg::device {
    */
   struct Input {
   private:
-    std::vector<detail::device_input_data_t> m_data;
+    /* Inline storage for the common case: an Input is typically built by a task on a worker
+     * thread and destroyed by the thread managing the device after the kernel launch, where
+     * freeing a heap block allocated by another thread is expensive. Only an Input with more
+     * buffers than that uses the heap (all entries then live in m_overflow). */
+    static constexpr std::size_t inline_capacity = 24;
+    std::array<detail::device_input_data_t, inline_capacity> m_inline;
+    std::vector<detail::device_input_data_t> m_overflow;
+    std::size_t m_size = 0;
+
+    void push(detail::device_input_data_t d) {
+      if (m_size < inline_capacity) {
+        m_inline[m_size] = d;
+      } else {
+        if (m_size == inline_capacity) {
+          m_overflow.reserve(2*inline_capacity);
+          m_overflow.assign(m_inline.begin(), m_inline.end());
+        }
+        m_overflow.push_back(d);
+      }
+      ++m_size;
+    }
 
   public:
     Input() { }
     template<typename... Args>
     Input(Args&&... args)
-    : m_data{{TTG_IMPL_NS::buffer_data(args), args.scope(),
-              std::is_const_v<std::remove_reference_t<Args>>,
-              ttg::meta::is_devicescratch_v<std::decay_t<Args>>}...}
-    { }
+    {
+      (push(detail::device_input_data_t{TTG_IMPL_NS::buffer_data(args), args.scope(),
+                                        std::is_const_v<std::remove_reference_t<Args>>,
+                                        ttg::meta::is_devicescratch_v<std::decay_t<Args>>}), ...);
+    }
 
     template<typename T>
     void add(T&& v) {
       using type = std::remove_reference_t<T>;
-      m_data.emplace_back(TTG_IMPL_NS::buffer_data(v), v.scope(), std::is_const_v<type>,
-                          ttg::meta::is_devicescratch_v<type>);
+      push(detail::device_input_data_t{TTG_IMPL_NS::buffer_data(v), v.scope(), std::is_const_v<type>,
+                                       ttg::meta::is_devicescratch_v<type>});
     }
 
     ttg::span<detail::device_input_data_t> span() {
-      return ttg::span(m_data);
+      if (m_size > inline_capacity) return ttg::span(m_overflow.data(), m_size);
+      return ttg::span(m_inline.data(), m_size);
     }
   };
 

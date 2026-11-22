@@ -733,7 +733,8 @@ namespace ttg_parsec {
       if (task == nullptr || ptr == nullptr) {
         return res;
       }
-      for (int i = 0; i < task->data_count; ++i) {
+      /* newest first: a send looks up the copy its value handler just appended */
+      for (int i = task->data_count - 1; i >= 0; --i) {
         auto copy = static_cast<ttg_data_copy_t *>(task->copies[i]);
         if (NULL != copy && copy->get_ptr() == ptr) {
           res = copy;
@@ -3963,11 +3964,14 @@ namespace ttg_parsec {
                      void>
     broadcast_arg(const ttg::span<const Key> &keylist, const Value &value) {
       using valueT = std::tuple_element_t<i, input_values_full_tuple_type>;
-      auto world = ttg_default_execution_context();
+      /* the TT's world, not a copy of the default one: copying a World touches a shared
+       * reference count, which all threads sending contend on */
+      auto &world = this->world;
       auto np = world.size();
       int rank = world.rank();
       uint64_t pos = 0;
-      bool have_remote = keylist.end() != std::find_if(keylist.begin(), keylist.end(),
+      bool have_remote = (np > 1) &&
+                         keylist.end() != std::find_if(keylist.begin(), keylist.end(),
                                                        [&](const Key &key) { return keymap(key) != rank; });
 
       if (have_remote) {
@@ -4576,8 +4580,9 @@ namespace ttg_parsec {
                      void>
     prepare_send(const ttg::span<const Key> &keylist, const Value &value) {
       auto remote_check = [&](){
-          auto world = ttg_default_execution_context();
-          int rank = world.rank();
+          /* a single rank has no remote successors: don't evaluate the keymap */
+          if (this->world.size() == 1) return false;
+          int rank = this->world.rank();
           bool remote = keylist.end() != std::find_if(keylist.begin(), keylist.end(),
                                                       [&](const Key &key) { return keymap(key) != rank; });
           return remote;
@@ -4590,8 +4595,8 @@ namespace ttg_parsec {
                      void>
     prepare_send(const Value &value) {
       auto remote_check = [&](){
-          auto world = ttg_default_execution_context();
-          int rank = world.rank();
+          if (this->world.size() == 1) return false;
+          int rank = this->world.rank();
           return (keymap() != rank);
         };
       do_prepare_send<i>(value, remote_check);
