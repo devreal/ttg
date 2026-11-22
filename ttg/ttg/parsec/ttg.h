@@ -1719,9 +1719,22 @@ namespace ttg_parsec {
 
 #ifdef TTG_HAVE_DEVICE
 #if defined(TTG_HAVE_PARSEC_DEV_BATCH)
-    /* number of times a batch head that could not fill its batch waits for more
-     * tasks (see device_static_submit) */
-    static constexpr int max_batch_waits = 1;
+    /* How long a batch head that could not fill its batch waits for more tasks
+     * (see device_static_submit): at most TTG_BATCH_WAITS visits of the device
+     * (default 1) and, if TTG_BATCH_WAIT_US is set, at most that many
+     * microseconds since it first waited. */
+    struct batch_wait_policy_t {
+      int max_waits = 1;
+      uint64_t max_ns = 0;  // 0: no time bound
+      batch_wait_policy_t() {
+        if (const char *e = std::getenv("TTG_BATCH_WAITS")) max_waits = std::atoi(e);
+        if (const char *e = std::getenv("TTG_BATCH_WAIT_US")) max_ns = std::strtoull(e, nullptr, 10) * 1000;
+      }
+    };
+    static const batch_wait_policy_t &batch_wait_policy() {
+      static const batch_wait_policy_t policy;
+      return policy;
+    }
 
     struct batch_match_ctx_t {
       TT *tt;
@@ -1985,9 +1998,12 @@ namespace ttg_parsec {
             /* The batch is not full: park the head with its followers so that the
              * device scheduler can ingest and stage in more tasks, and collect them
              * when the head is resumed. Nothing has been queued on the stream yet,
-             * as required by PaRSEC. Bounded by max_batch_waits, since PaRSEC never
+             * as required by PaRSEC. Bounded by batch_wait_policy(), since PaRSEC never
              * forces a parked head to execute. */
-            if (ctx.accepted + 1 < ctx.max_size && task->dev_ptr->batch_waits < max_batch_waits) {
+            const auto &policy = batch_wait_policy();
+            if (ctx.accepted + 1 < ctx.max_size && task->dev_ptr->batch_waits < policy.max_waits &&
+                (policy.max_ns == 0 || task->dev_ptr->batch_waits == 0 ||
+                 parsec_gpu_task_batch_wait_elapsed(gpu_task) < policy.max_ns)) {
               ++task->dev_ptr->batch_waits;
               return PARSEC_HOOK_RETURN_BATCH_WAIT;
             }
