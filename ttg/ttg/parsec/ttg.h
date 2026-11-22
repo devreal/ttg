@@ -791,9 +791,24 @@ namespace ttg_parsec {
 #ifdef TTG_HAVE_COROUTINE
       if (task->coroutine_id != ttg::TaskCoroutineID::DeviceTask) return false;
 #endif // TTG_HAVE_COROUTINE
-      if (task->num_release_callbacks >= parsec_ttg_task_base_t::max_release_callbacks) return false;
-      task->release_callbacks[task->num_release_callbacks++] = {fn, arg};
-      return true;
+      /* The callbacks of every member of the task's batch ring run when the ring re-enters the
+       * device scheduler (or from complete_stage if none does), so a batch leader submitting
+       * more than max_release_callbacks launches can use the room of the other members. */
+      auto try_register = [&](parsec_ttg_task_base_t *t) {
+        if (t->num_release_callbacks >= parsec_ttg_task_base_t::max_release_callbacks) return false;
+        t->release_callbacks[t->num_release_callbacks++] = {fn, arg};
+        return true;
+      };
+      if (try_register(task)) return true;
+      parsec_gpu_task_t *ring_head = task->dev_ptr->batch_ring_head;
+      if (ring_head == nullptr) return false;
+      parsec_gpu_task_t *cur = ring_head;
+      do {
+        auto *member = reinterpret_cast<parsec_ttg_task_base_t *>(cur->ec);
+        if (member != task && member->dev_ptr != nullptr && try_register(member)) return true;
+        cur = (parsec_gpu_task_t *)cur->list_item.list_next;
+      } while (cur != ring_head);
+      return false;
     }
 
     /* runs and clears the callbacks registered with defer_to_stream_completion */
