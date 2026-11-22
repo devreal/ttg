@@ -797,6 +797,8 @@ namespace ttg_parsec {
       auto try_register = [&](parsec_ttg_task_base_t *t) {
         if (t->num_release_callbacks >= parsec_ttg_task_base_t::max_release_callbacks) return false;
         t->release_callbacks[t->num_release_callbacks++] = {fn, arg};
+        /* the callback waits for stream work: an event has to be recorded */
+        ttg::device::detail::stream_used_ts = true;
         return true;
       };
       if (try_register(task)) return true;
@@ -1901,6 +1903,9 @@ namespace ttg_parsec {
       if (head_state == ttg::device::detail::TTG_DEVICE_CORO_SENDOUT && is_singleton(gpu_task)) {
         /* The device task is sending out already but we go through the device scheduler
          * for a pushout. We just report this task done, no callbacks to invoke. */
+#if defined(PARSEC_GPU_TASK_HAS_NOTHING_QUEUED)
+        gpu_task->nothing_queued = 1;
+#endif
         return PARSEC_HOOK_RETURN_DONE;
       }
 
@@ -2006,6 +2011,13 @@ namespace ttg_parsec {
 
       task_t *head_task = (task_t *)ring_head->ec;
 
+      /* The passes below are repeated while they queue nothing on the stream and every member
+       * still pending waits for its stream work (WAIT_KERNEL): that work completed before this
+       * entry (or there is none), so waiting for an event would only delay them. */
+      bool any_pending;
+      bool stream_used;
+      for (;;) {
+      ttg::device::detail::stream_used_ts = false;
 #if defined(TTG_HAVE_PARSEC_DEV_BATCH)
       /* defer the device->host copies of ttg::device::wait() to the flush pass below */
       assert(!detail::pending_device_copies.active && detail::pending_device_copies.size() == 0);
@@ -2103,12 +2115,12 @@ namespace ttg_parsec {
                                                     static_cast<int>(pending.size()));
           if (ret != PARSEC_SUCCESS) throw std::runtime_error("Failed to batch-copy data from device to host!");
           pending.clear();
+          ttg::device::detail::stream_used_ts = true;
         }
         pending.active = false;
       }
 #endif  // defined(TTG_HAVE_PARSEC_DEV_BATCH)
-
-      ttg::device::detail::reset_current();
+      stream_used = ttg::device::detail::stream_used_ts;
 
       auto discard_tmp_flows = [](parsec_gpu_task_t *member_gpu_task, task_t *mtask){
         for (int i = 0; i < MAX_PARAM_COUNT; ++i) {
@@ -2126,7 +2138,8 @@ namespace ttg_parsec {
        * (reached SENDOUT/COMPLETE, or returned immediately without
        * suspending at all). For a singleton ring this is exactly the
        * single-task check this replaced. */
-      bool any_pending = false;
+      any_pending = false;
+      bool all_wait_kernel = true;  // every pending member waits for its stream work
       {
         parsec_gpu_task_t *cur = ring_head;
         do {
@@ -2138,10 +2151,17 @@ namespace ttg_parsec {
             discard_tmp_flows(cur, mtask);
           } else {
             any_pending = true;
+            if (state != TTG_DEVICE_CORO_WAIT_KERNEL) all_wait_kernel = false;
           }
           cur = (parsec_gpu_task_t *)cur->list_item.list_next;
         } while (cur != ring_head);
       }
+      if (!any_pending || stream_used || !all_wait_kernel) break;
+      /* nothing queued: resume the members waiting for their (completed) stream work */
+      is_first_entry = false;
+      } // for (;;)
+
+      ttg::device::detail::reset_current();
 
       if (any_pending) return PARSEC_HOOK_RETURN_AGAIN;
 
@@ -2159,6 +2179,10 @@ namespace ttg_parsec {
           gpu_task->complete_stage = &stream_completion_stage;
         }
       }
+#if defined(PARSEC_GPU_TASK_HAS_NOTHING_QUEUED)
+      /* nothing to wait for: PaRSEC completes the stage without recording an event */
+      if (!stream_used) gpu_task->nothing_queued = 1;
+#endif
       return PARSEC_HOOK_RETURN_DONE;
     }
 

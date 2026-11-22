@@ -140,6 +140,9 @@ namespace ttg::device {
   namespace detail {
     inline thread_local ttg::device::Device current_device_ts = {};
     inline thread_local Stream current_stream_ts = detail::default_stream_v<Stream>; // default stream
+    /* set whenever the current stream is handed out (current_stream()), so the backend can tell
+     * whether a device task may have queued work on it */
+    inline thread_local bool stream_used_ts = false;
 
     inline void reset_current() {
       current_device_ts = {};
@@ -159,6 +162,7 @@ namespace ttg::device {
 
   inline
   Stream current_stream() {
+    detail::stream_used_ts = true;
     return detail::current_stream_ts;
   }
 
@@ -171,7 +175,8 @@ namespace ttg::device {
   namespace detail {
     inline thread_local ttg::device::Device current_device_ts = {};
     inline thread_local sycl::queue* current_stream_ts = nullptr; // default stream
-
+    /* see the non-SYCL variant above */
+    inline thread_local bool stream_used_ts = false;
 
     inline void reset_current() {
       current_device_ts = {};
@@ -191,6 +196,7 @@ namespace ttg::device {
 
   inline
   sycl::queue& current_stream() {
+    detail::stream_used_ts = true;
     return *detail::current_stream_ts;
   }
 #endif // TTG_HAVE_LEVEL_ZERO
